@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
 from uuid import UUID
+from typing import Optional
 
 
 class ReconciliationOptions(BaseModel):
@@ -16,7 +17,27 @@ class RunReconciliationRequest(BaseModel):
     options: ReconciliationOptions = ReconciliationOptions()
 
 
+class ReconciliationSummary(BaseModel):
+    total_lines: int
+    matched: int
+    unmatched: int
+    exceptions: int
+
+
+class ReconciliationLineResult(BaseModel):
+    line_id: UUID
+    match_status: str
+    expected_amount: Optional[float] = None
+    matched_amount: Optional[float] = None
+    variance_amount: Optional[float] = None
+    matched_invoice_id: Optional[UUID] = None
+    matched_invoice_number: Optional[str] = None
+    notes: Optional[str] = None
+
+
 class RunReconciliationResponse(BaseModel):
     job_id: UUID
     reconciliation_id: UUID
     status: str
+    summary: ReconciliationSummary
+    lines: list[ReconciliationLineResult]
