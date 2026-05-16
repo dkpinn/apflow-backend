@@ -207,6 +207,166 @@ def extract_line_items_from_single_rows(lines: list[str]) -> list[dict]:
 
     return items
 
+
+def _normalise_receipt_ocr_text(value: str) -> str:
+    return (
+        (value or "")
+        .replace("O", "0")
+        .replace("o", "0")
+        .replace("I", "1")
+        .replace("l", "1")
+        .replace("|", "1")
+    )
+
+
+def _looks_like_receipt_item_description(value: str) -> bool:
+    lower = value.lower().strip()
+    if not lower:
+        return False
+    if len(re.findall(r"[a-zA-Z]", value)) < 4:
+        return False
+    if any(
+        term in lower
+        for term in [
+            "itemname",
+            "item name",
+            "description",
+            "subtotal",
+            "sub total",
+            "vat",
+            "total",
+            "card",
+            "cash",
+            "payment",
+            "receipt",
+            "cashier",
+            "till",
+            "refund",
+            "exchange",
+            "terms",
+            "condition",
+            "welcome",
+            "www.",
+        ]
+    ):
+        return False
+    return True
+
+
+def _receipt_table_bounds(lines: list[str]) -> tuple[int, int]:
+    start = 0
+    end = len(lines)
+
+    for index, line in enumerate(lines):
+        lower = line.lower()
+        if re.search(r"item\s*(?:name|mame|nane|nan[e3])", lower):
+            start = index + 1
+            break
+        if re.search(r"\b[qo]ty\b", lower) and "price" in lower and "total" in lower:
+            start = index + 1
+            break
+
+    for index in range(start, len(lines)):
+        lower = lines[index].lower().strip(" :-")
+        if re.match(r"^(total|subtotal|sub total|vat|card|cash|payment|tender|items?\s+rounding)\b", lower):
+            end = index
+            break
+
+    return start, end
+
+
+def _extract_receipt_amounts(value: str) -> list[float]:
+    value = _normalise_receipt_ocr_text(value)
+    matches = re.findall(r"\b\d{1,5}[,.]\d{2}\b", value)
+    amounts = [clean_amount(match) for match in matches]
+    return [amount for amount in amounts if amount is not None]
+
+
+def _description_before_first_amount(value: str) -> str:
+    match = re.search(r"\b\d{1,5}[,.]\d{2}\b", _normalise_receipt_ocr_text(value))
+    head = value[:match.start()] if match else value
+    head = re.sub(r"\b\d{6,}\b", "", head)
+    head = re.sub(r"\s+", " ", head)
+    return head.strip(" :-")
+
+
+def extract_narrow_receipt_line_items(text: str) -> list[dict]:
+    """
+    Handles photographed till slips with ITEMNAME/QTY/PRICE/TOTAL style rows.
+
+    OCR often splits each receipt row into a description line plus a following
+    barcode/quantity/amount line, so this parser examines the current line
+    together with a short lookahead window.
+    """
+    lines = normalise_lines(text)
+    if not lines:
+        return []
+
+    lower_text = text.lower()
+    has_receipt_shape = (
+        re.search(r"item\s*(?:name|mame|nane|nan[e3])", lower_text) is not None
+        or (re.search(r"\b[qo]ty\b", lower_text) and "price" in lower_text and "total" in lower_text)
+        or ("receipt no" in lower_text and "cashier" in lower_text)
+    )
+    if not has_receipt_shape:
+        return []
+
+    start, end = _receipt_table_bounds(lines)
+    item_lines = lines[start:end]
+    items: list[dict] = []
+    index = 0
+
+    while index < len(item_lines):
+        line = item_lines[index].strip()
+        if not _looks_like_receipt_item_description(line):
+            index += 1
+            continue
+
+        window_lines = [line]
+        for candidate in item_lines[index + 1:index + 4]:
+            candidate_amounts = _extract_receipt_amounts(candidate)
+            current_amounts = _extract_receipt_amounts(" ".join(window_lines))
+            if current_amounts and not candidate_amounts and _looks_like_receipt_item_description(candidate):
+                break
+            window_lines.append(candidate)
+            if len(_extract_receipt_amounts(" ".join(window_lines))) >= 2:
+                break
+        combined = " ".join(window_lines)
+        amounts = _extract_receipt_amounts(combined)
+
+        if len(amounts) < 2:
+            index += 1
+            continue
+
+        description = _description_before_first_amount(line)
+        if not description or len(description) < 4:
+            description = _description_before_first_amount(combined)
+
+        if not _looks_like_receipt_item_description(description):
+            index += 1
+            continue
+
+        quantity = amounts[0]
+        line_total = amounts[-1]
+        unit_price = amounts[-2] if len(amounts) >= 3 else None
+        if unit_price is None and quantity and quantity > 0:
+            unit_price = round(line_total / quantity, 2)
+
+        items.append({
+            "code": None,
+            "description": description,
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "tax_amount": None,
+            "line_total": line_total,
+            "raw_line": combined,
+        })
+
+        index += max(1, len(window_lines))
+
+    return items
+
+
 def extract_chimes_line_items(text: str) -> list[dict]:
     """
     Supplier/template-specific parser for Chimes Crane Hire invoices.
@@ -290,6 +450,10 @@ def extract_chimes_line_items(text: str) -> list[dict]:
 
 def extract_line_items(text: str, layout_type: str = "unknown") -> list[dict]:
     lines = normalise_lines(text)
+
+    receipt_items = extract_narrow_receipt_line_items(text)
+    if receipt_items:
+        return receipt_items
 
     if layout_type == "chimes_column_table":
         return extract_chimes_line_items(text)

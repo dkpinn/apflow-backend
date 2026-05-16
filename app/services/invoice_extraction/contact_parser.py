@@ -88,7 +88,6 @@ def extract_supplier_fax(text: str) -> Optional[str]:
 def extract_supplier_cell(text: str) -> Optional[str]:
     patterns = [
         r"(?:Cell|Mobile|Mob)\s*[:#\-]?\s*([+0-9 ()\-]{7,25})",
-        r"\b(0[6-8]\d\s*\d{3}\s*\d{4})\b",
     ]
 
     return extract_first_match(text, patterns)
@@ -96,7 +95,7 @@ def extract_supplier_cell(text: str) -> Optional[str]:
 
 def extract_vat_number(text: str) -> Optional[str]:
     patterns = [
-        r"(?:Tax\s+Registration|VAT\s+Registration|VAT\s+Reg\.?|VAT\s+Reg\s+No\.?|VAT\s+No\.?|VAT\s+Number|VAT)\s*[:#\-]?\s*([0-9]{7,15})",
+        r"(?:Tax\s+Registration|VAT\s+Registration|VAT\s+Reg\.?|VAT\s+Reg\s+No\.?|VAT\s+No\.?|VAT\s+Number|VAT)\s*(?:No\.?|Number)?\s*[:#\-]?\s*([0-9]{7,15})",
     ]
 
     return extract_first_match(text, patterns)
@@ -104,7 +103,7 @@ def extract_vat_number(text: str) -> Optional[str]:
 
 def extract_customer_code(text: str) -> Optional[str]:
     patterns = [
-        r"(?:Customer\s+Code|Customer\s+No\.?|Customer\s+Number|Account\s+No\.?|Account\s+Number)\s*[:#\-]?\s*([A-Z0-9\-\/]{2,30})",
+        r"(?:Customer\s+Code|Customer\s+No\.?|Customer\s+Number|Account\s+No\.?|Account\s+Number)\s*[:#\-]?\s*([A-Z0-9\-\/]{1,30})",
     ]
 
     return extract_first_match(text, patterns)
@@ -145,28 +144,51 @@ def extract_supplier_delivery_address(text: str) -> Optional[str]:
     if len(lines) < 2:
         return None
 
+    top_text = re.sub(r"\s+", " ", "\n".join(lines[:20]).lower())
+    receipt_text = re.sub(r"\s+", " ", "\n".join(lines[:80]).lower())
+    if (
+        "scan to rate" in top_text
+        or ("survey" in top_text and ("tax invoice" in receipt_text or "receipt" in receipt_text))
+    ):
+        return None
+
     stop_terms = [
         "p o box",
         "po box",
         "p.o box",
         "postnet",
         "tel:",
+        "tel",
         "telephone:",
+        "telephone",
         "fax:",
+        "fax",
         "e-mail:",
+        "e-mail",
+        "e mail",
         "email:",
+        "email",
         "website:",
+        "website",
         "tax registration:",
+        "tax registration",
         "reg number:",
+        "reg number",
         "tax invoice",
         "vat:",
+        "vat",
         "computer generated",
     ]
 
+    start_index = 1
+    for index, line in enumerate(lines[:12]):
+        if re.search(r"\b(build\s*it|builders|pinetown)\b", line, re.IGNORECASE):
+            start_index = index + 1
+            break
+
     address_lines: list[str] = []
 
-    # Assume line 0 is supplier name for now.
-    for line in lines[1:15]:
+    for line in lines[start_index:start_index + 8]:
         lower = line.lower()
 
         if any(term in lower for term in stop_terms):
@@ -177,6 +199,9 @@ def extract_supplier_delivery_address(text: str) -> Optional[str]:
 
         # Ignore obvious contact/metadata lines
         if "@" in line or "www." in lower:
+            continue
+
+        if re.match(r"^[\W_]{2,}", line.strip()):
             continue
 
         address_lines.append(line)

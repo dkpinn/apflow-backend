@@ -46,6 +46,10 @@ def extract_total_amount(text: str) -> Optional[float]:
     if stacked.get("total_amount") is not None:
         return stacked["total_amount"]
 
+    receipt_total = extract_receipt_total_amount(text)
+    if receipt_total is not None:
+        return receipt_total
+
     lines = normalise_lines(text)
 
     priority_labels = [
@@ -75,6 +79,60 @@ def extract_total_amount(text: str) -> Optional[float]:
 
                 if amount is not None and amount > 0:
                     return amount
+
+    return None
+
+
+def _clean_amount_from_parts(parts: list[str]) -> Optional[float]:
+    joined = "".join(str(part).strip() for part in parts if str(part).strip())
+    return clean_amount(joined)
+
+
+def extract_receipt_total_amount(text: str) -> Optional[float]:
+    """
+    Handles receipt OCR where TOTAL and amount pieces appear on separate lines:
+
+    TOTAL
+    695
+    ,00
+    """
+    lines = normalise_lines(text)
+    lower_lines = [line.lower().strip() for line in lines]
+    total_candidates: list[float] = []
+
+    for index, lower in enumerate(lower_lines):
+        if lower not in {"total", "amount due", "total amount"}:
+            continue
+
+        window = lines[index + 1:index + 8]
+
+        for candidate in window:
+            amount = clean_amount(candidate)
+            if amount is not None and amount > 0:
+                total_candidates.append(amount)
+                break
+
+        for offset in range(0, max(0, len(window) - 1)):
+            amount = _clean_amount_from_parts(window[offset:offset + 2])
+            if amount is not None and amount > 0:
+                total_candidates.append(amount)
+                break
+
+        for offset in range(0, max(0, len(window) - 2)):
+            amount = _clean_amount_from_parts(window[offset:offset + 3])
+            if amount is not None and amount > 0:
+                total_candidates.append(amount)
+                break
+
+    if total_candidates:
+        return total_candidates[-1]
+
+    pattern = r"\bTOTAL\b\s*(?:ZAR|R)?\s*([0-9]{1,6})\s*(?:[,.]\s*|\n\s*[,.]\s*)?([0-9]{2})\b"
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    if matches:
+        amount = clean_amount(f"{matches[-1][0]},{matches[-1][1]}")
+        if amount is not None and amount > 0:
+            return amount
 
     return None
 

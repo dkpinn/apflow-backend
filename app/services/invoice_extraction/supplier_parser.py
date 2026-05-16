@@ -35,10 +35,16 @@ def line_has_bank_context(line: str) -> bool:
 
 def is_valid_supplier_candidate(line: str) -> bool:
     lower = line.lower().strip()
+    clean = line.strip()
 
     ignored_terms = [
+        "copy",
+        "original",
+        "copy of original",
+        "customer copy",
         "invoice",
         "tax invoice",
+        "tax invoice customer copy",
         "statement",
         "date",
         "invoice date",
@@ -67,9 +73,35 @@ def is_valid_supplier_candidate(line: str) -> bool:
         "product code",
         "configuration",
         "please note",
+        "welcome",
+        "welcame",
+        "welkom",
     ]
 
-    if not line:
+    if not clean:
+        return False
+
+    if lower in {"pty", "(pty)", "ltd", "limited", "(pty) ltd", "pty ltd"}:
+        return False
+
+    if lower in {"copy", "original", "customer copy", "copy of original"}:
+        return False
+
+    if "copy of original" in lower or "customer copy" in lower:
+        return False
+
+    if re.match(r"^[\W_]{2,}", clean):
+        return False
+
+    alpha_count = sum(char.isalpha() for char in clean)
+    if alpha_count < 3:
+        return False
+
+    if len(clean) >= 6 and alpha_count / len(clean) < 0.45:
+        return False
+
+    words = re.findall(r"[A-Za-z]+", clean)
+    if len(words) == 1 and len(words[0]) <= 4 and not re.search(r"\b(absa|fnb)\b", lower):
         return False
 
     if "@" in line:
@@ -95,6 +127,8 @@ def is_valid_supplier_candidate(line: str) -> bool:
 
 
 def looks_like_legal_entity(line: str) -> bool:
+    if line.lower().strip() in {"pty", "(pty)", "ltd", "limited", "(pty) ltd", "pty ltd"}:
+        return False
     return bool(
         re.search(
             r"\b(pty|ltd|limited|cc|inc|company|corporation|corp|co\.?)\b",
@@ -102,6 +136,82 @@ def looks_like_legal_entity(line: str) -> bool:
             re.IGNORECASE,
         )
     )
+
+
+def _clean_receipt_supplier_candidate(value: str) -> str:
+    candidate = re.sub(r"[_|]+", " ", value or "")
+    candidate = re.sub(r"[^A-Za-z0-9 &().,/\-]+", " ", candidate)
+    candidate = re.sub(r"\s+", " ", candidate).strip(" -:,.")
+    candidate = re.sub(r"\bT\s*/\s*A\b", "t/a", candidate, flags=re.IGNORECASE)
+    return candidate
+
+
+def extract_massmart_builders_supplier(lines: list[str]) -> Optional[str]:
+    """
+    Prefer the full legal/trading line on Massmart/Builders till receipts.
+
+    OCR often exposes this as one line, but sometimes splits the legal name and
+    trading-as brand across adjacent lines.
+    """
+    top_lines = lines[:80]
+    for window_size in (1, 2, 3):
+        for index in range(0, max(len(top_lines) - window_size + 1, 0)):
+            candidate = _clean_receipt_supplier_candidate(
+                " ".join(top_lines[index:index + window_size])
+            )
+            lower = candidate.lower()
+            if "massmart" not in lower:
+                continue
+            if not re.search(r"\b(retailer|retail|builders|warehouse|t/a|pty|ltd)\b", lower):
+                continue
+            if re.search(r"\b(vat|invoice|receipt|tel|telephone|fax|email|total|subtotal)\b", lower):
+                continue
+            if len(candidate) <= 140:
+                return candidate
+
+    for line in top_lines:
+        candidate = _clean_receipt_supplier_candidate(line)
+        if re.search(r"\bbuilders\s+warehouse\b|\bbuilders\b", candidate, re.IGNORECASE):
+            if not re.search(r"\b(vat|invoice|receipt|tel|total|subtotal)\b", candidate, re.IGNORECASE):
+                return candidate
+
+    return None
+
+
+def extract_supplier_from_receipt_text(text: str) -> Optional[str]:
+    lines = normalise_lines(text)
+    joined = "\n".join(lines[:80])
+
+    if re.search(r"\bwait[eo]ns\b|wait[eo]ns\.co\.za", text, re.IGNORECASE):
+        return "Waitens"
+
+    massmart_builders_supplier = extract_massmart_builders_supplier(lines)
+    if massmart_builders_supplier:
+        return massmart_builders_supplier
+
+    build_it_candidates: list[str] = []
+    for line in lines[:80]:
+        if re.search(r"\b(?:build\s*it|bui[l1i]d\s*it|pinetown\s+bui|netown\s+bui)\b", line, re.IGNORECASE):
+            candidate = re.sub(r"[_|]+", " ", line)
+            candidate = re.sub(r"\s+", " ", candidate).strip(" -:")
+            if is_valid_supplier_candidate(candidate):
+                build_it_candidates.append(candidate)
+
+    if build_it_candidates:
+        for candidate in build_it_candidates:
+            if re.search(r"\bpinetown\b|\bnewtown\b|\bbuild\s*it\b", candidate, re.IGNORECASE):
+                return candidate.upper() if candidate.isupper() else candidate
+        return build_it_candidates[0]
+
+    if re.search(r"\bmassmart\b", joined, re.IGNORECASE):
+        for line in lines[:80]:
+            if re.search(r"\bmassmart\b", line, re.IGNORECASE):
+                return _clean_receipt_supplier_candidate(line)
+
+    if re.search(r"\bbuilders\b", joined, re.IGNORECASE):
+        return "Builders"
+
+    return None
 
 
 def extract_supplier_from_evetech_layout(text: str) -> Optional[str]:
@@ -252,6 +362,10 @@ def extract_supplier_name(text: str, layout_type: str = "unknown") -> Optional[s
         supplier = extract_supplier_from_evetech_layout(text)
         if supplier:
             return supplier
+
+    supplier = extract_supplier_from_receipt_text(text)
+    if supplier:
+        return supplier
 
     # 2. FROM / TO blocks
     supplier = extract_supplier_from_from_to_block(lines)
