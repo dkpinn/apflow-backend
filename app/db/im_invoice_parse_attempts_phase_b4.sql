@@ -1,5 +1,5 @@
 -- ============================================================
--- APFlow Invoice Parse Attempts Phase B4
+-- APPayPal Invoice Parse Attempts Phase B4
 -- Stores temporary parse snapshots for review/selection.
 -- Apply manually in external Supabase.
 -- Idempotent. Does not change RLS.

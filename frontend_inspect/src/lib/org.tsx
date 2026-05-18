@@ -44,7 +44,7 @@ type OrgCtx = {
 
 const Ctx = createContext<OrgCtx | undefined>(undefined);
 
-const STORAGE_KEY = "apflow.currentOrgId";
+const STORAGE_KEY = "appaypal.currentOrgId";
 
 export function OrgProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();

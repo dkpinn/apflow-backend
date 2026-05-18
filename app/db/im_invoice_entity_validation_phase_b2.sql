@@ -1,5 +1,5 @@
 -- ============================================================
--- APFlow Invoice Entity Validation — Phase B2
+-- APPayPal Invoice Entity Validation — Phase B2
 -- Adds issuer/recipient/direction validation fields.
 -- Apply manually in external Supabase.
 -- Idempotent.

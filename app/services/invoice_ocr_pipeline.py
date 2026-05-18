@@ -29,6 +29,9 @@ OCR_MAX_HEIGHT = int(os.getenv("OCR_MAX_HEIGHT", "3500"))
 OCR_MAX_PIXELS = int(os.getenv("OCR_MAX_PIXELS", "10_000_000"))
 PDF_RENDER_MAX_PIXELS = int(os.getenv("PDF_RENDER_MAX_PIXELS", "12_000_000"))
 DEEP_OCR_RENDER_DPI = int(os.getenv("DEEP_OCR_RENDER_DPI", "300"))
+# Per-call Tesseract timeout in seconds. Prevents a stuck subprocess from
+# blocking the background worker indefinitely and exhausting system resources.
+OCR_TESSERACT_TIMEOUT = int(os.getenv("OCR_TESSERACT_TIMEOUT", "30"))
 
 from app.services.invoice_extraction.layout_analyser import analyse_invoice_layout
 
@@ -313,6 +316,7 @@ def _ocr_image_region(image: Image.Image, *, region_name: str, psms: list[str] |
                 image,
                 config=config,
                 output_type=pytesseract.Output.DICT,
+                timeout=OCR_TESSERACT_TIMEOUT,
             )
             text = "\n".join(
                 part.strip()
@@ -322,7 +326,7 @@ def _ocr_image_region(image: Image.Image, *, region_name: str, psms: list[str] |
             confidence = _ocr_confidence_from_data(data)
         except Exception:
             try:
-                text = pytesseract.image_to_string(image, config=config).strip()
+                text = pytesseract.image_to_string(image, config=config, timeout=OCR_TESSERACT_TIMEOUT).strip()
                 confidence = None
             except Exception:
                 text = ""
@@ -648,6 +652,7 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
                     processed_image,
                     config=config,
                     output_type=pytesseract.Output.DICT,
+                    timeout=OCR_TESSERACT_TIMEOUT,
                 )
                 text = "\n".join(
                     part.strip()
@@ -657,7 +662,7 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
                 confidence = _ocr_confidence_from_data(data)
             except Exception:
                 try:
-                    text = pytesseract.image_to_string(processed_image, config=config).strip()
+                    text = pytesseract.image_to_string(processed_image, config=config, timeout=OCR_TESSERACT_TIMEOUT).strip()
                     confidence = None
                 except Exception:
                     text = ""

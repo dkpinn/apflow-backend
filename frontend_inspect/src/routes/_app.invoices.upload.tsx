@@ -325,8 +325,8 @@ function InvoiceUploadPage() {
 
       return response;
     },
-    onSuccess: async (response) => {
-      toast.success("Invoice extracted");
+    onSuccess: async () => {
+      toast.success("Queued for extraction");
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["invoices_raw", currentOrgId] }),
         queryClient.invalidateQueries({ queryKey: ["upload_suppliers", currentOrgId] }),
@@ -334,11 +334,6 @@ function InvoiceUploadPage() {
         queryClient.invalidateQueries({ queryKey: ["invoices", currentOrgId] }),
         queryClient.invalidateQueries({ queryKey: ["invoices"] }),
       ]);
-      const extractedId = (response as { extracted_invoice_id?: unknown })
-        ?.extracted_invoice_id;
-      if (typeof extractedId === "string" && extractedId) {
-        navigate({ to: "/invoices/$invoiceId", params: { invoiceId: extractedId } });
-      }
     },
     onError: async (error, raw) => {
       const stage = (error as { stage?: string })?.stage;
@@ -458,7 +453,9 @@ function InvoiceUploadPage() {
                         ])
                       : null);
                   const isProcessing =
-                    extractMutation.isPending && extractMutation.variables?.id === row.id;
+                    (extractMutation.isPending && extractMutation.variables?.id === row.id) ||
+                    parseStatus === "queued" ||
+                    parseStatus === "processing";
                   const extractedRow = extractedByRaw.get(String(row.id));
                   const isExtracted =
                     !!extractedRow ||
@@ -507,7 +504,7 @@ function InvoiceUploadPage() {
                             ) : (
                               <Play className="h-4 w-4" />
                             )}
-                            Extract
+                            {isProcessing ? "Processing…" : "Extract"}
                           </Button>
                         )}
                       </TableCell>

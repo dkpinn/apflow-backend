@@ -1,5 +1,5 @@
 -- ============================================================
--- APFlow Supplier Extraction Profile Phase B3.4
+-- APPayPal Supplier Extraction Profile Phase B3.4
 -- Adds optional supplier profile fields that are already extracted
 -- from invoices/receipts but were not present on suppliers.
 -- Apply manually in external Supabase.

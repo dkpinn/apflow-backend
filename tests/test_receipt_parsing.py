@@ -32,9 +32,9 @@ def test_builders_receipt_defaults_to_cash_card_recipient():
     result = classify_document_direction(
         BUILDERS_RECEIPT_TEXT,
         {
-            "name": "APFlow Demo",
-            "legal_name": "APFlow Demo (Pty) Ltd",
-            "trading_name": "APFlow",
+            "name": "APPayPal Demo",
+            "legal_name": "APPayPal Demo (Pty) Ltd",
+            "trading_name": "APPayPal",
         },
     )
 

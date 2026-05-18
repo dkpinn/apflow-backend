@@ -35,8 +35,13 @@ from app.services.invoice_parse_attempts import (
     persist_parse_attempts,
 )
 from app.services.invoice_ocr_pipeline import (
+    calculate_confidence,
     extract_text_with_fallback,
     parse_invoice_fields,
+)
+from app.services.invoice_extraction.vlm_parser import (
+    VLM_MERGE_FIELDS,
+    extract_with_gemini,
 )
 from app.services.invoice_previews import persist_preview_artifacts
 from app.services.invoice_extraction.entity_detection import classify_document_direction, normalise_name
@@ -818,7 +823,7 @@ def queue_invoice_job(
         event_type="queued_for_processing",
         stage="queued",
         actor_type="api",
-        notes="Invoice queued in APFlow document processing holding pen.",
+        notes="Invoice queued in APPayPal document processing holding pen.",
     )
 
     return job
@@ -954,6 +959,47 @@ def run_invoice_extraction(
 
         parsed_data = parse_invoice_fields(text)
 
+        vlm_should_try = (
+            parsed_data.get("confidence_score", 0) < 0.70
+            or not parsed_data.get("invoice_number")
+            or not parsed_data.get("total_amount")
+            or not parsed_data.get("supplier_name_extracted")
+        )
+
+        if vlm_should_try:
+            vlm_data = extract_with_gemini(file_bytes, raw.get("file_type"))
+            if vlm_data is not None:
+                vlm_confidence = vlm_data.get("confidence_score", 0)
+                tesseract_confidence = parsed_data.get("confidence_score", 0)
+
+                for field in VLM_MERGE_FIELDS:
+                    vlm_value = vlm_data.get(field)
+                    if vlm_value is not None and vlm_value != [] and vlm_value != "":
+                        if not parsed_data.get(field) or vlm_confidence > tesseract_confidence:
+                            parsed_data[field] = vlm_value
+
+                parsed_data["confidence_score"] = calculate_confidence(parsed_data)
+
+                log_invoice_event(
+                    supabase,
+                    organisation_id=org_id,
+                    invoice_raw_id=invoice_raw_id,
+                    job_id=job_id,
+                    event_type="vlm_extraction_completed",
+                    stage="field_extraction",
+                    actor_type="worker" if job_id else "api",
+                    new_value={
+                        "vlm_confidence": vlm_confidence,
+                        "tesseract_confidence": tesseract_confidence,
+                        "merged_confidence": parsed_data.get("confidence_score"),
+                        "vlm_supplier": vlm_data.get("supplier_name_extracted"),
+                        "vlm_invoice_number": vlm_data.get("invoice_number"),
+                        "vlm_total": vlm_data.get("total_amount"),
+                        "vlm_line_items_count": len(vlm_data.get("line_items") or []),
+                    },
+                    notes=f"Gemini VLM fallback merged. VLM confidence={vlm_confidence:.2f}, Tesseract confidence={tesseract_confidence:.2f}.",
+                )
+
         organisation = get_organisation(org_id)
         direction_result = classify_document_direction(text, organisation)
 
@@ -968,7 +1014,7 @@ def run_invoice_extraction(
         supplier_correction_reason = None
 
         # Correct the common AP extraction error where the parser picks the
-        # recipient/customer block as the supplier. In APFlow, "supplier" means
+        # recipient/customer block as the supplier. In APPayPal, "supplier" means
         # the invoice issuer/vendor, not the recipient/customer.
         original_supplier_norm = normalise_name(original_supplier_name)
         issuer_norm = normalise_name(direction_result.issuer_name)
@@ -1513,6 +1559,50 @@ def run_invoice_re_extraction(
 
         parsed_data = deep_result.get("parsed_data") or {}
         deep_text = deep_result.get("text") or ""
+
+        vlm_should_try = (
+            parsed_data.get("confidence_score", 0) < 0.70
+            or not parsed_data.get("invoice_number")
+            or not parsed_data.get("total_amount")
+            or not parsed_data.get("supplier_name_extracted")
+        )
+
+        if vlm_should_try:
+            vlm_data = extract_with_gemini(file_bytes, raw.get("file_type"))
+            print("RE-EXTRACT VLM RAW RESULT:", vlm_data)
+            if vlm_data is not None:
+                vlm_confidence = vlm_data.get("confidence_score", 0)
+                tesseract_confidence = parsed_data.get("confidence_score", 0)
+                print(f"RE-EXTRACT VLM LINE ITEMS: {len(vlm_data.get('line_items') or [])} items — {vlm_data.get('line_items')}")
+
+                for field in VLM_MERGE_FIELDS:
+                    vlm_value = vlm_data.get(field)
+                    if vlm_value is not None and vlm_value != [] and vlm_value != "":
+                        if not parsed_data.get(field) or vlm_confidence > tesseract_confidence:
+                            parsed_data[field] = vlm_value
+
+                print(f"RE-EXTRACT MERGED LINE ITEMS: {len(parsed_data.get('line_items') or [])} items")
+                parsed_data["confidence_score"] = calculate_confidence(parsed_data)
+
+                log_invoice_event(
+                    supabase,
+                    organisation_id=org_id,
+                    invoice_raw_id=payload.invoice_raw_id,
+                    invoice_extracted_id=extracted_invoice_id,
+                    event_type="vlm_extraction_completed",
+                    stage="field_extraction",
+                    actor_type="api",
+                    new_value={
+                        "vlm_confidence": vlm_confidence,
+                        "tesseract_confidence": tesseract_confidence,
+                        "merged_confidence": parsed_data.get("confidence_score"),
+                        "vlm_supplier": vlm_data.get("supplier_name_extracted"),
+                        "vlm_invoice_number": vlm_data.get("invoice_number"),
+                        "vlm_total": vlm_data.get("total_amount"),
+                        "vlm_line_items_count": len(vlm_data.get("line_items") or []),
+                    },
+                    notes=f"Gemini VLM fallback merged during re-extract. VLM confidence={vlm_confidence:.2f}, deep OCR confidence={tesseract_confidence:.2f}.",
+                )
 
         organisation = get_organisation(org_id)
         direction_result = classify_document_direction(deep_text, organisation)

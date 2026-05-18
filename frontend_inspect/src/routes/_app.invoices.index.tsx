@@ -151,7 +151,7 @@ function InvoicesList() {
     <>
       <PageHeader
         title="Invoices"
-        description="Parsed invoices captured by APFlow."
+        description="Parsed invoices captured by APPayPal."
         actions={
           <>
             {canEditData && (

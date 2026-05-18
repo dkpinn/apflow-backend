@@ -6,7 +6,7 @@ from app.routers import invoices
 from app.routers import suppliers
 
 app = FastAPI(
-    title="APFlow Backend",
+    title="APPayPal Backend",
     version="0.1.0",
 )
 
@@ -30,7 +30,7 @@ app.include_router(suppliers.router)
 
 @app.get("/")
 def root():
-    return {"message": "APFlow backend is running"}
+    return {"message": "APPayPal backend is running"}
 
 
 @app.get("/test-db")

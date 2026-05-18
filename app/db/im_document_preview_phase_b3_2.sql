@@ -1,5 +1,5 @@
 -- ============================================================
--- APFlow Document Preview Phase B3.2
+-- APPayPal Document Preview Phase B3.2
 -- Adds preview artifact and receipt/photo preprocessing metadata.
 -- Apply manually in external Supabase.
 -- Idempotent. Does not change RLS.

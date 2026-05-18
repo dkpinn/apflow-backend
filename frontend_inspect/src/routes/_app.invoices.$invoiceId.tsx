@@ -82,6 +82,11 @@ function InvoiceDetail() {
   const queryClient = useQueryClient();
   const [saving, setSaving] = useState(false);
   const [reextracting, setReextracting] = useState(false);
+  const [reextractJob, setReextractJob] = useState<{
+    job_id: string;
+    stage_label: string;
+    progress: number;
+  } | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<null | "extracted" | "all">(null);
   const [editOpen, setEditOpen] = useState(false);
@@ -516,6 +521,8 @@ function InvoiceDetail() {
     setReextracting(true);
     setLineItemsReextractDiagnostic(null);
     storeLineItemsDiagnostic((data?.id as string | undefined) ?? invoiceId, null);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000);
     try {
       const res = await fetch(`${FASTAPI_URL.replace(/\/$/, "")}/api/invoices/re-extract`, {
         method: "POST",
@@ -524,7 +531,9 @@ function InvoiceDetail() {
           invoice_raw_id: rawId,
           organisation_id: currentOrgId,
         }),
+        signal: controller.signal,
       });
+      clearTimeout(timer);
       const text = await res.text().catch(() => "");
       if (!res.ok) throw new Error(text || `Re-extract failed (${res.status})`);
       let parsed: Record<string, unknown> = {};
@@ -533,42 +542,92 @@ function InvoiceDetail() {
       } catch {
         // ignore
       }
-      const diagnostic = parseLineItemsReextractDiagnostic(parsed);
-      toast.success("Invoice re-extracted");
-      const extractedId = parsed.extracted_invoice_id;
-      const targetInvoiceId =
-        typeof extractedId === "string" && extractedId
-          ? extractedId
-          : ((data?.id as string | undefined) ?? invoiceId);
-      setLineItemsReextractDiagnostic(diagnostic);
-      storeLineItemsDiagnostic(targetInvoiceId, diagnostic);
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["invoice_extracted"] }),
-        queryClient.invalidateQueries({ queryKey: ["invoices_raw_for_review", rawId] }),
-        queryClient.invalidateQueries({ queryKey: ["document_pages_for_review", rawId] }),
-        queryClient.invalidateQueries({ queryKey: ["invoice_line_items"] }),
-        queryClient.invalidateQueries({ queryKey: ["invoice_raw_audit_events", rawId] }),
-      ]);
-      if (typeof extractedId === "string" && extractedId && extractedId !== invoiceId) {
-        navigate({ to: "/invoices/$invoiceId", params: { invoiceId: extractedId } });
+      const jobId = parsed.job_id as string | undefined;
+      if (jobId) {
+        // Job is queued — polling effect takes over from here
+        setReextractJob({ job_id: jobId, stage_label: "Queued", progress: 0 });
       } else {
+        // Synchronous fallback (e.g. ?sync=true) — treat response as final result
+        const diagnostic = parseLineItemsReextractDiagnostic(parsed);
+        setLineItemsReextractDiagnostic(diagnostic);
+        storeLineItemsDiagnostic((data?.id as string | undefined) ?? invoiceId, diagnostic);
+        toast.success("Invoice re-extracted");
+        setReextracting(false);
         await Promise.all([
-          refetch(),
-          refetchRawRecord(),
-          refetchDocumentPages(),
-          queryClient.refetchQueries({
-            queryKey: ["invoice_line_items", targetInvoiceId],
-            type: "active",
-          }),
-          refetchAudit(),
+          queryClient.invalidateQueries({ queryKey: ["invoice_extracted"] }),
+          queryClient.invalidateQueries({ queryKey: ["invoices_raw_for_review", rawId] }),
+          queryClient.invalidateQueries({ queryKey: ["document_pages_for_review", rawId] }),
+          queryClient.invalidateQueries({ queryKey: ["invoice_line_items"] }),
+          queryClient.invalidateQueries({ queryKey: ["invoice_raw_audit_events", rawId] }),
         ]);
+        await Promise.all([refetch(), refetchRawRecord(), refetchDocumentPages(), refetchAudit()]);
       }
     } catch (e) {
-      toast.error((e as Error).message);
-    } finally {
+      clearTimeout(timer);
       setReextracting(false);
+      const msg = (e as Error).name === "AbortError"
+        ? "Request timed out — retry in a moment."
+        : (e as Error).message;
+      toast.error(msg);
     }
   }
+
+  useEffect(() => {
+    if (!reextractJob) return;
+    const jobId = reextractJob.job_id;
+
+    const poll = async () => {
+      try {
+        const res = await fetch(
+          `${FASTAPI_URL.replace(/\/$/, "")}/api/invoices/re-extract/${jobId}/status`,
+        );
+        if (!res.ok) return;
+        const status = (await res.json()) as {
+          status: string;
+          stage_label: string;
+          progress: number;
+          error?: string;
+          extracted_invoice_id?: string;
+          diagnostic?: Record<string, unknown>;
+        };
+
+        setReextractJob((prev) =>
+          prev?.job_id === jobId
+            ? { ...prev, stage_label: status.stage_label, progress: status.progress }
+            : prev,
+        );
+
+        if (status.status === "completed") {
+          const diagnostic = parseLineItemsReextractDiagnostic(status.diagnostic ?? {});
+          const targetId = status.extracted_invoice_id ?? (data?.id as string | undefined) ?? invoiceId;
+          setReextractJob(null);
+          setReextracting(false);
+          setLineItemsReextractDiagnostic(diagnostic);
+          storeLineItemsDiagnostic(targetId, diagnostic);
+          toast.success("Invoice re-extracted");
+          await Promise.all([
+            queryClient.invalidateQueries({ queryKey: ["invoice_extracted"] }),
+            queryClient.invalidateQueries({ queryKey: ["invoices_raw_for_review", rawId] }),
+            queryClient.invalidateQueries({ queryKey: ["document_pages_for_review", rawId] }),
+            queryClient.invalidateQueries({ queryKey: ["invoice_line_items"] }),
+            queryClient.invalidateQueries({ queryKey: ["invoice_raw_audit_events", rawId] }),
+          ]);
+          await Promise.all([refetch(), refetchRawRecord(), refetchDocumentPages(), refetchAudit()]);
+        } else if (status.status === "failed") {
+          setReextractJob(null);
+          setReextracting(false);
+          toast.error(status.error || "Re-extraction failed");
+        }
+      } catch {
+        // transient poll error — keep polling
+      }
+    };
+
+    poll();
+    const id = setInterval(poll, 1500);
+    return () => clearInterval(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reextractJob?.job_id]);
 
   async function handleDelete(mode: "extracted" | "all") {
     setDeleting(true);
@@ -853,17 +912,22 @@ function InvoiceDetail() {
                 onClick={handleReextract}
                 className="gap-2"
               >
-                <RotateCcw className="h-4 w-4" />
-                {reextracting ? "Re-extracting…" : "Re-extract"}
+                <RotateCcw className={`h-4 w-4 ${reextracting ? "animate-spin" : ""}`} />
+                {reextracting
+                  ? reextractJob
+                    ? `${reextractJob.stage_label} ${reextractJob.progress}%`
+                    : "Queuing…"
+                  : "Re-extract"}
               </Button>
               <Button
                 size="sm"
                 variant="outline"
-                disabled={saving}
-                onClick={() => toast.info("Save coming soon — wire to FastAPI")}
+                disabled={saving || approving}
+                onClick={handleSave}
                 className="gap-2"
               >
-                <Save className="h-4 w-4" /> Save
+                <Save className="h-4 w-4" />
+                {saving ? "Saving…" : "Save"}
               </Button>
               <Button
                 size="sm"
@@ -875,11 +939,12 @@ function InvoiceDetail() {
               </Button>
               <Button
                 size="sm"
-                variant="ghost"
-                disabled
+                disabled={saving || approving}
+                onClick={handleApprove}
                 className="gap-2"
               >
-                <Send className="h-4 w-4" /> Approve invoice
+                <CheckCircle2 className="h-4 w-4" />
+                {approving ? "Approving…" : "Approve invoice"}
               </Button>
               <div className="ml-auto flex flex-wrap items-center gap-2">
                 <Button
@@ -1747,33 +1812,6 @@ function EditableExtractedCard({
               onChange={(e) => set("currency", e.target.value)}
             />
           </div>
-        </div>
-        <Separator className="my-5" />
-        <div className="flex flex-wrap items-center justify-end gap-2">
-          <Link to="/invoices/upload">
-            <Button variant="ghost" size="sm" className="gap-2">
-              <ArrowLeft className="h-4 w-4" /> Back to upload queue
-            </Button>
-          </Link>
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-2"
-            onClick={handleSave}
-            disabled={saving || approving}
-          >
-            <Save className="h-4 w-4" />
-            {saving ? "Saving…" : "Save changes"}
-          </Button>
-          <Button
-            size="sm"
-            className="gap-2"
-            onClick={handleApprove}
-            disabled={saving || approving}
-          >
-            <CheckCircle2 className="h-4 w-4" />
-            {approving ? "Approving…" : "Approve invoice"}
-          </Button>
         </div>
       </CardContent>
     </Card>
@@ -2915,7 +2953,7 @@ function readDiagnosticBool(value: unknown): boolean | null {
 }
 
 function lineItemsDiagnosticStorageKey(invoiceId: string) {
-  return `apflow:line-items-reextract-diagnostic:${invoiceId}`;
+  return `appaypal:line-items-reextract-diagnostic:${invoiceId}`;
 }
 
 function readStoredLineItemsDiagnostic(invoiceId: string): LineItemsReextractDiagnostic | null {

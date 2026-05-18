@@ -1,5 +1,5 @@
 -- ============================================================
--- APFlow OCR / Photo Quality Phase B3
+-- APPayPal OCR / Photo Quality Phase B3
 -- No schema changes required if document_pages already includes:
 --   image_quality_score numeric
 --   ocr_confidence numeric

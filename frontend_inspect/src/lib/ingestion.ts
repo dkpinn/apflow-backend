@@ -143,21 +143,33 @@ export function getFastApiUrl() {
   return base.replace(/\/$/, "");
 }
 
+// Frontend fetch timeout — keeps the browser responsive if FastAPI is slow.
+// The backend has its own per-stage timeouts; this is a last-resort safety net.
+const EXTRACTION_FETCH_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
 export async function callExtraction(
   endpoint: "/api/invoices/extract" | "/api/extract/statement" | "/api/extract/invoice",
   body: Record<string, unknown>,
 ) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), EXTRACTION_FETCH_TIMEOUT_MS);
   let response: Response;
   try {
     response = await fetch(`${getFastApiUrl()}${endpoint}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: controller.signal,
     });
   } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      throw new Error("Extraction timed out — the server is still processing in the background. Refresh in a moment.");
+    }
     // eslint-disable-next-line no-console
     console.error("EXTRACT ERROR", err, { stage: "fetch", endpoint, body });
     throw err;
+  } finally {
+    clearTimeout(timer);
   }
 
   const rawText = await response.text().catch(() => "");
