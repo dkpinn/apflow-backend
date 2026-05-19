@@ -63,53 +63,59 @@ def persist_preview_artifacts(
     text_result: dict,
 ) -> dict:
     """
-    Store page-1 original and processed OCR preview images, then attach their
-    storage paths back onto the text_result page metadata.
+    Store original and processed OCR preview images for ALL pages, then attach
+    storage paths back onto each page dict in text_result so _capture_document_pages
+    can persist them to the document_pages table.
     """
     pages = text_result.get("pages") or []
-    page_one = next((page for page in pages if (page.get("page_number") or 1) == 1), pages[0] if pages else None)
-    if not page_one:
-        return {}
-
-    original_image = page_one.get("original_preview_image")
-    processed_image = page_one.get("processed_preview_image")
-    if not original_image and not processed_image:
+    if not pages:
         return {}
 
     result: dict = {}
 
-    try:
-        if original_image:
-            original_path = upload_invoice_preview_image(
-                supabase,
-                storage_path=f"{organisation_id}/invoices/previews/{invoice_raw_id}/page-1-original.jpg",
-                image=original_image,
-            )
-            page_one["original_preview_path"] = original_path
-            text_result["original_preview_path"] = original_path
-            result["preview_path"] = original_path
+    for page in pages:
+        page_number = page.get("page_number") or 1
+        original_image = page.get("original_preview_image")
+        processed_image = page.get("processed_preview_image")
+        if not original_image and not processed_image:
+            continue
 
-        if processed_image:
-            processed_path = upload_invoice_preview_image(
-                supabase,
-                storage_path=f"{organisation_id}/invoices/previews/{invoice_raw_id}/page-1-processed.jpg",
-                image=processed_image,
-            )
-            page_one["processed_preview_path"] = processed_path
-            text_result["processed_preview_path"] = processed_path
-            result["processed_preview_path"] = processed_path
+        try:
+            if original_image:
+                original_path = upload_invoice_preview_image(
+                    supabase,
+                    storage_path=f"{organisation_id}/invoices/previews/{invoice_raw_id}/page-{page_number}-original.jpg",
+                    image=original_image,
+                )
+                page["original_preview_path"] = original_path
+                if page_number == 1:
+                    text_result["original_preview_path"] = original_path
+                    result["preview_path"] = original_path
 
-        if result:
-            update_payload = {"updated_at": utc_now_iso()}
-            if result.get("preview_path"):
-                update_payload["preview_path"] = result["preview_path"]
-            if result.get("processed_preview_path"):
-                update_payload["processed_preview_path"] = result["processed_preview_path"]
+            if processed_image:
+                processed_path = upload_invoice_preview_image(
+                    supabase,
+                    storage_path=f"{organisation_id}/invoices/previews/{invoice_raw_id}/page-{page_number}-processed.jpg",
+                    image=processed_image,
+                )
+                page["processed_preview_path"] = processed_path
+                if page_number == 1:
+                    text_result["processed_preview_path"] = processed_path
+                    result["processed_preview_path"] = processed_path
 
+        except Exception as exc:
+            print(f"PREVIEW ARTIFACT STORAGE FAILED (page {page_number}):", str(exc))
+            result["error"] = str(exc)
+
+    update_payload = {"updated_at": utc_now_iso()}
+    if result.get("preview_path"):
+        update_payload["preview_path"] = result["preview_path"]
+    if result.get("processed_preview_path"):
+        update_payload["processed_preview_path"] = result["processed_preview_path"]
+    if len(update_payload) > 1:
+        try:
             supabase.table("invoices_raw").update(update_payload).eq("id", invoice_raw_id).execute()
-
-    except Exception as exc:
-        print("PREVIEW ARTIFACT STORAGE FAILED:", str(exc))
-        result["error"] = str(exc)
+        except Exception as exc:
+            print("INVOICES_RAW PREVIEW UPDATE FAILED:", str(exc))
 
     return result

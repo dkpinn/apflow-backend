@@ -309,6 +309,31 @@ def get_supplier_profile_from_invoice(invoice_extracted_id: str):
     }
 
 
+@router.get("/match-suggest")
+def suggest_supplier_match(invoice_extracted_id: str):
+    """Return best fuzzy name match suggestion for an unlinked invoice."""
+    inv_res = (
+        supabase.table("invoices_extracted")
+        .select("organisation_id, supplier_name_extracted, supplier_id")
+        .eq("id", invoice_extracted_id)
+        .limit(1)
+        .execute()
+    )
+    if not inv_res.data:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    inv = inv_res.data[0]
+    if inv.get("supplier_id"):
+        return {"suggestion": None}
+
+    from app.services.supplier_matcher import find_name_match_suggestion
+    suggestion = find_name_match_suggestion(
+        supabase,
+        org_id=inv["organisation_id"],
+        supplier_name_extracted=inv.get("supplier_name_extracted"),
+    )
+    return {"suggestion": suggestion}
+
+
 @router.post("")
 @router.post("/new")
 def create_supplier(payload: SupplierCreateRequest):

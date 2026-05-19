@@ -1237,6 +1237,25 @@ def run_invoice_extraction(
         "updated_at": utc_now_iso(),
     }
 
+    # Auto-link supplier when not already linked and an exact identifier match exists.
+    if not extracted_payload.get("supplier_id"):
+        try:
+            from app.services.supplier_matcher import attempt_supplier_auto_link
+            matched_id = attempt_supplier_auto_link(
+                supabase,
+                org_id=org_id,
+                supplier_name_extracted=parsed_data.get("supplier_name_extracted"),
+                vat_number_extracted=parsed_data.get("vat_number_extracted"),
+                company_registration_number_extracted=parsed_data.get("company_registration_number_extracted"),
+                cus_code_extracted=parsed_data.get("cus_code_extracted"),
+                bank_account_number_extracted=parsed_data.get("bank_account_number_extracted"),
+            )
+            if matched_id:
+                extracted_payload["supplier_id"] = matched_id
+                print(f"AUTO-LINKED supplier {matched_id} via exact identifier match")
+        except Exception as exc:
+            print(f"SUPPLIER AUTO-MATCH FAILED (non-fatal): {exc}")
+
     print("EXTRACTED PAYLOAD TO SAVE:", extracted_payload)
 
     if job_id:

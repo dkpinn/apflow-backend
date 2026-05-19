@@ -640,8 +640,8 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
         "original_image_quality": original_quality.as_dict(),
         "processed_image_quality": region_quality.as_dict(),
         "receipt_preprocessing_quality": receipt_preprocessing.image_quality,
-        "original_preview_image": preview_images.original_preview if page_number == 1 else None,
-        "processed_preview_image": preview_images.processed_preview if page_number == 1 else None,
+        "original_preview_image": preview_images.original_preview,
+        "processed_preview_image": preview_images.processed_preview,
     }
 
     for variant_name, processed_image in variants:
@@ -706,8 +706,8 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
                 "original_image_quality": original_quality.as_dict(),
                 "processed_image_quality": quality.as_dict(),
                 "receipt_preprocessing_quality": receipt_preprocessing.image_quality,
-                "original_preview_image": preview_images.original_preview if page_number == 1 else None,
-                "processed_preview_image": preview_images.processed_preview if page_number == 1 else None,
+                "original_preview_image": preview_images.original_preview,
+                "processed_preview_image": preview_images.processed_preview,
             }
 
             if candidate["ocr_candidate_score"] > best["ocr_candidate_score"]:
@@ -735,8 +735,8 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
         "original_image_quality": original_quality.as_dict(),
         "processed_image_quality": receipt_preprocessing.image_quality,
         "receipt_preprocessing_quality": receipt_preprocessing.image_quality,
-        "original_preview_image": preview_images.original_preview if page_number == 1 else None,
-        "processed_preview_image": preview_images.processed_preview if page_number == 1 else None,
+        "original_preview_image": preview_images.original_preview,
+        "processed_preview_image": preview_images.processed_preview,
     }
 
 

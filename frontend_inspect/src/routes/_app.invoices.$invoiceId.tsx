@@ -1991,7 +1991,7 @@ function AuditTrail({
               </td>
               <td className="px-4 py-2.5 text-xs">{e.actor}</td>
               <td className="px-4 py-2.5 text-xs text-muted-foreground">
-                {e.createdAt ? fmtDateTime(e.createdAt) : "—"}
+                {formatDateTime(e.createdAt)}
               </td>
             </tr>
           ))}
@@ -2042,7 +2042,7 @@ function InvoiceAuditTrail({ rows }: { rows: AnyRec[] }) {
                 </div>
               </div>
               <div className="text-right text-xs text-muted-foreground">
-                {createdAt ? fmtDateTime(createdAt) : "—"}
+                {formatDateTime(createdAt)}
               </div>
             </div>
 
@@ -2819,11 +2819,11 @@ function auditEvents(row: AnyRec): { label: string; detail: string }[] {
   const created = pickStr(row, ["created_at", "captured_at", "inserted_at"]);
   const updated = pickStr(row, ["updated_at", "modified_at"]);
   const reviewed = pickStr(row, ["reviewed_at", "approved_at"]);
-  if (created) events.push({ label: "Captured", detail: fmtDateTime(created) });
+  if (created) events.push({ label: "Captured", detail: formatDateTime(created) });
   if (updated && updated !== created)
-    events.push({ label: "Updated", detail: fmtDateTime(updated) });
+    events.push({ label: "Updated", detail: formatDateTime(updated) });
   if (reviewed)
-    events.push({ label: "Reviewed", detail: fmtDateTime(reviewed) });
+    events.push({ label: "Reviewed", detail: formatDateTime(reviewed) });
   if (events.length === 0)
     events.push({
       label: "No audit history",
@@ -2986,10 +2986,12 @@ function fmtDate(s: string | null) {
   const d = new Date(s);
   return Number.isNaN(d.getTime()) ? s : d.toLocaleDateString();
 }
-function fmtDateTime(s: string) {
+function formatDateTime(s: string | null) {
+  if (!s) return "-";
   const d = new Date(s);
   return Number.isNaN(d.getTime()) ? s : d.toLocaleString();
 }
+
 function normaliseAcct(s: string) {
   return s.replace(/\s+/g, "").toLowerCase();
 }
