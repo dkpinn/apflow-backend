@@ -51,6 +51,8 @@ KNOWN_SUPPLIER_COLUMNS = {
     "cell",
     "website",
     "source_invoice_extracted_id",
+    "parse_line_items",
+    "line_items_include_vat",
 }
 
 

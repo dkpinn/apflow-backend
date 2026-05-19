@@ -843,6 +843,27 @@ def run_invoice_extraction(
     if not org_id:
         raise HTTPException(status_code=400, detail="Missing organisation_id")
 
+    # Fetch supplier-level extraction preferences.
+    _supplier_settings: dict = {}
+    _supplier_id = raw.get("supplier_id")
+    if _supplier_id:
+        try:
+            _sup_res = (
+                supabase
+                .table("suppliers")
+                .select("parse_line_items, line_items_include_vat")
+                .eq("id", _supplier_id)
+                .limit(1)
+                .execute()
+            )
+            if _sup_res.data:
+                _supplier_settings = _sup_res.data[0]
+        except Exception:
+            pass  # non-fatal — fall back to defaults
+
+    _parse_line_items    = _supplier_settings.get("parse_line_items",       True)
+    _line_items_incl_vat = _supplier_settings.get("line_items_include_vat", False)
+
     file_path = raw.get("file_path")
     if not file_path:
         safe_update_invoice_raw_status(supabase, invoice_raw_id=invoice_raw_id, parse_status="failed")
@@ -1275,6 +1296,40 @@ def run_invoice_extraction(
         )
 
     line_items = parsed_data.get("line_items", [])
+
+    # Apply supplier-level line-item settings.
+    if not _parse_line_items:
+        # Collapse to one summary line item regardless of what was extracted.
+        supplier_name = parsed_data.get("supplier_name_extracted") or "Supplier"
+        total = parsed_data.get("subtotal") or parsed_data.get("total_amount")
+        line_items = [{
+            "description": f"Purchase from {supplier_name}",
+            "quantity": 1,
+            "unit_price": total,
+            "line_total": total,
+        }]
+    elif _line_items_incl_vat and line_items:
+        # Strip VAT from unit prices; derive rate from invoice or fall back to 15%.
+        subtotal   = parsed_data.get("subtotal")
+        tax_amount = parsed_data.get("tax_amount")
+        if tax_amount and subtotal and float(subtotal) > 0:
+            vat_rate = round((float(tax_amount) / float(subtotal)) * 10000) / 10000
+        else:
+            vat_rate = 0.15
+
+        stripped: list[dict] = []
+        for item in line_items:
+            unit_price = item.get("unit_price")
+            qty = item.get("quantity") or 1
+            if unit_price is not None:
+                try:
+                    ex_price = round(float(unit_price) / (1 + vat_rate), 2)
+                    ex_total = round(ex_price * float(qty), 2)
+                    item = {**item, "unit_price": ex_price, "line_total": ex_total}
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+            stripped.append(item)
+        line_items = stripped
 
     if extracted_invoice_id:
         if job_id:

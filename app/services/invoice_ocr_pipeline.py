@@ -192,6 +192,8 @@ def pdf_to_images(file_bytes: bytes, dpi: int = OCR_RENDER_DPI) -> list[Image.Im
         matrix = fitz.Matrix(effective_scale, effective_scale)
         pix = page.get_pixmap(matrix=matrix, alpha=False)
         image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+        if page.rotation:
+            image = image.rotate(-page.rotation, expand=True)
         images.append(resize_for_ocr(image))
 
     return images

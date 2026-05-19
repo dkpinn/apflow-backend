@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import cv2
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
@@ -140,6 +141,25 @@ def otsu_threshold(image: Image.Image) -> Image.Image:
     return Image.fromarray(thresholded)
 
 
+def correct_major_rotation(image: Image.Image) -> Image.Image:
+    """Detect and correct 90/180/270° rotation using Tesseract OSD.
+
+    Falls back to the original image if OSD fails (insufficient text,
+    blurry scan, or Tesseract not available).
+    """
+    try:
+        import pytesseract
+        osd = pytesseract.image_to_osd(image, config="--psm 0 -c min_characters_to_try=5")
+        match = re.search(r"Rotate: (\d+)", osd)
+        if match:
+            angle = int(match.group(1))
+            if angle in (90, 180, 270):
+                return image.rotate(angle, expand=True)
+    except Exception:
+        pass
+    return image
+
+
 def deskew_image(image: Image.Image) -> Image.Image:
     """
     Attempt to deskew a scanned document.
@@ -193,6 +213,7 @@ def preprocess_for_ocr_variants(image: Image.Image) -> list[tuple[str, Image.Ima
     """
     variants: list[tuple[str, Image.Image]] = []
 
+    image = correct_major_rotation(image)
     cropped = crop_to_content(image)
     upscaled = upscale_image(cropped, scale=2.0)
     contrasted = enhance_contrast(upscaled, factor=1.8)
