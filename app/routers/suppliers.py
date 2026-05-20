@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app.db.supabase_client import get_supabase_client
 from app.services.audit_log import log_invoice_event
+from app.services.supplier_matcher import attempt_supplier_auto_link, find_name_match_suggestion
 
 router = APIRouter(prefix="/api/suppliers", tags=["suppliers"])
 supabase = get_supabase_client()
@@ -118,6 +119,49 @@ def _compact(payload: dict) -> dict:
 def _filter_supplier_payload(payload: dict) -> dict:
     columns = _supplier_columns()
     return {key: value for key, value in _compact(payload).items() if key in columns}
+
+
+def _raise_if_duplicate(
+    *,
+    org_id: str,
+    supplier_name: Optional[str] = None,
+    vat_number: Optional[str] = None,
+    company_registration_number: Optional[str] = None,
+    account_number: Optional[str] = None,
+    bank_account_number: Optional[str] = None,
+) -> None:
+    existing_id = attempt_supplier_auto_link(
+        supabase,
+        org_id=org_id,
+        vat_number_extracted=vat_number,
+        company_registration_number_extracted=company_registration_number,
+        cus_code_extracted=account_number,
+        bank_account_number_extracted=bank_account_number,
+    )
+    if existing_id is None and supplier_name:
+        suggestion = find_name_match_suggestion(supabase, org_id=org_id, supplier_name_extracted=supplier_name)
+        if suggestion:
+            existing_id = suggestion["id"]
+            existing_name = suggestion["supplier_name"]
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Duplicate supplier",
+                    "existing_supplier_id": existing_id,
+                    "existing_supplier_name": existing_name,
+                },
+            )
+    if existing_id:
+        res = supabase.table("suppliers").select("id, supplier_name").eq("id", existing_id).limit(1).execute()
+        existing = _first(res.data)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Duplicate supplier",
+                "existing_supplier_id": existing_id,
+                "existing_supplier_name": existing.get("supplier_name") if existing else None,
+            },
+        )
 
 
 def get_extracted_invoice(invoice_extracted_id: str) -> dict:
@@ -349,6 +393,15 @@ def create_supplier(payload: SupplierCreateRequest):
     if not insert_payload.get("supplier_name"):
         raise HTTPException(status_code=400, detail="Missing supplier_name")
 
+    _raise_if_duplicate(
+        org_id=insert_payload["organisation_id"],
+        supplier_name=insert_payload.get("supplier_name"),
+        vat_number=insert_payload.get("vat_number"),
+        company_registration_number=insert_payload.get("company_registration_number"),
+        account_number=insert_payload.get("account_number"),
+        bank_account_number=insert_payload.get("bank_account_number"),
+    )
+
     res = supabase.table("suppliers").insert(insert_payload).execute()
     supplier = _first(res.data)
     if not supplier:
@@ -379,6 +432,15 @@ def create_supplier_from_invoice(payload: SupplierFromInvoiceRequest):
 
     if not insert_payload.get("supplier_name"):
         raise HTTPException(status_code=400, detail="No supplier name was extracted")
+
+    _raise_if_duplicate(
+        org_id=insert_payload["organisation_id"],
+        supplier_name=insert_payload.get("supplier_name"),
+        vat_number=insert_payload.get("vat_number"),
+        company_registration_number=insert_payload.get("company_registration_number"),
+        account_number=insert_payload.get("account_number"),
+        bank_account_number=insert_payload.get("bank_account_number"),
+    )
 
     res = supabase.table("suppliers").insert(insert_payload).execute()
     supplier = _first(res.data)

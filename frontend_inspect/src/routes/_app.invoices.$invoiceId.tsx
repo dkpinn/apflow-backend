@@ -842,12 +842,77 @@ function InvoiceDetail() {
 
   return (
     <>
-      <div className="mb-5">
+      <div className="mb-5 flex flex-wrap items-center gap-3">
         <Link to="/invoices">
           <Button variant="ghost" size="sm" className="-ml-2 gap-2">
             <ArrowLeft className="h-4 w-4" /> Back to invoices
           </Button>
         </Link>
+        {data && (
+          <div className="ml-auto flex w-fit max-w-full flex-wrap items-center justify-end gap-2 rounded-lg border bg-card p-2 shadow-sm">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={reextracting || !rawId}
+              onClick={handleReextract}
+              className="gap-2"
+            >
+              <RotateCcw className={`h-4 w-4 ${reextracting ? "animate-spin" : ""}`} />
+              {reextracting
+                ? reextractJob
+                  ? `${reextractJob.stage_label} ${reextractJob.progress}%`
+                  : "Queuing…"
+                : "Re-extract"}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={saving || approving}
+              onClick={handleSave}
+              className="gap-2"
+            >
+              <Save className="h-4 w-4" />
+              {saving ? "Saving…" : "Save"}
+            </Button>
+            <Button
+              size="sm"
+              disabled={saving}
+              onClick={handleMarkReviewed}
+              className="gap-2"
+            >
+              <CheckCircle2 className="h-4 w-4" /> Mark reviewed
+            </Button>
+            <Button
+              size="sm"
+              disabled={saving || approving}
+              onClick={handleApprove}
+              className="gap-2"
+            >
+              <CheckCircle2 className="h-4 w-4" />
+              {approving ? "Approving…" : "Approve invoice"}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={deleting}
+              onClick={() => setConfirmDelete("extracted")}
+              className="gap-2"
+            >
+              <Trash2 className="h-4 w-4" /> Delete
+            </Button>
+            {(search.admin || search.from === "upload") && (
+              <Button
+                size="sm"
+                variant="destructive"
+                disabled={deleting}
+                onClick={() => setConfirmDelete("all")}
+                className="gap-2"
+              >
+                <Trash2 className="h-4 w-4" /> Delete upload and extracted
+              </Button>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="mb-7 flex flex-wrap items-end justify-between gap-4 border-b pb-5">
@@ -902,75 +967,6 @@ function InvoiceDetail() {
         </div>
       ) : (
         <div className="space-y-5">
-          {/* Compact action toolbar */}
-          <Card className="card-elevated">
-            <CardContent className="flex flex-wrap items-center gap-2 p-3">
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={reextracting || !rawId}
-                onClick={handleReextract}
-                className="gap-2"
-              >
-                <RotateCcw className={`h-4 w-4 ${reextracting ? "animate-spin" : ""}`} />
-                {reextracting
-                  ? reextractJob
-                    ? `${reextractJob.stage_label} ${reextractJob.progress}%`
-                    : "Queuing…"
-                  : "Re-extract"}
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={saving || approving}
-                onClick={handleSave}
-                className="gap-2"
-              >
-                <Save className="h-4 w-4" />
-                {saving ? "Saving…" : "Save"}
-              </Button>
-              <Button
-                size="sm"
-                disabled={saving}
-                onClick={handleMarkReviewed}
-                className="gap-2"
-              >
-                <CheckCircle2 className="h-4 w-4" /> Mark reviewed
-              </Button>
-              <Button
-                size="sm"
-                disabled={saving || approving}
-                onClick={handleApprove}
-                className="gap-2"
-              >
-                <CheckCircle2 className="h-4 w-4" />
-                {approving ? "Approving…" : "Approve invoice"}
-              </Button>
-              <div className="ml-auto flex flex-wrap items-center gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={deleting}
-                  onClick={() => setConfirmDelete("extracted")}
-                  className="gap-2"
-                >
-                  <Trash2 className="h-4 w-4" /> Delete
-                </Button>
-                {(search.admin || search.from === "upload") && (
-                  <Button
-                    size="sm"
-                    variant="destructive"
-                    disabled={deleting}
-                    onClick={() => setConfirmDelete("all")}
-                    className="gap-2"
-                  >
-                    <Trash2 className="h-4 w-4" /> Delete upload and extracted
-                  </Button>
-                )}
-              </div>
-            </CardContent>
-          </Card>
-
           {/* Two-column review area: Document Preview (wider) | Tabs */}
           <div className="grid gap-5 lg:grid-cols-5">
             <Card className="card-elevated lg:col-span-3">
