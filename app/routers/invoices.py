@@ -34,6 +34,11 @@ from app.services.invoice_parse_attempts import (
     fetch_parse_attempts,
     persist_parse_attempts,
 )
+from app.services.invoice_supplier_rules import (
+    apply_supplier_processing_rules,
+    fetch_supplier_processing_settings,
+    reapply_supplier_rules_to_invoice,
+)
 from app.services.invoice_ocr_pipeline import (
     calculate_confidence,
     extract_text_with_fallback,
@@ -47,7 +52,10 @@ from app.services.invoice_previews import persist_preview_artifacts
 from app.services.invoice_extraction.entity_detection import classify_document_direction, normalise_name
 
 router = APIRouter(prefix="/api/invoices", tags=["invoices"])
-supabase = get_supabase_client()
+try:
+    supabase = get_supabase_client()
+except Exception:
+    supabase = None  # will fail on first API call; create .env with SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY
 
 
 REEXTRACT_STAGE_PROGRESS = {
@@ -150,6 +158,19 @@ class ReExtractInvoiceRequest(BaseModel):
     invoice_raw_id: str
     organisation_id: Optional[str] = None
     force_update: bool = False
+
+
+class SaveLineItemsRequest(BaseModel):
+    invoice_extracted_id: str
+    organisation_id: str
+    supplier_id: Optional[str] = None
+    line_items: list[dict]
+    document_total: Optional[float] = None  # original VLM-extracted total; rounding reference
+
+
+class GeneratePreviewRequest(BaseModel):
+    invoice_raw_id: str
+    organisation_id: str
 
 
 def utc_now_iso() -> str:
@@ -843,27 +864,6 @@ def run_invoice_extraction(
     if not org_id:
         raise HTTPException(status_code=400, detail="Missing organisation_id")
 
-    # Fetch supplier-level extraction preferences.
-    _supplier_settings: dict = {}
-    _supplier_id = raw.get("supplier_id")
-    if _supplier_id:
-        try:
-            _sup_res = (
-                supabase
-                .table("suppliers")
-                .select("parse_line_items, line_items_include_vat")
-                .eq("id", _supplier_id)
-                .limit(1)
-                .execute()
-            )
-            if _sup_res.data:
-                _supplier_settings = _sup_res.data[0]
-        except Exception:
-            pass  # non-fatal — fall back to defaults
-
-    _parse_line_items    = _supplier_settings.get("parse_line_items",       True)
-    _line_items_incl_vat = _supplier_settings.get("line_items_include_vat", False)
-
     file_path = raw.get("file_path")
     if not file_path:
         safe_update_invoice_raw_status(supabase, invoice_raw_id=invoice_raw_id, parse_status="failed")
@@ -1234,8 +1234,12 @@ def run_invoice_extraction(
         "bank_account_number_extracted": parsed_data.get("bank_account_number_extracted"),
         "bank_branch_code_extracted": parsed_data.get("bank_branch_code_extracted"),
         "bank_swift_code_extracted": parsed_data.get("bank_swift_code_extracted"),
+        "document_type": parsed_data.get("document_type") or "tax_invoice",
+        "document_count": parsed_data.get("document_count") or 1,
         "updated_at": utc_now_iso(),
     }
+
+    auto_linked_supplier_id = None
 
     # Auto-link supplier when not already linked and an exact identifier match exists.
     if not extracted_payload.get("supplier_id"):
@@ -1252,9 +1256,25 @@ def run_invoice_extraction(
             )
             if matched_id:
                 extracted_payload["supplier_id"] = matched_id
+                auto_linked_supplier_id = matched_id
+                try:
+                    supabase.table("invoices_raw").update({
+                        "supplier_id": matched_id,
+                        "updated_at": utc_now_iso(),
+                    }).eq("id", invoice_raw_id).execute()
+                except Exception as raw_link_exc:
+                    print(f"INVOICES_RAW AUTO-LINK UPDATE FAILED (non-fatal): {raw_link_exc}")
                 print(f"AUTO-LINKED supplier {matched_id} via exact identifier match")
         except Exception as exc:
             print(f"SUPPLIER AUTO-MATCH FAILED (non-fatal): {exc}")
+
+    supplier_settings = fetch_supplier_processing_settings(
+        supabase,
+        extracted_payload.get("supplier_id"),
+    )
+    supplier_rule_result = apply_supplier_processing_rules(parsed_data, supplier_settings)
+    extracted_payload.update(supplier_rule_result["invoice_patch"])
+    line_items = supplier_rule_result["line_items"]
 
     print("EXTRACTED PAYLOAD TO SAVE:", extracted_payload)
 
@@ -1314,41 +1334,22 @@ def run_invoice_extraction(
             notes="Created extracted invoice row.",
         )
 
-    line_items = parsed_data.get("line_items", [])
-
-    # Apply supplier-level line-item settings.
-    if not _parse_line_items:
-        # Collapse to one summary line item regardless of what was extracted.
-        supplier_name = parsed_data.get("supplier_name_extracted") or "Supplier"
-        total = parsed_data.get("subtotal") or parsed_data.get("total_amount")
-        line_items = [{
-            "description": f"Purchase from {supplier_name}",
-            "quantity": 1,
-            "unit_price": total,
-            "line_total": total,
-        }]
-    elif _line_items_incl_vat and line_items:
-        # Strip VAT from unit prices; derive rate from invoice or fall back to 15%.
-        subtotal   = parsed_data.get("subtotal")
-        tax_amount = parsed_data.get("tax_amount")
-        if tax_amount and subtotal and float(subtotal) > 0:
-            vat_rate = round((float(tax_amount) / float(subtotal)) * 10000) / 10000
-        else:
-            vat_rate = 0.15
-
-        stripped: list[dict] = []
-        for item in line_items:
-            unit_price = item.get("unit_price")
-            qty = item.get("quantity") or 1
-            if unit_price is not None:
-                try:
-                    ex_price = round(float(unit_price) / (1 + vat_rate), 2)
-                    ex_total = round(ex_price * float(qty), 2)
-                    item = {**item, "unit_price": ex_price, "line_total": ex_total}
-                except (TypeError, ValueError, ZeroDivisionError):
-                    pass
-            stripped.append(item)
-        line_items = stripped
+    if auto_linked_supplier_id and extracted_invoice_id:
+        log_invoice_event(
+            supabase,
+            organisation_id=org_id,
+            invoice_raw_id=invoice_raw_id,
+            invoice_extracted_id=extracted_invoice_id,
+            job_id=job_id,
+            event_type="supplier_auto_linked",
+            stage="supplier_auto_link",
+            actor_type="worker" if job_id else "api",
+            new_value={
+                "supplier_id": auto_linked_supplier_id,
+                "match_type": "exact_identifier",
+            },
+            notes="Supplier auto-linked from exact extracted identifier match.",
+        )
 
     if extracted_invoice_id:
         if job_id:
@@ -1363,6 +1364,24 @@ def run_invoice_extraction(
             delete_when_empty=True,
             raise_on_error=True,
         )
+
+        if extracted_payload.get("supplier_id"):
+            log_invoice_event(
+                supabase,
+                organisation_id=org_id,
+                invoice_raw_id=invoice_raw_id,
+                invoice_extracted_id=extracted_invoice_id,
+                job_id=job_id,
+                event_type="supplier_rules_applied",
+                stage="supplier_processing_rules",
+                actor_type="worker" if job_id else "api",
+                new_value={
+                    "supplier_id": extracted_payload.get("supplier_id"),
+                    "invoice_patch": supplier_rule_result["invoice_patch"],
+                    **line_item_diagnostics,
+                },
+                notes="Supplier processing rules applied during extraction.",
+            )
 
         if line_items:
             print("INSERTED LINE ITEMS:", line_item_diagnostics)
@@ -1430,10 +1449,13 @@ def run_invoice_extraction(
             notes=parse_attempt_result.get("parse_attempts_insert_error"),
         )
 
+    _doc_count = parsed_data.get("document_count") or 1
+    _final_status = "needs_split" if _doc_count > 1 else "completed"
+
     safe_update_invoice_raw_status(
         supabase,
         invoice_raw_id=invoice_raw_id,
-        parse_status="completed",
+        parse_status=_final_status,
         extra={"parse_completed_at": utc_now_iso()},
     )
 
@@ -1444,10 +1466,12 @@ def run_invoice_extraction(
         invoice_extracted_id=extracted_invoice_id,
         job_id=job_id,
         event_type="extraction_completed",
-        stage="completed",
+        stage=_final_status,
         actor_type="worker" if job_id else "api",
         confidence_after=parsed_data.get("confidence_score"),
-        notes="Invoice extraction completed.",
+        notes=f"Invoice extraction completed. document_type={parsed_data.get('document_type')}, document_count={_doc_count}."
+        if _doc_count > 1
+        else "Invoice extraction completed.",
     )
 
     response = {
@@ -1727,7 +1751,14 @@ def run_invoice_re_extraction(
         if job_id:
             update_reextract_job(job_id, status="running", stage="extracting_line_items")
 
-        line_items = parsed_data.get("line_items") or []
+        supplier_settings = fetch_supplier_processing_settings(
+            supabase,
+            existing.get("supplier_id") or raw.get("supplier_id"),
+        )
+        supplier_rule_result = apply_supplier_processing_rules(parsed_data, supplier_settings)
+        line_items = supplier_rule_result["line_items"]
+        update_payload.update(supplier_rule_result["invoice_patch"])
+
         line_items_replaced = False
         if line_items:
             line_item_diagnostics = replace_invoice_line_items(
@@ -1752,6 +1783,24 @@ def run_invoice_re_extraction(
             line_item_diagnostics = build_line_item_diagnostics(
                 line_items=line_items,
                 invoice_total=parsed_data.get("total_amount"),
+            )
+
+        if supplier_settings.get("supplier_id"):
+            log_invoice_event(
+                supabase,
+                organisation_id=org_id,
+                invoice_raw_id=payload.invoice_raw_id,
+                invoice_extracted_id=extracted_invoice_id,
+                job_id=job_id,
+                event_type="supplier_rules_applied",
+                stage="supplier_processing_rules",
+                actor_type="api",
+                new_value={
+                    "supplier_id": supplier_settings.get("supplier_id"),
+                    "invoice_patch": supplier_rule_result["invoice_patch"],
+                    **line_item_diagnostics,
+                },
+                notes="Supplier processing rules applied during re-extraction.",
             )
 
         if job_id:
@@ -2317,3 +2366,316 @@ def get_invoice_preview_image(invoice_raw_id: str, page: int = 0):
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Preview rendering failed: {str(e)}")
+
+
+@router.post("/save-line-items")
+def save_invoice_line_items(req: SaveLineItemsRequest):
+    """
+    Persist user-edited line items and recompute invoices_extracted totals.
+    Line items are the source of truth: subtotal = SUM(line_total), VAT = subtotal * rate,
+    total = subtotal + VAT.  Rounding differences vs document_total are absorbed automatically.
+    """
+    # 1. Determine VAT rate — only if supplier is a VAT vendor (has vat_number)
+    vat_rate = 0.0
+    if req.supplier_id:
+        settings = fetch_supplier_processing_settings(supabase, req.supplier_id)
+        if settings.get("vat_number"):
+            raw_rate = settings.get("default_vat_rate")
+            vat_rate = float(raw_rate) / 100 if raw_rate else 0.15
+
+    # 2. Subtotal from line items
+    subtotal = round(sum(float(it.get("line_total") or 0) for it in req.line_items), 2)
+
+    # 3. Computed VAT and total
+    computed_vat = round(subtotal * vat_rate, 2)
+    computed_total = round(subtotal + computed_vat, 2)
+
+    # 4. Hybrid rounding adjustment vs original document total
+    rounding_applied = None
+    needs_review = False
+    final_line_items = list(req.line_items)
+
+    if req.document_total is not None:
+        diff = round(req.document_total - computed_total, 2)
+        abs_diff = abs(diff)
+        if 0 < abs_diff <= 0.02:
+            # Absorb silently into VAT (floating-point drift)
+            computed_vat = round(computed_vat + diff, 2)
+            computed_total = round(subtotal + computed_vat, 2)
+            rounding_applied = "vat_adjusted"
+        elif abs_diff <= 0.50:
+            # Named rounding line item for visible penny differences
+            final_line_items.append({"description": "Rounding adjustment", "line_total": diff})
+            subtotal = round(subtotal + diff, 2)
+            computed_total = round(subtotal + computed_vat, 2)
+            rounding_applied = "line_item_added"
+        elif abs_diff > 0.50:
+            # Too large to auto-fix — flag for human review
+            needs_review = True
+            rounding_applied = "needs_review"
+
+    # 5. Persist line items (always delete-and-replace on explicit save)
+    diagnostics = replace_invoice_line_items(
+        supabase,
+        invoice_extracted_id=req.invoice_extracted_id,
+        organisation_id=req.organisation_id,
+        line_items=final_line_items,
+        invoice_total=computed_total,
+        delete_when_empty=True,
+    )
+
+    # 6. Update invoices_extracted with derived totals
+    patch: dict = {
+        "subtotal": subtotal,
+        "tax_amount": computed_vat,
+        "total_amount": computed_total,
+    }
+    if needs_review:
+        patch["validation_status"] = "needs_review"
+
+    supabase.table("invoices_extracted").update(patch).eq("id", req.invoice_extracted_id).execute()
+
+    return {
+        "subtotal": subtotal,
+        "tax_amount": computed_vat,
+        "total_amount": computed_total,
+        "rounding_applied": rounding_applied,
+        "needs_review": needs_review,
+        "diagnostics": diagnostics,
+    }
+
+
+class ReapplyRulesRequest(BaseModel):
+    invoice_extracted_id: str
+    organisation_id: str
+
+
+@router.post("/reapply-supplier-rules")
+def reapply_supplier_rules_endpoint(req: ReapplyRulesRequest):
+    result = (
+        supabase.table("invoices_extracted")
+        .select("*, supplier:suppliers(*)")
+        .eq("id", req.invoice_extracted_id)
+        .eq("organisation_id", req.organisation_id)
+        .single()
+        .execute()
+    )
+    invoice = result.data if result else None
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    supplier_id = invoice.get("supplier_id")
+    if not supplier_id:
+        raise HTTPException(status_code=422, detail="No supplier linked to this invoice")
+
+    rules_applied = reapply_supplier_rules_to_invoice(
+        supabase,
+        invoice=invoice,
+        supplier_id=supplier_id,
+        actor_type="user",
+        event_reason="Manual re-apply of supplier rules via UI.",
+    )
+    return {"success": True, "rules_applied": rules_applied}
+
+
+class MergeInvoicesPayload(BaseModel):
+    invoice_raw_ids: list[str]
+    organisation_id: str
+
+
+@router.post("/merge")
+def merge_invoices(payload: MergeInvoicesPayload, background_tasks: BackgroundTasks):
+    """
+    Merge two or more single-page invoice uploads into one multi-page document and
+    trigger a fresh extraction.  Old raw records (and all dependent data) are deleted.
+    """
+    import time as _time
+
+    if len(payload.invoice_raw_ids) < 2:
+        raise HTTPException(status_code=400, detail="At least two invoice_raw_ids are required")
+
+    # Step 1 — fetch raw records in caller-specified page order
+    rows_result = (
+        supabase.from_("invoices_raw")
+        .select("id, file_path, file_name, file_type")
+        .in_("id", payload.invoice_raw_ids)
+        .eq("organisation_id", payload.organisation_id)
+        .execute()
+    )
+    rows = rows_result.data or []
+    if len(rows) != len(payload.invoice_raw_ids):
+        raise HTTPException(status_code=404, detail="One or more invoices not found")
+
+    id_to_row = {r["id"]: r for r in rows}
+    ordered = [id_to_row[rid] for rid in payload.invoice_raw_ids]
+
+    # Step 2 — download each file from Storage
+    file_bytes_list: list[tuple[bytes, str]] = []
+    for row in ordered:
+        file_bytes = supabase.storage.from_("invoices").download(row["file_path"])
+        file_bytes_list.append((file_bytes, row.get("file_type") or "application/pdf"))
+
+    # Step 3 — merge into one PDF using PyMuPDF (fitz is already imported at module level)
+    import io as _io
+    from PIL import Image as _PILImage, ImageOps as _ImageOps
+
+    merged_doc = fitz.open()
+    for file_bytes, file_type in file_bytes_list:
+        if file_type.startswith("image/"):
+            # Apply EXIF orientation before embedding so the PDF is correctly oriented.
+            pil_img = _ImageOps.exif_transpose(_PILImage.open(_io.BytesIO(file_bytes))).convert("RGB")
+            corrected_buf = _io.BytesIO()
+            pil_img.save(corrected_buf, format="PNG")
+            img_doc = fitz.open(stream=corrected_buf.getvalue(), filetype="png")
+            pdf_bytes = img_doc.convert_to_pdf()
+            img_doc.close()
+            src = fitz.open("pdf", pdf_bytes)
+        else:
+            src = fitz.open(stream=file_bytes, filetype="pdf")
+        merged_doc.insert_pdf(src)
+        src.close()
+    merged_bytes = merged_doc.tobytes()
+    merged_doc.close()
+
+    # Step 4 — upload merged PDF to Storage
+    base_name = re.sub(r"[^a-zA-Z0-9._-]", "_", ordered[0].get("file_name") or "merged")
+    if not base_name.lower().endswith(".pdf"):
+        base_name = base_name + ".pdf"
+    new_file_name = f"{int(_time.time())}-merged-{base_name}"
+    new_path = f"{payload.organisation_id}/invoices/{new_file_name}"
+
+    supabase.storage.from_("invoices").upload(
+        new_path,
+        merged_bytes,
+        {"content-type": "application/pdf"},
+    )
+
+    # Step 5 — create new invoices_raw record
+    new_raw_result = (
+        supabase.from_("invoices_raw")
+        .insert({
+            "organisation_id": payload.organisation_id,
+            "file_path": new_path,
+            "file_name": new_file_name,
+            "file_type": "application/pdf",
+            "parse_status": "pending",
+            "upload_status": "uploaded",
+        })
+        .execute()
+    )
+    new_raw_id = new_raw_result.data[0]["id"]
+
+    # Step 6 — delete old records (manual cascade: no FK cascade on invoices_raw)
+    for old_id in payload.invoice_raw_ids:
+        extracted_rows = (
+            supabase.from_("invoices_extracted")
+            .select("id")
+            .eq("invoice_raw_id", old_id)
+            .execute()
+        ).data or []
+        extracted_ids = [r["id"] for r in extracted_rows]
+
+        if extracted_ids:
+            supabase.from_("invoice_line_items").delete().in_("invoice_extracted_id", extracted_ids).execute()
+            try:
+                supabase.from_("invoice_extraction_feedback").delete().in_("invoice_extracted_id", extracted_ids).execute()
+            except Exception:
+                pass
+            supabase.from_("invoices_extracted").delete().eq("invoice_raw_id", old_id).execute()
+
+        supabase.from_("invoice_parse_attempts").delete().eq("invoice_raw_id", old_id).execute()
+        supabase.from_("document_pages").delete().eq("invoice_raw_id", old_id).execute()
+        supabase.from_("invoice_audit_events").delete().eq("invoice_raw_id", old_id).execute()
+
+        try:
+            supabase.storage.from_("invoices").remove([id_to_row[old_id]["file_path"]])
+        except Exception:
+            pass
+
+        supabase.from_("invoices_raw").delete().eq("id", old_id).execute()
+
+    # Step 7 — queue extraction on the merged record
+    queue_invoice_job(invoice_raw_id=new_raw_id, organisation_id=payload.organisation_id)
+    background_tasks.add_task(run_extract_worker_until_empty)
+
+    return {"success": True, "new_invoice_raw_id": new_raw_id}
+
+
+@router.post("/generate-preview")
+def generate_invoice_preview(req: GeneratePreviewRequest):
+    """
+    Render preview images for an invoice without running VLM extraction (~1s).
+    Saves images to Supabase Storage and upserts document_pages rows.
+    Fixes missing previews for old invoices and PDFs processed via the selectable-text path.
+    """
+    import io as _io
+    from PIL import Image as _Image
+    from app.services.invoice_ocr_pipeline import pdf_to_images
+    from app.services.invoice_extraction.receipt_preprocessing import generate_preview_images
+    from app.services.invoice_previews import upload_invoice_preview_image
+
+    raw_res = supabase.table("invoices_raw").select("file_path, file_type").eq("id", req.invoice_raw_id).single().execute()
+    if not raw_res.data:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    raw = raw_res.data
+    file_path = raw.get("file_path")
+    if not file_path:
+        raise HTTPException(status_code=400, detail="No file_path on invoices_raw record")
+
+    try:
+        file_bytes = supabase.storage.from_("invoices").download(file_path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Storage download failed: {e}")
+
+    file_type = raw.get("file_type") or "application/pdf"
+    is_pdf = "pdf" in str(file_type).lower()
+
+    try:
+        if is_pdf:
+            images = pdf_to_images(file_bytes)
+        else:
+            images = [_Image.open(_io.BytesIO(file_bytes)).convert("RGB")]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Page rendering failed: {e}")
+
+    results = []
+    for i, img in enumerate(images, 1):
+        try:
+            previews = generate_preview_images(img, img)
+            orig_path = f"{req.organisation_id}/invoices/previews/{req.invoice_raw_id}/page-{i}-original.jpg"
+            proc_path = f"{req.organisation_id}/invoices/previews/{req.invoice_raw_id}/page-{i}-processed.jpg"
+            upload_invoice_preview_image(supabase, storage_path=orig_path, image=previews.original_preview)
+            upload_invoice_preview_image(supabase, storage_path=proc_path, image=previews.processed_preview)
+            results.append({
+                "page_number": i,
+                "original_preview_path": orig_path,
+                "processed_preview_path": proc_path,
+            })
+        except Exception as e:
+            print(f"[generate-preview] page {i} upload failed: {e}")
+
+    # Upsert document_pages rows
+    for page in results:
+        existing = supabase.table("document_pages").select("id").eq("invoice_raw_id", req.invoice_raw_id).eq("page_number", page["page_number"]).execute().data
+        if existing:
+            supabase.table("document_pages").update({
+                "original_preview_path": page["original_preview_path"],
+                "processed_preview_path": page["processed_preview_path"],
+            }).eq("invoice_raw_id", req.invoice_raw_id).eq("page_number", page["page_number"]).execute()
+        else:
+            supabase.table("document_pages").insert({
+                "invoice_raw_id": req.invoice_raw_id,
+                "organisation_id": req.organisation_id,
+                "page_number": page["page_number"],
+                "original_preview_path": page["original_preview_path"],
+                "processed_preview_path": page["processed_preview_path"],
+            }).execute()
+
+    # Update invoices_raw with page-1 preview path
+    if results:
+        supabase.table("invoices_raw").update({
+            "preview_path": results[0]["original_preview_path"],
+            "processed_preview_path": results[0]["processed_preview_path"],
+            "updated_at": utc_now_iso(),
+        }).eq("id", req.invoice_raw_id).execute()
+
+    return {"generated": len(results), "pages": results}

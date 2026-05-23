@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app.db.supabase_client import get_supabase_client
 from app.services.audit_log import log_invoice_event
+from app.services.invoice_supplier_rules import reapply_supplier_rules_to_invoice
 from app.services.supplier_matcher import attempt_supplier_auto_link, find_name_match_suggestion
 
 router = APIRouter(prefix="/api/suppliers", tags=["suppliers"])
@@ -54,6 +55,10 @@ KNOWN_SUPPLIER_COLUMNS = {
     "source_invoice_extracted_id",
     "parse_line_items",
     "line_items_include_vat",
+    "track_inventory",
+    "use_uom_from_description",
+    "default_expense_account",
+    "default_vat_rate",
 }
 
 
@@ -81,6 +86,12 @@ class SupplierCreateRequest(BaseModel):
     fax: Optional[str] = None
     cell: Optional[str] = None
     website: Optional[str] = None
+    parse_line_items: Optional[bool] = None
+    line_items_include_vat: Optional[bool] = None
+    track_inventory: Optional[bool] = None
+    use_uom_from_description: Optional[bool] = None
+    default_expense_account: Optional[str] = None
+    default_vat_rate: Optional[float] = None
     invoice_extracted_id: Optional[str] = None
     invoice_raw_id: Optional[str] = None
     link_invoice: bool = True
@@ -90,6 +101,12 @@ class SupplierFromInvoiceRequest(BaseModel):
     invoice_extracted_id: str
     organisation_id: Optional[str] = None
     supplier_name: Optional[str] = None
+    parse_line_items: Optional[bool] = None
+    line_items_include_vat: Optional[bool] = None
+    track_inventory: Optional[bool] = None
+    use_uom_from_description: Optional[bool] = None
+    default_expense_account: Optional[str] = None
+    default_vat_rate: Optional[float] = None
     link_invoice: bool = True
 
 
@@ -119,6 +136,19 @@ def _compact(payload: dict) -> dict:
 def _filter_supplier_payload(payload: dict) -> dict:
     columns = _supplier_columns()
     return {key: value for key, value in _compact(payload).items() if key in columns}
+
+
+def _supplier_processing_overrides(payload: BaseModel) -> dict:
+    values = payload.model_dump()
+    keys = {
+        "parse_line_items",
+        "line_items_include_vat",
+        "track_inventory",
+        "use_uom_from_description",
+        "default_expense_account",
+        "default_vat_rate",
+    }
+    return {key: values.get(key) for key in keys if values.get(key) is not None}
 
 
 def _raise_if_duplicate(
@@ -177,6 +207,19 @@ def get_extracted_invoice(invoice_extracted_id: str) -> dict:
     if not invoice:
         raise HTTPException(status_code=404, detail="Extracted invoice not found")
     return invoice
+
+
+def get_extracted_invoice_by_raw(invoice_raw_id: str) -> Optional[dict]:
+    res = (
+        supabase
+        .table("invoices_extracted")
+        .select("*")
+        .eq("invoice_raw_id", invoice_raw_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return _first(res.data)
 
 
 def _build_supplier_payload_from_extracted(invoice: dict, *, supplier_name_override: Optional[str] = None) -> dict:
@@ -288,6 +331,16 @@ def _link_supplier_to_invoice(
             "updated_at": utc_now_iso(),
         }).eq("id", invoice_extracted_id).execute()
         linked["invoice_raw_id"] = invoice_raw_id
+    elif invoice_raw_id:
+        invoice = get_extracted_invoice_by_raw(invoice_raw_id)
+        if invoice:
+            invoice_extracted_id = invoice.get("id")
+            organisation_id = organisation_id or invoice.get("organisation_id")
+            linked["invoice_extracted_id"] = invoice_extracted_id
+            supabase.table("invoices_extracted").update({
+                "supplier_id": supplier_id,
+                "updated_at": utc_now_iso(),
+            }).eq("id", invoice_extracted_id).execute()
 
     if invoice_raw_id:
         try:
@@ -310,6 +363,18 @@ def _link_supplier_to_invoice(
             new_value={"supplier_id": supplier_id},
             notes="Supplier master record linked to extracted invoice.",
         )
+
+    if invoice:
+        try:
+            linked["rules_applied"] = reapply_supplier_rules_to_invoice(
+                supabase,
+                invoice={**invoice, "supplier_id": supplier_id},
+                supplier_id=supplier_id,
+                actor_type="api",
+                event_reason="Supplier rules applied after supplier link/create.",
+            )
+        except Exception as exc:
+            linked["rules_apply_error"] = str(exc)
 
     return linked
 
@@ -427,7 +492,10 @@ def create_supplier_from_invoice(payload: SupplierFromInvoiceRequest):
         raise HTTPException(status_code=400, detail="Invoice does not belong to organisation_id")
 
     insert_payload = _filter_supplier_payload(
-        _build_supplier_payload_from_extracted(invoice, supplier_name_override=payload.supplier_name)
+        {
+            **_build_supplier_payload_from_extracted(invoice, supplier_name_override=payload.supplier_name),
+            **_supplier_processing_overrides(payload),
+        }
     )
 
     if not insert_payload.get("supplier_name"):

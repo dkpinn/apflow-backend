@@ -579,7 +579,7 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
     Returns text, selected variant, confidence and image quality metadata.
     """
     original_size = image.size
-    image = resize_for_ocr(image.convert("RGB"))
+    image = resize_for_ocr(image)  # exif_transpose + RGB conversion happen inside _resize_to_limits
     resized_size = image.size
 
     original_quality = analyse_image_quality(image)
@@ -770,6 +770,16 @@ def extract_text_with_fallback(file_bytes: bytes, file_type: Optional[str] = Non
             pages_with_text = sum(1 for page in pdf_pages if len((page.get("text") or "").strip()) >= 80)
 
             if len(selectable_text) >= 80 and pages_with_text >= 1:
+                # Render preview images even on the selectable-text path so that
+                # persist_preview_artifacts() always has something to upload.
+                try:
+                    preview_imgs = pdf_to_images(file_bytes)
+                    for page, img in zip(pdf_pages, preview_imgs):
+                        previews = generate_preview_images(img, img)
+                        page["original_preview_image"] = previews.original_preview
+                        page["processed_preview_image"] = previews.processed_preview
+                except Exception as _prev_exc:
+                    print(f"[extract_text_with_fallback] preview render skipped: {_prev_exc}")
                 return {
                     "method": "pdf_text",
                     "ocr_used": False,

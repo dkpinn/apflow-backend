@@ -35,7 +35,18 @@ _EXTRACTION_PROMPT = (
     "and the item/product code or SKU if printed. "
     "Even if the image is dark or low contrast, do your best to read each line. "
     "Set confidence_score to your confidence that the extraction is accurate and complete "
-    "(1.0 = highly confident, 0.0 = unable to extract)."
+    "(1.0 = highly confident, 0.0 = unable to extract). "
+    "Set document_type to one of: "
+    "'tax_invoice' (a VAT invoice with an invoice number and supplier VAT registration number), "
+    "'card_receipt' (a card machine / POS payment slip showing card type and last 4 digits — no line items, no VAT number), "
+    "'till_slip' (a cash register or POS till receipt that may have item descriptions), "
+    "'credit_note' (a supplier credit note), "
+    "'statement' (an account statement), "
+    "'quotation' (a quote or pro-forma invoice), "
+    "'delivery_note' (a delivery docket without pricing), "
+    "'other' (anything that does not fit the above). "
+    "Set document_count to the number of physically separate documents visible on this page "
+    "(e.g. a page with 3 stapled till slips has document_count = 3; a single invoice has document_count = 1)."
 )
 
 
@@ -77,6 +88,17 @@ class _VLMInvoiceSchema(BaseModel):
         0.0,
         description="Confidence 0.0-1.0 that the extraction is accurate and complete",
     )
+    document_type: str = Field(
+        "tax_invoice",
+        description=(
+            "Document classification: tax_invoice, card_receipt, till_slip, credit_note, "
+            "statement, quotation, delivery_note, or other"
+        ),
+    )
+    document_count: int = Field(
+        1,
+        description="Number of distinct separate documents visible on this page",
+    )
 
 
 # Fields that the VLM result can overwrite in the Tesseract-parsed dict.
@@ -108,6 +130,8 @@ VLM_MERGE_FIELDS: list[str] = [
     "bank_branch_code_extracted",
     "bank_swift_code_extracted",
     "line_items",
+    "document_type",
+    "document_count",
 ]
 
 
@@ -120,16 +144,18 @@ def _to_png_bytes(file_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
-def _preprocess_for_vlm(file_bytes: bytes, effective_mime: str) -> tuple[bytes, str]:
-    """
-    Render PDFs to a contrast-enhanced image before sending to Gemini.
+_MAX_VLM_PAGES = 10  # Gemini handles up to ~10 pages reliably before latency/token issues
 
-    Raw scanned-receipt PDFs are often dark and low-contrast. Applying the same
-    receipt preprocessing that helps Tesseract also helps Gemini read line items.
-    Returns (bytes, mime_type) ready to pass to the Gemini API.
+
+def _preprocess_for_vlm(file_bytes: bytes, effective_mime: str) -> list[tuple[bytes, str]]:
+    """
+    Render each PDF page to a contrast-enhanced PNG before sending to Gemini.
+
+    Returns a list of (bytes, mime_type) — one item per page for PDFs, one item
+    for image inputs. Gemini sees all pages so line items that span pages are captured.
     """
     if "pdf" not in effective_mime:
-        return file_bytes, effective_mime
+        return [(file_bytes, effective_mime)]
 
     try:
         import fitz
@@ -139,20 +165,26 @@ def _preprocess_for_vlm(file_bytes: bytes, effective_mime: str) -> tuple[bytes, 
 
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         if not doc.page_count:
-            return file_bytes, effective_mime
+            return [(file_bytes, effective_mime)]
 
         scale = DEEP_OCR_RENDER_DPI / 72
-        page = doc[0]
-        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
-        image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-        image = resize_for_ocr(image)
+        page_parts: list[tuple[bytes, str]] = []
+        for page_num in range(min(doc.page_count, _MAX_VLM_PAGES)):
+            try:
+                page = doc[page_num]
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+                image = resize_for_ocr(image)
+                processed = preprocess_receipt_photo(image)
+                buf = io.BytesIO()
+                processed.processed_image.save(buf, format="PNG")
+                page_parts.append((buf.getvalue(), "image/png"))
+            except Exception:
+                continue
 
-        processed = preprocess_receipt_photo(image)
-        buf = io.BytesIO()
-        processed.processed_image.save(buf, format="PNG")
-        return buf.getvalue(), "image/png"
+        return page_parts if page_parts else [(file_bytes, effective_mime)]
     except Exception:
-        return file_bytes, effective_mime
+        return [(file_bytes, effective_mime)]
 
 
 def _call_gemini(file_bytes: bytes, effective_mime: str) -> Optional[dict]:
@@ -164,15 +196,18 @@ def _call_gemini(file_bytes: bytes, effective_mime: str) -> Optional[dict]:
     if not api_key:
         return None
 
-    file_bytes, effective_mime = _preprocess_for_vlm(file_bytes, effective_mime)
+    page_parts = _preprocess_for_vlm(file_bytes, effective_mime)
 
     client = genai.Client(api_key=api_key)
+    contents: list = [
+        types.Part.from_bytes(data=page_bytes, mime_type=page_mime)
+        for page_bytes, page_mime in page_parts
+    ]
+    contents.append(_EXTRACTION_PROMPT)
+
     response = client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=[
-            types.Part.from_bytes(data=file_bytes, mime_type=effective_mime),
-            _EXTRACTION_PROMPT,
-        ],
+        contents=contents,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=_VLMInvoiceSchema,

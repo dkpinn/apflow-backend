@@ -75,6 +75,8 @@ def build_line_item_payload(
             "line_total": item.get("line_total"),
             "raw_line": item.get("raw_line"),
             "code": item.get("code"),
+            "expense_account": item.get("expense_account"),
+            "tracking": item.get("tracking"),
         }
         for item in line_items or []
     ]
