@@ -9,14 +9,16 @@ from app.routers.reconciliation import router as reconciliation_router
 from app.db.supabase_client import get_supabase_client
 from app.routers import invoices
 from app.routers import suppliers
+from app.routers import themes
 
 
 def _rescue_pending_invoices() -> None:
     """
     Startup + periodic sweep:
-    1. Reset invoices stuck in 'processing' for > 10 min back to 'pending'
-    2. Queue any 'pending' invoices that have no active processing job
-    3. Run the extraction worker to drain the queue
+    1.  Reset invoices stuck in 'processing' for > 10 min back to 'pending'
+    1b. Reset 'completed' invoices that have no extracted record back to 'pending'
+    2.  Queue any 'pending' invoices that have no active processing job
+    3.  Run the extraction worker to drain the queue
     """
     from app.services.document_jobs import create_processing_job, safe_update_invoice_raw_status
     from app.services.audit_log import log_invoice_event
@@ -42,6 +44,85 @@ def _rescue_pending_invoices() -> None:
             safe_update_invoice_raw_status(supabase_client, invoice_raw_id=row["id"], parse_status="pending")
     except Exception as exc:
         print(f"SWEEP: Error resetting stale processing items: {exc}")
+
+    # Step 1b — detect 'completed' raw invoices with no extracted record and reset to 'pending'
+    try:
+        completed_rows = (
+            supabase_client.table("invoices_raw")
+            .select("id, organisation_id")
+            .eq("parse_status", "completed")
+            .execute()
+        ).data or []
+
+        if completed_rows:
+            completed_ids = [r["id"] for r in completed_rows]
+
+            extracted_raw_ids = {
+                row["invoice_raw_id"]
+                for row in (
+                    supabase_client.table("invoices_extracted")
+                    .select("invoice_raw_id")
+                    .in_("invoice_raw_id", completed_ids)
+                    .execute()
+                ).data or []
+            }
+
+            MAX_SWEEP_ATTEMPTS = 3
+            orphans = [r for r in completed_rows if r["id"] not in extracted_raw_ids]
+            for row in orphans:
+                raw_id = row["id"]
+                org_id = row.get("organisation_id")
+
+                # Count past extraction attempts so we can give up after MAX_SWEEP_ATTEMPTS
+                try:
+                    past_jobs = (
+                        supabase_client.table("document_processing_jobs")
+                        .select("id", count="exact")
+                        .eq("invoice_raw_id", raw_id)
+                        .execute()
+                    ).count or 0
+                except Exception:
+                    past_jobs = 0
+
+                if past_jobs >= MAX_SWEEP_ATTEMPTS:
+                    print(f"SWEEP: Giving up on orphaned invoice {raw_id} after {past_jobs} attempts → marking failed")
+                    safe_update_invoice_raw_status(
+                        supabase_client,
+                        invoice_raw_id=raw_id,
+                        parse_status="failed",
+                    )
+                    if org_id:
+                        log_invoice_event(
+                            supabase_client,
+                            organisation_id=org_id,
+                            invoice_raw_id=raw_id,
+                            job_id=None,
+                            event_type="job_failed",
+                            stage="failed",
+                            actor_type="system",
+                            notes=f"Marked failed by SWEEP after {past_jobs} extraction attempts with no extracted record.",
+                        )
+                    continue
+
+                print(f"SWEEP: Orphaned invoice {raw_id} (completed but no extracted record, attempt {past_jobs + 1}/{MAX_SWEEP_ATTEMPTS}) → resetting to pending")
+                safe_update_invoice_raw_status(
+                    supabase_client,
+                    invoice_raw_id=raw_id,
+                    parse_status="pending",
+                )
+                if org_id:
+                    log_invoice_event(
+                        supabase_client,
+                        organisation_id=org_id,
+                        invoice_raw_id=raw_id,
+                        job_id=None,
+                        event_type="queued_for_processing",
+                        stage="pending",
+                        actor_type="system",
+                        notes=f"Reset to pending by SWEEP (attempt {past_jobs + 1}/{MAX_SWEEP_ATTEMPTS}): completed status but no extracted record found.",
+                    )
+    except Exception as exc:
+        print(f"SWEEP: Error checking for orphaned completed invoices: {exc}")
 
     # Step 2 — find 'pending' items with no active job and queue them
     try:
@@ -169,6 +250,7 @@ app.add_middleware(
 app.include_router(reconciliation_router)
 app.include_router(invoices.router)
 app.include_router(suppliers.router)
+app.include_router(themes.router)
 
 
 @app.get("/")

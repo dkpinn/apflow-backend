@@ -31,6 +31,7 @@ from app.services.invoice_line_items import (
 from app.services.invoice_parse_attempts import (
     build_deep_region_parse_attempt,
     build_parse_attempts_from_text_result,
+    ensure_parsed_data_attempt,
     fetch_parse_attempts,
     persist_parse_attempts,
 )
@@ -1172,11 +1173,11 @@ def run_invoice_extraction(
             or ocr_quality_needs_review
         )
 
-        parse_attempts = build_parse_attempts_from_text_result(text_result)
-        if parse_attempts:
-            parse_attempts[0]["parsed_data"] = dict(parsed_data)
-            parse_attempts[0]["line_items"] = parsed_data.get("line_items") or []
-            parse_attempts[0]["confidence_score"] = parsed_data.get("confidence_score")
+        parse_attempts = ensure_parsed_data_attempt(
+            build_parse_attempts_from_text_result(text_result),
+            parsed_data=parsed_data,
+            text=text,
+        )
 
         store_basic_document_page_snapshot(
             organisation_id=org_id,
@@ -1723,6 +1724,14 @@ def run_invoice_re_extraction(
             deep_attempt["line_items"] = parsed_data.get("line_items") or []
             deep_attempt["confidence_score"] = parsed_data.get("confidence_score")
 
+        raw_parse_attempts = ensure_parsed_data_attempt(
+            [deep_attempt] if deep_attempt else [],
+            parsed_data=parsed_data,
+            text=deep_text,
+            strategy="deep_region_ocr",
+        )
+        selected_raw_parse_attempt = raw_parse_attempts[0] if raw_parse_attempts else None
+
         update_payload, improved_fields, unchanged_fields = build_reextract_update(
             existing=existing,
             parsed=parsed_data,
@@ -1815,20 +1824,20 @@ def run_invoice_re_extraction(
             supabase.table("invoices_extracted").update(update_payload).eq("id", extracted_invoice_id).execute()
 
         parse_attempt_result: dict = {}
-        if deep_attempt:
+        if raw_parse_attempts:
             parse_attempts = [
                 attempt
                 for attempt in existing_parse_attempts
                 if attempt.get("strategy") != "deep_region_ocr"
             ]
-            parse_attempts.append(deep_attempt)
+            parse_attempts.extend(raw_parse_attempts)
             parse_attempt_result = persist_parse_attempts(
                 supabase,
                 organisation_id=org_id,
                 invoice_raw_id=payload.invoice_raw_id,
                 invoice_extracted_id=extracted_invoice_id,
                 attempts=parse_attempts,
-                selected_attempt=deep_attempt,
+                selected_attempt=selected_raw_parse_attempt,
             )
 
             log_invoice_event(
@@ -2598,6 +2607,258 @@ def merge_invoices(payload: MergeInvoicesPayload, background_tasks: BackgroundTa
     background_tasks.add_task(run_extract_worker_until_empty)
 
     return {"success": True, "new_invoice_raw_id": new_raw_id}
+
+
+@router.post("/{raw_id}/split-into-pages")
+def split_invoice_into_pages(raw_id: str, organisation_id: str, background_tasks: BackgroundTasks):
+    """
+    Split a multi-page PDF into individual single-page invoices, one per page.
+    Each page is uploaded as a new invoices_raw record and queued for extraction.
+    The original record and all dependent data are deleted.
+    """
+    import time as _time
+
+    # Step 1 — fetch the raw record
+    row_result = (
+        supabase.from_("invoices_raw")
+        .select("id, file_path, file_name, file_type")
+        .eq("id", raw_id)
+        .eq("organisation_id", organisation_id)
+        .single()
+        .execute()
+    )
+    row = row_result.data
+    if not row:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    # Step 2 — download and open with PyMuPDF
+    file_bytes = supabase.storage.from_("invoices").download(row["file_path"])
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    page_count = len(doc)
+    if page_count < 2:
+        doc.close()
+        raise HTTPException(status_code=422, detail="Document has only one page — use the crop tool for within-page splits")
+
+    # Step 3 — split into N single-page PDFs and upload each
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", row.get("file_name") or "split")
+    if safe_name.lower().endswith(".pdf"):
+        safe_name = safe_name[:-4]
+
+    new_raw_ids: list[str] = []
+    for i in range(page_count):
+        single_doc = fitz.open()
+        single_doc.insert_pdf(doc, from_page=i, to_page=i)
+        page_bytes = single_doc.tobytes()
+        single_doc.close()
+
+        new_file_name = f"{int(_time.time())}-p{i + 1}-{safe_name}.pdf"
+        new_path = f"{organisation_id}/invoices/{new_file_name}"
+
+        supabase.storage.from_("invoices").upload(
+            new_path,
+            page_bytes,
+            {"content-type": "application/pdf"},
+        )
+
+        new_raw_result = (
+            supabase.from_("invoices_raw")
+            .insert({
+                "organisation_id": organisation_id,
+                "file_path": new_path,
+                "file_name": new_file_name,
+                "file_type": "application/pdf",
+                "parse_status": "pending",
+                "upload_status": "uploaded",
+            })
+            .execute()
+        )
+        new_raw_ids.append(new_raw_result.data[0]["id"])
+
+    doc.close()
+
+    # Step 4 — delete original record (same cascade order as merge)
+    extracted_rows = (
+        supabase.from_("invoices_extracted")
+        .select("id")
+        .eq("invoice_raw_id", raw_id)
+        .execute()
+    ).data or []
+    extracted_ids = [r["id"] for r in extracted_rows]
+
+    if extracted_ids:
+        supabase.from_("invoice_line_items").delete().in_("invoice_extracted_id", extracted_ids).execute()
+        try:
+            supabase.from_("invoice_extraction_feedback").delete().in_("invoice_extracted_id", extracted_ids).execute()
+        except Exception:
+            pass
+        supabase.from_("invoices_extracted").delete().eq("invoice_raw_id", raw_id).execute()
+
+    supabase.from_("invoice_parse_attempts").delete().eq("invoice_raw_id", raw_id).execute()
+    supabase.from_("document_pages").delete().eq("invoice_raw_id", raw_id).execute()
+    supabase.from_("invoice_audit_events").delete().eq("invoice_raw_id", raw_id).execute()
+
+    try:
+        supabase.storage.from_("invoices").remove([row["file_path"]])
+    except Exception:
+        pass
+
+    supabase.from_("invoices_raw").delete().eq("id", raw_id).execute()
+
+    # Step 5 — queue extraction for all new records and drain the worker
+    for new_id in new_raw_ids:
+        queue_invoice_job(invoice_raw_id=new_id, organisation_id=organisation_id)
+    background_tasks.add_task(run_extract_worker_until_empty)
+
+    return {"success": True, "page_count": page_count, "new_raw_ids": new_raw_ids}
+
+
+class _PageCropModel(BaseModel):
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+class _PageRefModel(BaseModel):
+    kind: str               # "full" | "crop"
+    page_number: int        # 1-indexed
+    crop: _PageCropModel | None = None
+
+
+class _PageGroupModel(BaseModel):
+    pages: list[_PageRefModel]
+
+
+class ProcessPageGroupsPayload(BaseModel):
+    invoice_raw_id: str
+    organisation_id: str
+    groups: list[_PageGroupModel]
+
+
+@router.post("/process-page-groups")
+def process_page_groups(payload: ProcessPageGroupsPayload, background_tasks: BackgroundTasks):
+    """
+    Split a multi-page PDF into one output PDF per group, where each group is a user-defined
+    set of full pages and/or cropped regions.  Supports both "each page is a doc" and
+    "multiple docs on one page" scenarios.  Original record is deleted after splitting.
+    """
+    import time as _time
+
+    if not payload.groups:
+        raise HTTPException(status_code=400, detail="At least one group is required")
+
+    # Step 1 — fetch original raw record
+    row_result = (
+        supabase.from_("invoices_raw")
+        .select("id, file_path, file_name, file_type")
+        .eq("id", payload.invoice_raw_id)
+        .eq("organisation_id", payload.organisation_id)
+        .single()
+        .execute()
+    )
+    row = row_result.data
+    if not row:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    # Step 2 — download and open original PDF
+    file_bytes = supabase.storage.from_("invoices").download(row["file_path"])
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", row.get("file_name") or "split")
+    if safe_name.lower().endswith(".pdf"):
+        safe_name = safe_name[:-4]
+
+    # Step 3 — build one output PDF per group
+    new_raw_ids: list[str] = []
+    for group_idx, group in enumerate(payload.groups):
+        out_doc = fitz.open()
+        for ref in group.pages:
+            page_index = ref.page_number - 1   # 1-indexed → 0-indexed
+            if page_index < 0 or page_index >= len(doc):
+                continue
+            src_page = doc[page_index]
+            if ref.kind == "full":
+                tmp = fitz.open()
+                tmp.insert_pdf(doc, from_page=page_index, to_page=page_index)
+                out_doc.insert_pdf(tmp)
+                tmp.close()
+            elif ref.kind == "crop" and ref.crop:
+                c = ref.crop
+                rect = fitz.Rect(
+                    src_page.rect.width  * c.x,
+                    src_page.rect.height * c.y,
+                    src_page.rect.width  * (c.x + c.w),
+                    src_page.rect.height * (c.y + c.h),
+                )
+                pix = src_page.get_pixmap(clip=rect, dpi=200)
+                img_doc = fitz.open()
+                img_page = img_doc.new_page(width=pix.width, height=pix.height)
+                img_page.insert_image(img_page.rect, pixmap=pix)
+                out_doc.insert_pdf(img_doc)
+                img_doc.close()
+
+        if len(out_doc) == 0:
+            out_doc.close()
+            continue
+
+        out_bytes = out_doc.tobytes()
+        out_doc.close()
+
+        new_file_name = f"{int(_time.time())}-g{group_idx + 1}-{safe_name}.pdf"
+        new_path = f"{payload.organisation_id}/invoices/{new_file_name}"
+        supabase.storage.from_("invoices").upload(
+            new_path, out_bytes, {"content-type": "application/pdf"}
+        )
+        new_raw_result = (
+            supabase.from_("invoices_raw")
+            .insert({
+                "organisation_id": payload.organisation_id,
+                "file_path": new_path,
+                "file_name": new_file_name,
+                "file_type": "application/pdf",
+                "parse_status": "pending",
+                "upload_status": "uploaded",
+            })
+            .execute()
+        )
+        new_raw_ids.append(new_raw_result.data[0]["id"])
+
+    doc.close()
+
+    # Step 4 — delete original record (same cascade as split/merge)
+    extracted_rows = (
+        supabase.from_("invoices_extracted")
+        .select("id")
+        .eq("invoice_raw_id", payload.invoice_raw_id)
+        .execute()
+    ).data or []
+    extracted_ids = [r["id"] for r in extracted_rows]
+
+    if extracted_ids:
+        supabase.from_("invoice_line_items").delete().in_("invoice_extracted_id", extracted_ids).execute()
+        try:
+            supabase.from_("invoice_extraction_feedback").delete().in_("invoice_extracted_id", extracted_ids).execute()
+        except Exception:
+            pass
+        supabase.from_("invoices_extracted").delete().eq("invoice_raw_id", payload.invoice_raw_id).execute()
+
+    supabase.from_("invoice_parse_attempts").delete().eq("invoice_raw_id", payload.invoice_raw_id).execute()
+    supabase.from_("document_pages").delete().eq("invoice_raw_id", payload.invoice_raw_id).execute()
+    supabase.from_("invoice_audit_events").delete().eq("invoice_raw_id", payload.invoice_raw_id).execute()
+
+    try:
+        supabase.storage.from_("invoices").remove([row["file_path"]])
+    except Exception:
+        pass
+
+    supabase.from_("invoices_raw").delete().eq("id", payload.invoice_raw_id).execute()
+
+    # Step 5 — queue extraction for all new records
+    for new_id in new_raw_ids:
+        queue_invoice_job(invoice_raw_id=new_id, organisation_id=payload.organisation_id)
+    background_tasks.add_task(run_extract_worker_until_empty)
+
+    return {"success": True, "group_count": len(new_raw_ids), "new_raw_ids": new_raw_ids}
 
 
 @router.post("/generate-preview")

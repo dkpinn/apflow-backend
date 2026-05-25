@@ -1,5 +1,9 @@
 from app.services.invoice_line_items import build_line_item_payload
-from app.services.invoice_supplier_rules import apply_supplier_processing_rules
+from app.services.invoice_parse_attempts import ensure_parsed_data_attempt
+from app.services.invoice_supplier_rules import (
+    apply_supplier_processing_rules,
+    reapply_supplier_rules_to_invoice,
+)
 from app.services.supplier_matcher import attempt_supplier_auto_link
 
 
@@ -24,6 +28,85 @@ class _SupplierClient:
     def table(self, name):
         assert name == "suppliers"
         return _SupplierQuery(self.suppliers)
+
+
+class _Result:
+    def __init__(self, data):
+        self.data = data
+
+
+class _MemoryQuery:
+    def __init__(self, client, table_name):
+        self.client = client
+        self.table_name = table_name
+        self.filters = []
+        self.operation = "select"
+        self.payload = None
+
+    def select(self, *_args):
+        self.operation = "select"
+        return self
+
+    def eq(self, key, value):
+        self.filters.append((key, value))
+        return self
+
+    def order(self, *_args, **_kwargs):
+        return self
+
+    def limit(self, *_args):
+        return self
+
+    def update(self, payload):
+        self.operation = "update"
+        self.payload = payload
+        return self
+
+    def delete(self):
+        self.operation = "delete"
+        return self
+
+    def insert(self, payload):
+        self.operation = "insert"
+        self.payload = payload
+        return self
+
+    def _matches(self, row):
+        return all(row.get(key) == value for key, value in self.filters)
+
+    def execute(self):
+        rows = self.client.tables.setdefault(self.table_name, [])
+        if self.operation == "select":
+            return _Result([row.copy() for row in rows if self._matches(row)])
+        if self.operation == "update":
+            updated = []
+            for row in rows:
+                if self._matches(row):
+                    row.update(self.payload)
+                    updated.append(row.copy())
+            return _Result(updated)
+        if self.operation == "delete":
+            deleted = [row for row in rows if self._matches(row)]
+            self.client.tables[self.table_name] = [row for row in rows if not self._matches(row)]
+            return _Result([row.copy() for row in deleted])
+        if self.operation == "insert":
+            payload = self.payload if isinstance(self.payload, list) else [self.payload]
+            inserted = []
+            for item in payload:
+                row = dict(item)
+                row.setdefault("id", f"{self.table_name}-{len(rows) + len(inserted) + 1}")
+                inserted.append(row)
+            rows.extend(inserted)
+            return _Result([row.copy() for row in inserted])
+        return _Result([])
+
+
+class _MemorySupabase:
+    def __init__(self, tables):
+        self.tables = tables
+
+    def table(self, name):
+        return _MemoryQuery(self, name)
 
 
 def test_supplier_rule_defaults_preserve_extracted_line_items():
@@ -137,3 +220,148 @@ def test_line_item_payload_persists_expense_account():
     )
 
     assert payload[0]["expense_account"] == "6000/Office"
+
+
+def test_parsed_data_attempt_captures_vlm_line_items_when_text_is_empty():
+    parsed = {
+        "supplier_name_extracted": "Example Supplier",
+        "invoice_number": "INV-1",
+        "total_amount": 300.0,
+        "line_items": [
+            {"description": "Item A", "quantity": 1, "unit_price": 100.0, "line_total": 100.0},
+            {"description": "Item B", "quantity": 2, "unit_price": 100.0, "line_total": 200.0},
+        ],
+    }
+
+    attempts = ensure_parsed_data_attempt([], parsed_data=parsed, text="")
+
+    assert len(attempts) == 1
+    assert attempts[0]["strategy"] == "final_extraction_snapshot"
+    assert attempts[0]["line_items"] == parsed["line_items"]
+    assert attempts[0]["parsed_data"]["line_items"] == parsed["line_items"]
+
+
+def _rule_test_db(*, supplier_settings=None, attempts=None, current_line_items=None):
+    supplier = {
+        "id": "supplier-1",
+        "parse_line_items": True,
+        "line_items_include_vat": False,
+        "default_vat_rate": None,
+        "default_expense_account": None,
+        **(supplier_settings or {}),
+    }
+    return _MemorySupabase({
+        "suppliers": [supplier],
+        "invoice_parse_attempts": attempts or [],
+        "invoice_line_items": current_line_items or [],
+        "invoices_extracted": [{
+            "id": "invoice-1",
+            "organisation_id": "org-1",
+            "invoice_raw_id": "raw-1",
+            "supplier_id": "supplier-1",
+        }],
+        "invoice_audit_events": [],
+    })
+
+
+def _invoice():
+    return {
+        "id": "invoice-1",
+        "organisation_id": "org-1",
+        "invoice_raw_id": "raw-1",
+        "supplier_id": "supplier-1",
+        "supplier_name_extracted": "Example Supplier",
+        "subtotal": 300.0,
+        "total_amount": 300.0,
+    }
+
+
+def _raw_attempt(line_items):
+    return {
+        "id": "attempt-1",
+        "invoice_raw_id": "raw-1",
+        "attempt_number": 1,
+        "strategy": "final_extraction_snapshot",
+        "selected": True,
+        "parsed_data": {
+            "supplier_name_extracted": "Example Supplier",
+            "subtotal": 300.0,
+            "total_amount": 300.0,
+            "line_items": line_items,
+        },
+        "line_items": line_items,
+    }
+
+
+def test_reapply_rules_uses_raw_parse_attempt_instead_of_current_summary_row():
+    raw_lines = [
+        {"description": "Item A", "quantity": 1, "unit_price": 100.0, "line_total": 100.0},
+        {"description": "Item B", "quantity": 2, "unit_price": 100.0, "line_total": 200.0},
+    ]
+    db = _rule_test_db(
+        attempts=[_raw_attempt(raw_lines)],
+        current_line_items=[{
+            "invoice_extracted_id": "invoice-1",
+            "description": "Purchase from Example Supplier",
+            "quantity": 1,
+            "line_total": 300.0,
+        }],
+    )
+
+    result = reapply_supplier_rules_to_invoice(db, invoice=_invoice(), supplier_id="supplier-1")
+
+    assert result["source"] == "selected_parse_attempt"
+    assert result["needs_reextract"] is False
+    assert [row["description"] for row in db.tables["invoice_line_items"]] == ["Item A", "Item B"]
+
+
+def test_reapply_rules_can_collapse_raw_lines_to_supplier_summary():
+    raw_lines = [
+        {"description": "Item A", "quantity": 1, "unit_price": 100.0, "line_total": 100.0},
+        {"description": "Item B", "quantity": 2, "unit_price": 100.0, "line_total": 200.0},
+    ]
+    db = _rule_test_db(
+        supplier_settings={"parse_line_items": False},
+        attempts=[_raw_attempt(raw_lines)],
+    )
+
+    result = reapply_supplier_rules_to_invoice(db, invoice=_invoice(), supplier_id="supplier-1")
+
+    assert result["source"] == "selected_parse_attempt"
+    assert result["line_items_count"] == 1
+    assert db.tables["invoice_line_items"][0]["description"] == "Purchase from Example Supplier"
+    assert db.tables["invoice_line_items"][0]["line_total"] == 300.0
+
+
+def test_reapply_rules_restores_raw_lines_after_summary_mode_is_turned_back_on():
+    raw_lines = [
+        {"description": "Item A", "quantity": 1, "unit_price": 100.0, "line_total": 100.0},
+        {"description": "Item B", "quantity": 2, "unit_price": 100.0, "line_total": 200.0},
+    ]
+    db = _rule_test_db(
+        supplier_settings={"parse_line_items": False},
+        attempts=[_raw_attempt(raw_lines)],
+    )
+
+    reapply_supplier_rules_to_invoice(db, invoice=_invoice(), supplier_id="supplier-1")
+    db.tables["suppliers"][0]["parse_line_items"] = True
+    result = reapply_supplier_rules_to_invoice(db, invoice=_invoice(), supplier_id="supplier-1")
+
+    assert result["source"] == "selected_parse_attempt"
+    assert [row["description"] for row in db.tables["invoice_line_items"]] == ["Item A", "Item B"]
+
+
+def test_reapply_rules_without_raw_snapshot_does_not_overwrite_generated_summary():
+    summary = {
+        "invoice_extracted_id": "invoice-1",
+        "description": "Purchase from Example Supplier",
+        "quantity": 1,
+        "line_total": 300.0,
+    }
+    db = _rule_test_db(current_line_items=[summary.copy()])
+
+    result = reapply_supplier_rules_to_invoice(db, invoice=_invoice(), supplier_id="supplier-1")
+
+    assert result["needs_reextract"] is True
+    assert result["skipped"] is True
+    assert db.tables["invoice_line_items"] == [summary]

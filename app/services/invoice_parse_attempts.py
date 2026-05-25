@@ -100,6 +100,58 @@ def build_parse_attempt(
     }
 
 
+def ensure_parsed_data_attempt(
+    attempts: list[dict],
+    *,
+    parsed_data: dict,
+    text: str = "",
+    strategy: str = "final_extraction_snapshot",
+) -> list[dict]:
+    """
+    Ensure the final raw extraction is persisted even when OCR text is empty.
+
+    Supplier rules mutate the working line-item rows later. This snapshot keeps
+    the pre-rule parsed data available so rules can be re-applied without
+    running OCR/VLM again.
+    """
+    parsed = _copy_parsed(parsed_data)
+    line_items = _line_items(parsed)
+    has_extracted_values = any(
+        parsed.get(key) not in (None, "", [])
+        for key in (
+            "supplier_name_extracted",
+            "invoice_number",
+            "invoice_date",
+            "subtotal",
+            "tax_amount",
+            "total_amount",
+            "currency",
+        )
+    )
+    if not line_items and not has_extracted_values:
+        return attempts
+
+    updated_attempts = list(attempts or [])
+    if updated_attempts:
+        updated_attempts[0] = {
+            **updated_attempts[0],
+            "parsed_data": parsed,
+            "line_items": line_items,
+            "confidence_score": parsed.get("confidence_score"),
+        }
+        return updated_attempts
+
+    attempt = build_parse_attempt(
+        strategy=strategy,
+        text=text or "",
+        parsed_data=parsed,
+        ocr_used=False,
+    )
+    if not attempt:
+        return updated_attempts
+    return [attempt]
+
+
 def build_parse_attempts_from_text_result(text_result: dict) -> list[dict]:
     attempts: list[dict] = []
     text = text_result.get("text") or ""

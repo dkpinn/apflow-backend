@@ -169,13 +169,27 @@ def build_invoice_rule_source(supabase, invoice: dict) -> tuple[dict, list[dict]
 
     try:
         attempts, _ = fetch_parse_attempts(supabase, invoice_raw_id=invoice_raw_id)
-        selected = next((attempt for attempt in attempts if attempt.get("selected")), None)
-        attempt = selected or (attempts[0] if attempts else None)
+        selected = next(
+            (
+                attempt
+                for attempt in attempts
+                if attempt.get("selected")
+                and (attempt.get("line_items") or (attempt.get("parsed_data") or {}).get("line_items"))
+            ),
+            None,
+        )
+        attempt = selected or next(
+            (
+                attempt
+                for attempt in attempts
+                if attempt.get("line_items") or (attempt.get("parsed_data") or {}).get("line_items")
+            ),
+            None,
+        )
         if attempt:
             parsed_data = deepcopy(attempt.get("parsed_data") or {})
             line_items = deepcopy(attempt.get("line_items") or parsed_data.get("line_items") or [])
-            if line_items:
-                parsed_data["line_items"] = line_items
+            parsed_data["line_items"] = line_items
             return parsed_data, line_items, "selected_parse_attempt" if selected else "first_parse_attempt"
     except Exception:
         pass
@@ -188,6 +202,29 @@ def build_invoice_rule_source(supabase, invoice: dict) -> tuple[dict, list[dict]
             parsed_data["line_items"] = line_items
 
     return parsed_data, line_items, "current_invoice"
+
+
+def _looks_like_generated_summary_line(line_items: list[dict], invoice: dict) -> bool:
+    if len(line_items or []) != 1:
+        return False
+
+    item = line_items[0] or {}
+    description = str(item.get("description") or "").strip().lower()
+    if not description.startswith("purchase from "):
+        return False
+
+    quantity = _numeric_amount(item.get("quantity"))
+    if quantity is not None and quantity != 1:
+        return False
+
+    line_total = _numeric_amount(item.get("line_total"))
+    invoice_total = _numeric_amount(invoice.get("total_amount"))
+    subtotal = _numeric_amount(invoice.get("subtotal"))
+    expected_total = subtotal if subtotal is not None else invoice_total
+    if line_total is None or expected_total is None:
+        return True
+
+    return abs(line_total - expected_total) <= 0.02
 
 
 def reapply_supplier_rules_to_invoice(
@@ -204,6 +241,33 @@ def reapply_supplier_rules_to_invoice(
 
     settings = fetch_supplier_processing_settings(supabase, supplier_id)
     parsed_data, raw_line_items, source = build_invoice_rule_source(supabase, invoice)
+    if source == "current_invoice" and _looks_like_generated_summary_line(raw_line_items, invoice):
+        result = {
+            "source": source,
+            "supplier_id": supplier_id,
+            "invoice_patch": {},
+            "line_items_count": len(raw_line_items or []),
+            "needs_reextract": True,
+            "skipped": True,
+            "reason": "missing_raw_extraction_snapshot",
+        }
+        if organisation_id:
+            log_invoice_event(
+                supabase,
+                organisation_id=organisation_id,
+                invoice_raw_id=invoice_raw_id,
+                invoice_extracted_id=invoice_extracted_id,
+                event_type="supplier_rules_reapply_skipped",
+                stage="supplier_processing_rules",
+                actor_type=actor_type,
+                new_value=result,
+                notes=(
+                    "Supplier rules were not re-applied because only a generated "
+                    "summary line is available. Re-extract once to rebuild the raw snapshot."
+                ),
+            )
+        return result
+
     applied = apply_supplier_processing_rules(
         parsed_data,
         settings,
@@ -233,6 +297,8 @@ def reapply_supplier_rules_to_invoice(
         "supplier_id": supplier_id,
         "invoice_patch": invoice_patch,
         "line_items_count": len(applied["line_items"]),
+        "needs_reextract": False,
+        "skipped": False,
         **diagnostics,
     }
 
