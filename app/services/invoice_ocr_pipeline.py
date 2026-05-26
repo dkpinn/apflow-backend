@@ -965,10 +965,13 @@ def parse_date_to_iso(value: str) -> Optional[str]:
     formats = [
         "%d/%m/%Y",
         "%d-%m-%Y",
+        "%d.%m.%Y",
         "%Y/%m/%d",
         "%Y-%m-%d",
+        "%Y.%m.%d",
         "%d/%m/%y",
         "%d-%m-%y",
+        "%d.%m.%y",
         "%d %b %Y",
         "%d %B %Y",
         "%b %d %Y",
@@ -983,14 +986,67 @@ def parse_date_to_iso(value: str) -> Optional[str]:
 
     return None
 
+
+def extract_document_time(text: str) -> Optional[str]:
+    """
+    Extract a document/receipt time as HHMM.
+
+    This is used only to create an internal fallback document reference when a
+    real invoice/receipt number is absent.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    def valid_time_from_match(source: str, match: re.Match[str]) -> Optional[str]:
+        if match.start() > 0 and source[match.start() - 1] in "./-":
+            return None
+        if match.end() < len(source) and source[match.end()] in "./-":
+            return None
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if hour <= 23:
+            return f"{hour:02d}{minute:02d}"
+        return None
+
+    for index, line in enumerate(lines):
+        if not re.search(r"\btime\b", line, re.IGNORECASE):
+            continue
+        window = " ".join(lines[index:index + 4])
+        for match in re.finditer(r"\b([0-2]?\d)[:.]([0-5]\d)\b", window):
+            candidate = valid_time_from_match(window, match)
+            if candidate:
+                return candidate
+
+    time_candidates: list[tuple[int, int]] = []
+    for match in re.finditer(r"\b([0-2]?\d)[:.]([0-5]\d)\b", text):
+        candidate = valid_time_from_match(text, match)
+        if candidate:
+            time_candidates.append((int(candidate[:2]), int(candidate[2:])))
+
+    if time_candidates:
+        hour, minute = time_candidates[-1]
+        return f"{hour:02d}{minute:02d}"
+
+    return None
+
+
+def build_datetime_invoice_number(invoice_date: Optional[str], document_time: Optional[str]) -> Optional[str]:
+    if not invoice_date:
+        return None
+    compact_date = invoice_date.replace("-", "")
+    if not re.fullmatch(r"\d{8}", compact_date):
+        return None
+    compact_time = document_time if document_time and re.fullmatch(r"\d{4}", document_time) else "0000"
+    return f"{compact_date}{compact_time}"
+
+
 # ------------------------------------------------------------
 # FIELD EXTRACTION
 # ------------------------------------------------------------
 
 def extract_invoice_date(text: str) -> Optional[str]:
     label_patterns = [
-        r"(?:Invoice\s*Date|Tax\s*Invoice\s*Date|Date)\s*[:#\-]?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})",
-        r"(?:Invoice\s*Date|Tax\s*Invoice\s*Date|Date)\s*[:#\-]?\s*(\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})",
+        r"(?:Invoice\s*Date|Tax\s*Invoice\s*Date|Date)\s*[:#\-]?\s*(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})",
+        r"(?:Invoice\s*Date|Tax\s*Invoice\s*Date|Date)\s*[:#\-]?\s*(\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2})",
         r"(?:Invoice\s*Date|Tax\s*Invoice\s*Date|Date)\s*[:#\-]?\s*(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})",
         r"(?:Invoice\s*Date|Tax\s*Invoice\s*Date|Date)\s*[:#\-]?\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})",
     ]
@@ -1003,9 +1059,9 @@ def extract_invoice_date(text: str) -> Optional[str]:
                 return parsed
 
     fallback_patterns = [
-        r"\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}\b",
-        r"\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2}\b",
-        r"\b\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2}\b",
+        r"\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{4}\b",
+        r"\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2}\b",
+        r"\b\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}\b",
         r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\b",
         r"\b[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}\b",
     ]
@@ -1060,6 +1116,11 @@ def parse_invoice_fields(text: str) -> dict:
 
     invoice_number = extract_invoice_number(text)
     invoice_date = extract_invoice_date(text)
+    document_time = extract_document_time(text)
+    invoice_number_generated_from_datetime = False
+    if not invoice_number:
+        invoice_number = build_datetime_invoice_number(invoice_date, document_time)
+        invoice_number_generated_from_datetime = bool(invoice_number)
     due_date = extract_due_date(text)
 
     line_items = extract_line_items(text, layout_type=layout.layout_type)
@@ -1081,6 +1142,8 @@ def parse_invoice_fields(text: str) -> dict:
         "layout_type": layout.layout_type,
 
         "invoice_number": invoice_number,
+        "invoice_number_generated_from_datetime": invoice_number_generated_from_datetime,
+        "document_time_extracted": document_time,
         "supplier_name_extracted": extract_supplier_name(text, layout_type=layout.layout_type),
         "invoice_date": invoice_date,
         "due_date": due_date,

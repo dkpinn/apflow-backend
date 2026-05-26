@@ -1,4 +1,6 @@
-from app.services.invoice_line_items import build_line_item_payload
+import pytest
+
+from app.services.invoice_line_items import build_line_item_payload, validate_line_item_allocations
 from app.services.invoice_parse_attempts import ensure_parsed_data_attempt
 from app.services.invoice_supplier_rules import (
     apply_supplier_processing_rules,
@@ -220,6 +222,33 @@ def test_line_item_payload_persists_expense_account():
     )
 
     assert payload[0]["expense_account"] == "6000/Office"
+
+
+def test_line_item_allocation_validation_accepts_balanced_split():
+    validate_line_item_allocations([
+        {
+            "description": "Shared expense",
+            "line_total": 150,
+            "allocations": [
+                {"expense_account": "6000", "tracking": {"cost_centre": "head-office"}, "amount": 100},
+                {"expense_account": "6000", "tracking": {"cost_centre": "finance"}, "amount": 50},
+            ],
+        },
+    ])
+
+
+def test_line_item_allocation_validation_rejects_unbalanced_split():
+    with pytest.raises(ValueError, match="allocations total"):
+        validate_line_item_allocations([
+            {
+                "description": "Shared expense",
+                "line_total": 150,
+                "allocations": [
+                    {"expense_account": "6000", "amount": 100},
+                    {"expense_account": "6000", "amount": 45},
+                ],
+            },
+        ])
 
 
 def test_parsed_data_attempt_captures_vlm_line_items_when_text_is_empty():
