@@ -693,6 +693,20 @@ def _append_validation_note(existing: Optional[str], note: str) -> str:
     return f"{existing} {note}"
 
 
+def _supplier_candidate_from_recovery_text(text: str) -> Optional[str]:
+    blocked = re.compile(
+        r"\b(vat|tax|invoice|receipt|tel|telephone|fax|email|address|total|subtotal|tendered|cashier|date|time|slip)\b",
+        re.IGNORECASE,
+    )
+    for raw_line in text.splitlines()[:12]:
+        candidate = re.sub(r"\s+", " ", raw_line).strip(" :-*\t")
+        if not candidate or blocked.search(candidate):
+            continue
+        if _valid_reextract_value("supplier_name_extracted", candidate):
+            return candidate.title() if candidate.isupper() else candidate
+    return None
+
+
 def merge_supplier_recovery_fields(parsed_data: dict, text_result: dict) -> dict:
     """
     Fill missing supplier identity/contact fields from full-page OCR only.
@@ -714,6 +728,11 @@ def merge_supplier_recovery_fields(parsed_data: dict, text_result: dict) -> dict
         _has_value(recovery_parsed.get(field))
         for field in SUPPLIER_RECOVERY_SUPPORT_FIELDS
     )
+    if (
+        has_supporting_supplier_evidence
+        and not _has_value(recovery_parsed.get("supplier_name_extracted"))
+    ):
+        recovery_parsed["supplier_name_extracted"] = _supplier_candidate_from_recovery_text(recovery_text)
 
     applied_fields: list[str] = []
     for field in SUPPLIER_RECOVERY_FIELDS:
