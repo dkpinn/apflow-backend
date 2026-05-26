@@ -2,7 +2,15 @@
 __pycache__/
 *.pyc
 .env
-# .gitignore content:
 apflow-backend.zip
-# OR
 *.zip
+
+# Invoice debug / temp data dumps — never commit these
+inv_data*.json
+*_inv_data.json
+invoice_debug*.json
+debug_invoice*.json
+
+# Windows %TEMP% path fragments that appear when a file from AppData\Local\Temp
+# is accidentally staged (path separators get stripped into the filename)
+UsersdaleAppData*.json
