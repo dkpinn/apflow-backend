@@ -51,6 +51,17 @@ from app.services.invoice_extraction.vlm_parser import (
 )
 from app.services.invoice_previews import persist_preview_artifacts
 from app.services.invoice_extraction.entity_detection import classify_document_direction, normalise_name
+from app.services.invoice_data_builders import (
+    apply_missing_supplier_failure,
+    build_extracted_document_profile,
+    build_extracted_supplier_profile,
+    build_reextract_update,
+    build_supplier_create_payload,
+    merge_supplier_recovery_fields,
+    utc_now_iso,
+    MISSING_SUPPLIER_VALIDATION_STATUS,
+    _trim_region_text,
+)
 
 router = APIRouter(prefix="/api/invoices", tags=["invoices"])
 try:
@@ -174,10 +185,6 @@ class GeneratePreviewRequest(BaseModel):
     organisation_id: str
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _reextract_status_payload(job: dict) -> dict:
     stage = job.get("stage") or "queued"
     return {
@@ -262,6 +269,79 @@ def get_reextract_job_status(job_id: str) -> Optional[dict]:
         if not job:
             return None
         return _reextract_status_payload(deepcopy(job))
+
+
+def _stringify_http_detail(detail) -> str:
+    if isinstance(detail, str):
+        return detail
+    if isinstance(detail, dict):
+        return detail.get("message") or str(detail)
+    return str(detail)
+
+
+def _resolve_reextract_context(payload_data: dict) -> dict:
+    invoice_raw_id = payload_data.get("invoice_raw_id")
+    organisation_id = payload_data.get("organisation_id")
+    raw = None
+    extracted_invoice_id = None
+
+    if invoice_raw_id:
+        try:
+            raw = get_raw_invoice(invoice_raw_id)
+            organisation_id = organisation_id or raw.get("organisation_id")
+        except Exception:
+            raw = None
+
+        try:
+            existing_res = (
+                supabase
+                .table("invoices_extracted")
+                .select("id")
+                .eq("invoice_raw_id", invoice_raw_id)
+                .limit(1)
+                .execute()
+            )
+            if existing_res.data:
+                extracted_invoice_id = existing_res.data[0].get("id")
+        except Exception:
+            extracted_invoice_id = None
+
+    return {
+        "invoice_raw_id": invoice_raw_id,
+        "organisation_id": organisation_id,
+        "raw": raw,
+        "extracted_invoice_id": extracted_invoice_id,
+    }
+
+
+def log_reextract_failure(
+    *,
+    payload_data: dict,
+    job_id: Optional[str],
+    error: str,
+    stage: str = "failed",
+    extracted_invoice_id: Optional[str] = None,
+) -> None:
+    context = _resolve_reextract_context(payload_data)
+    organisation_id = context.get("organisation_id")
+    if not organisation_id:
+        return
+
+    log_invoice_event(
+        supabase,
+        organisation_id=organisation_id,
+        invoice_raw_id=context.get("invoice_raw_id"),
+        invoice_extracted_id=extracted_invoice_id or context.get("extracted_invoice_id"),
+        job_id=job_id,
+        event_type="re_extraction_failed",
+        stage=stage,
+        actor_type="api",
+        new_value={
+            "job_id": job_id,
+            "error": error,
+        },
+        notes=error,
+    )
 
 
 def _normalise_extract_status(status: Optional[str]) -> str:
@@ -447,404 +527,6 @@ def _preprocessing_notes_text(value) -> Optional[str]:
     if isinstance(value, list):
         return "; ".join(str(item) for item in value if item is not None) or None
     return str(value)
-
-
-def build_extracted_supplier_profile(parsed_data: dict) -> dict:
-    return {
-        "supplier_name": parsed_data.get("supplier_name_extracted") or parsed_data.get("issuer_name_extracted"),
-        "supplier_code": parsed_data.get("cus_code_extracted"),
-        "account_number": parsed_data.get("cus_code_extracted"),
-        "currency": parsed_data.get("currency"),
-        "default_email": parsed_data.get("supplier_email_extracted"),
-        "accounting_email": parsed_data.get("supplier_acc_email_extracted"),
-        "phone": parsed_data.get("supplier_telephone_extracted"),
-        "telephone": parsed_data.get("supplier_telephone_extracted"),
-        "fax": parsed_data.get("supplier_fax_extracted"),
-        "cell": parsed_data.get("supplier_cell_extracted"),
-        "website": parsed_data.get("supplier_website_extracted"),
-        "delivery_address": parsed_data.get("supplier_del_address_extracted"),
-        "postal_address": parsed_data.get("supplier_pos_address_extracted"),
-        "vat_number": parsed_data.get("vat_number_extracted"),
-        "tax_number": parsed_data.get("vat_number_extracted"),
-        "company_registration_number": parsed_data.get("company_registration_number_extracted"),
-        "registration_number": parsed_data.get("company_registration_number_extracted"),
-        "bank_account_name": parsed_data.get("bank_account_name_extracted"),
-        "bank_name": parsed_data.get("bank_name_extracted"),
-        "bank_account_number": parsed_data.get("bank_account_number_extracted"),
-        "bank_branch_code": parsed_data.get("bank_branch_code_extracted"),
-        "bank_swift_code": parsed_data.get("bank_swift_code_extracted"),
-        # Raw extraction aliases for frontends that render invoices_extracted names.
-        "supplier_name_extracted": parsed_data.get("supplier_name_extracted"),
-        "supplier_email_extracted": parsed_data.get("supplier_email_extracted"),
-        "supplier_acc_email_extracted": parsed_data.get("supplier_acc_email_extracted"),
-        "supplier_telephone_extracted": parsed_data.get("supplier_telephone_extracted"),
-        "supplier_fax_extracted": parsed_data.get("supplier_fax_extracted"),
-        "supplier_cell_extracted": parsed_data.get("supplier_cell_extracted"),
-        "supplier_website_extracted": parsed_data.get("supplier_website_extracted"),
-        "supplier_del_address_extracted": parsed_data.get("supplier_del_address_extracted"),
-        "supplier_pos_address_extracted": parsed_data.get("supplier_pos_address_extracted"),
-        "vat_number_extracted": parsed_data.get("vat_number_extracted"),
-        "company_registration_number_extracted": parsed_data.get("company_registration_number_extracted"),
-        "cus_code_extracted": parsed_data.get("cus_code_extracted"),
-    }
-
-
-def build_extracted_document_profile(parsed_data: dict) -> dict:
-    return {
-        "invoice_number": parsed_data.get("invoice_number"),
-        "invoice_date": parsed_data.get("invoice_date"),
-        "due_date": parsed_data.get("due_date"),
-        "subtotal": parsed_data.get("subtotal"),
-        "tax_amount": parsed_data.get("tax_amount"),
-        "total_amount": parsed_data.get("total_amount"),
-        "currency": parsed_data.get("currency"),
-        "line_items": parsed_data.get("line_items") or [],
-        "supplier": build_extracted_supplier_profile(parsed_data),
-    }
-
-
-def build_supplier_create_payload(
-    *,
-    organisation_id: str,
-    invoice_raw_id: str,
-    invoice_extracted_id: Optional[str],
-    parsed_data: dict,
-) -> dict:
-    profile = build_extracted_supplier_profile(parsed_data)
-    return {
-        "organisation_id": organisation_id,
-        "supplier_name": profile.get("supplier_name"),
-        "supplier_code": profile.get("supplier_code"),
-        "account_number": profile.get("supplier_code"),
-        "currency": profile.get("currency"),
-        "default_email": profile.get("accounting_email") or profile.get("default_email"),
-        "phone": profile.get("phone") or profile.get("cell"),
-        "vat_number": profile.get("vat_number"),
-        "tax_number": profile.get("vat_number"),
-        "registration_number": profile.get("company_registration_number"),
-        "company_registration_number": profile.get("company_registration_number"),
-        "bank_account_name": profile.get("bank_account_name"),
-        "bank_name": profile.get("bank_name"),
-        "bank_account_number": profile.get("bank_account_number"),
-        "bank_branch_code": profile.get("bank_branch_code"),
-        "bank_swift_code": profile.get("bank_swift_code"),
-        "bank_country": "ZA" if (profile.get("currency") or "ZAR") == "ZAR" else None,
-        "delivery_address": profile.get("delivery_address"),
-        "postal_address": profile.get("postal_address"),
-        "accounting_email": profile.get("accounting_email"),
-        "fax": profile.get("fax"),
-        "cell": profile.get("cell"),
-        "website": profile.get("website"),
-        "invoice_extracted_id": invoice_extracted_id,
-        "invoice_raw_id": invoice_raw_id,
-        "link_invoice": True,
-    }
-
-
-REEXTRACT_FIELD_MAP = {
-    "supplier_name_extracted": "supplier_name_extracted",
-    "invoice_number": "invoice_number",
-    "invoice_date": "invoice_date",
-    "due_date": "due_date",
-    "subtotal": "subtotal",
-    "tax_amount": "tax_amount",
-    "total_amount": "total_amount",
-    "currency": "currency",
-    "supplier_del_address_extracted": "supplier_del_address_extracted",
-    "supplier_pos_address_extracted": "supplier_pos_address_extracted",
-    "supplier_email_extracted": "supplier_email_extracted",
-    "supplier_acc_email_extracted": "supplier_acc_email_extracted",
-    "supplier_telephone_extracted": "supplier_telephone_extracted",
-    "supplier_fax_extracted": "supplier_fax_extracted",
-    "supplier_cell_extracted": "supplier_cell_extracted",
-    "supplier_website_extracted": "supplier_website_extracted",
-    "vat_number_extracted": "vat_number_extracted",
-    "cus_code_extracted": "cus_code_extracted",
-    "company_registration_number_extracted": "company_registration_number_extracted",
-    "bank_account_name_extracted": "bank_account_name_extracted",
-    "bank_name_extracted": "bank_name_extracted",
-    "bank_account_number_extracted": "bank_account_number_extracted",
-    "bank_branch_code_extracted": "bank_branch_code_extracted",
-    "bank_swift_code_extracted": "bank_swift_code_extracted",
-    "issuer_name_extracted": "issuer_name_extracted",
-    "recipient_name_extracted": "recipient_name_extracted",
-    "document_direction": "document_direction",
-    "organisation_match_status": "organisation_match_status",
-    "validation_status": "validation_status",
-    "validation_notes": "validation_notes",
-}
-
-SUPPLIER_RECOVERY_FIELDS = [
-    "supplier_name_extracted",
-    "supplier_del_address_extracted",
-    "supplier_pos_address_extracted",
-    "supplier_email_extracted",
-    "supplier_acc_email_extracted",
-    "supplier_telephone_extracted",
-    "supplier_fax_extracted",
-    "supplier_cell_extracted",
-    "supplier_website_extracted",
-    "vat_number_extracted",
-    "cus_code_extracted",
-    "company_registration_number_extracted",
-]
-
-SUPPLIER_RECOVERY_SUPPORT_FIELDS = {
-    "supplier_del_address_extracted",
-    "supplier_pos_address_extracted",
-    "supplier_email_extracted",
-    "supplier_acc_email_extracted",
-    "supplier_telephone_extracted",
-    "supplier_fax_extracted",
-    "supplier_cell_extracted",
-    "supplier_website_extracted",
-    "vat_number_extracted",
-    "company_registration_number_extracted",
-}
-
-MISSING_SUPPLIER_VALIDATION_STATUS = "failed_missing_supplier"
-MISSING_SUPPLIER_NOTE = (
-    "No supplier name could be obtained from the document after OCR, supplier recovery, "
-    "VLM fallback, and issuer detection. Manual supplier editing is required."
-)
-
-
-def _has_value(value) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, (int, float)):
-        return value != 0  # treat 0 the same as null — a zeroed numeric field has no useful data
-    return True
-
-
-def _looks_suspicious_value(field_name: str, value) -> bool:
-    if not _has_value(value):
-        return True
-    if not isinstance(value, str):
-        return False
-
-    clean = value.strip()
-    if field_name == "supplier_name_extracted":
-        alpha_count = sum(char.isalpha() for char in clean)
-        if clean.startswith("_") or alpha_count < 3:
-            return True
-        if len(clean) <= 4 and clean.lower() in {"pty", "ltd", "copy"}:
-            return True
-        if clean.lower() in {"original", "customer copy", "copy of original", "welcome", "welcame", "welkom"}:
-            return True
-    if field_name == "supplier_del_address_extracted":
-        lower = clean.lower()
-        if "scan to rate" in lower or "survey" in lower:
-            return True
-    return False
-
-
-def _valid_reextract_value(field_name: str, value) -> bool:
-    if not _has_value(value):
-        return False
-
-    if field_name in {"subtotal", "total_amount"}:
-        try:
-            return float(value) > 0
-        except Exception:
-            return False
-    if field_name == "tax_amount":
-        try:
-            return float(value) >= 0
-        except Exception:
-            return False
-    if field_name in {"vat_number_extracted", "bank_account_number_extracted"}:
-        return len("".join(char for char in str(value) if char.isdigit())) >= 7
-    if field_name in {"supplier_telephone_extracted", "supplier_fax_extracted", "supplier_cell_extracted"}:
-        return len("".join(char for char in str(value) if char.isdigit())) >= 7
-    if field_name == "supplier_name_extracted":
-        clean = str(value).strip()
-        lower = clean.lower()
-        if lower in {"copy", "original", "customer copy", "copy of original", "tax invoice", "welcome", "welcame", "welkom"}:
-            return False
-        if "copy of original" in lower or "customer copy" in lower:
-            return False
-        if clean.startswith("_"):
-            return False
-        words = [word for word in re.findall(r"[A-Za-z]+", clean) if word]
-        if not words:
-            return False
-        if len(words) == 1 and len(words[0]) <= 4:
-            return False
-        if len(words) == 1 and not re.search(r"\b(build|builders|makro|massmart|pinetown)\b", lower):
-            return False
-        return True
-    if field_name == "invoice_number":
-        return any(char.isdigit() for char in str(value))
-    if field_name in {"invoice_date", "due_date"}:
-        return bool(str(value).strip())
-    return True
-
-
-
-# Status/classification fields whose latest extraction value should always win —
-def _append_validation_note(existing: Optional[str], note: str) -> str:
-    if not existing:
-        return note
-    if note in existing:
-        return existing
-    return f"{existing} {note}"
-
-
-def _supplier_candidate_from_recovery_text(text: str) -> Optional[str]:
-    blocked = re.compile(
-        r"\b(vat|tax|invoice|receipt|tel|telephone|fax|email|address|total|subtotal|tendered|cashier|date|time|slip)\b",
-        re.IGNORECASE,
-    )
-    for raw_line in text.splitlines()[:12]:
-        candidate = re.sub(r"\s+", " ", raw_line).strip(" :-*\t")
-        if not candidate or blocked.search(candidate):
-            continue
-        if _valid_reextract_value("supplier_name_extracted", candidate):
-            return candidate.title() if candidate.isupper() else candidate
-    return None
-
-
-def merge_supplier_recovery_fields(parsed_data: dict, text_result: dict) -> dict:
-    """
-    Fill missing supplier identity/contact fields from full-page OCR only.
-
-    This intentionally never updates amounts, dates, invoice numbers or line
-    items, so supplier recovery cannot change accounting calculations.
-    """
-    pages = text_result.get("pages") or []
-    recovery_texts = [
-        ((page.get("supplier_recovery_ocr") or {}).get("text") or "")
-        for page in pages
-    ]
-    recovery_text = "\n\n".join(text for text in recovery_texts if text.strip()).strip()
-    if not recovery_text:
-        return {"applied": False, "fields": [], "text_length": 0}
-
-    recovery_parsed = parse_invoice_fields(recovery_text)
-    has_supporting_supplier_evidence = any(
-        _has_value(recovery_parsed.get(field))
-        for field in SUPPLIER_RECOVERY_SUPPORT_FIELDS
-    )
-    if (
-        has_supporting_supplier_evidence
-        and not _has_value(recovery_parsed.get("supplier_name_extracted"))
-    ):
-        recovery_parsed["supplier_name_extracted"] = _supplier_candidate_from_recovery_text(recovery_text)
-
-    applied_fields: list[str] = []
-    for field in SUPPLIER_RECOVERY_FIELDS:
-        if _has_value(parsed_data.get(field)):
-            continue
-
-        value = recovery_parsed.get(field)
-        if not _valid_reextract_value(field, value):
-            continue
-
-        if field == "supplier_name_extracted" and not has_supporting_supplier_evidence:
-            continue
-
-        parsed_data[field] = value
-        applied_fields.append(field)
-
-    if applied_fields:
-        parsed_data["validation_notes"] = _append_validation_note(
-            parsed_data.get("validation_notes"),
-            "Supplier identity/contact fields were recovered from a full-page OCR pass.",
-        )
-
-    return {
-        "applied": bool(applied_fields),
-        "fields": applied_fields,
-        "text_length": len(recovery_text),
-        "supplier_candidate": recovery_parsed.get("supplier_name_extracted"),
-        "supporting_supplier_evidence": has_supporting_supplier_evidence,
-    }
-
-
-def apply_missing_supplier_failure(parsed_data: dict) -> bool:
-    if _has_value(parsed_data.get("supplier_name_extracted")):
-        return False
-
-    parsed_data["validation_status"] = MISSING_SUPPLIER_VALIDATION_STATUS
-    parsed_data["validation_notes"] = _append_validation_note(
-        parsed_data.get("validation_notes"),
-        MISSING_SUPPLIER_NOTE,
-    )
-    parsed_data["confidence_score"] = min(float(parsed_data.get("confidence_score") or 0), 0.45)
-    return True
-
-
-# Status/classification fields whose latest extraction value should always win.
-# The "has old value" guard does not apply to these.
-_ALWAYS_UPDATE_FIELDS = {"validation_status", "document_direction", "organisation_match_status"}
-
-
-def build_reextract_update(
-    *,
-    existing: dict,
-    parsed: dict,
-    force_update: bool = False,
-) -> tuple[dict, list[dict], list[str]]:
-    update_payload: dict = {}
-    improved_fields: list[dict] = []
-    unchanged_fields: list[str] = []
-    old_confidence = existing.get("confidence_score") or 0
-    new_confidence = parsed.get("confidence_score") or 0
-    confidence_materially_improved = new_confidence >= old_confidence + 0.15
-
-    for target_field, parsed_key in REEXTRACT_FIELD_MAP.items():
-        new_value = parsed.get(parsed_key)
-        old_value = existing.get(target_field)
-
-        if not _valid_reextract_value(target_field, new_value):
-            if target_field == "supplier_name_extracted" and _looks_suspicious_value(target_field, old_value):
-                update_payload[target_field] = None
-                improved_fields.append({
-                    "field": target_field,
-                    "old_value": old_value,
-                    "new_value": None,
-                })
-                continue
-            unchanged_fields.append(target_field)
-            continue
-
-        should_update = (
-            force_update
-            or target_field in _ALWAYS_UPDATE_FIELDS
-            or not _has_value(old_value)
-            or _looks_suspicious_value(target_field, old_value)
-            or confidence_materially_improved
-        )
-
-        if should_update and new_value != old_value:
-            update_payload[target_field] = new_value
-            improved_fields.append({
-                "field": target_field,
-                "old_value": old_value,
-                "new_value": new_value,
-            })
-        else:
-            unchanged_fields.append(target_field)
-
-    if new_confidence is not None and (force_update or not old_confidence or new_confidence > old_confidence):
-        update_payload["confidence_score"] = new_confidence
-
-    if update_payload:
-        update_payload["review_status"] = "needs_info"
-        update_payload["updated_at"] = utc_now_iso()
-
-    return update_payload, improved_fields, unchanged_fields
-
-
-def _trim_region_text(region_ocr: dict, limit: int = 700) -> dict:
-    region_text = (region_ocr.get("region_text_by_name") or {})
-    return {
-        name: (text[:limit] if text else "")
-        for name, text in region_text.items()
-    }
 
 
 def store_basic_document_page_snapshot(
@@ -1783,6 +1465,8 @@ def run_invoice_re_extraction(
     *,
     job_id: Optional[str] = None,
 ) -> dict:
+    org_id = payload.organisation_id
+    extracted_invoice_id: Optional[str] = None
     if job_id:
         update_reextract_job(job_id, status="running", stage="starting")
 
@@ -1794,7 +1478,20 @@ def run_invoice_re_extraction(
 
     file_path = raw.get("file_path")
     if not file_path:
-        raise HTTPException(status_code=400, detail="Missing file_path on invoices_raw row")
+        log_invoice_event(
+            supabase,
+            organisation_id=org_id,
+            invoice_raw_id=payload.invoice_raw_id,
+            job_id=job_id,
+            event_type="re_extraction_failed",
+            stage="failed",
+            actor_type="api",
+            new_value={"job_id": job_id, "error": "Missing file_path on invoices_raw row"},
+            notes="Missing file_path on invoices_raw row",
+        )
+        exc = HTTPException(status_code=400, detail="Missing file_path on invoices_raw row")
+        setattr(exc, "_audit_logged", True)
+        raise exc
 
     existing_res = (
         supabase
@@ -1805,7 +1502,20 @@ def run_invoice_re_extraction(
         .execute()
     )
     if not existing_res.data:
-        raise HTTPException(status_code=404, detail="No extracted invoice found to re-extract")
+        log_invoice_event(
+            supabase,
+            organisation_id=org_id,
+            invoice_raw_id=payload.invoice_raw_id,
+            job_id=job_id,
+            event_type="re_extraction_failed",
+            stage="failed",
+            actor_type="api",
+            new_value={"job_id": job_id, "error": "No extracted invoice found to re-extract"},
+            notes="No extracted invoice found to re-extract",
+        )
+        exc = HTTPException(status_code=404, detail="No extracted invoice found to re-extract")
+        setattr(exc, "_audit_logged", True)
+        raise exc
 
     existing = existing_res.data[0]
     extracted_invoice_id = existing["id"]
@@ -1818,7 +1528,7 @@ def run_invoice_re_extraction(
         event_type="re_extraction_started",
         stage="text_extraction",
         actor_type="api",
-        new_value={"mode": "deep_region_ocr", "force_update": payload.force_update},
+        new_value={"mode": "deep_region_ocr", "force_update": payload.force_update, "job_id": job_id},
         notes="Deep region OCR re-extraction started.",
     )
 
@@ -1828,7 +1538,21 @@ def run_invoice_re_extraction(
     try:
         file_bytes = supabase.storage.from_("invoices").download(file_path)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Storage download error: {str(exc)}")
+        log_invoice_event(
+            supabase,
+            organisation_id=org_id,
+            invoice_raw_id=payload.invoice_raw_id,
+            invoice_extracted_id=extracted_invoice_id,
+            job_id=job_id,
+            event_type="re_extraction_failed",
+            stage="failed",
+            actor_type="api",
+            new_value={"job_id": job_id, "error": f"Storage download error: {str(exc)}"},
+            notes=f"Storage download error: {str(exc)}",
+        )
+        http_exc = HTTPException(status_code=400, detail=f"Storage download error: {str(exc)}")
+        setattr(http_exc, "_audit_logged", True)
+        raise http_exc
 
     try:
         existing_parse_attempts: list[dict] = []
@@ -2136,13 +1860,28 @@ def run_invoice_re_extraction(
             )
         return response
     except HTTPException as exc:
+        error_message = _stringify_http_detail(exc.detail) if exc.detail else "Re-extraction failed"
         if job_id:
             update_reextract_job(
                 job_id,
                 status="failed",
                 stage="failed",
-                error=str(exc.detail) if exc.detail else "Re-extraction failed",
+                error=error_message,
             )
+        if org_id:
+            log_invoice_event(
+                supabase,
+                organisation_id=org_id,
+                invoice_raw_id=payload.invoice_raw_id,
+                invoice_extracted_id=extracted_invoice_id,
+                job_id=job_id,
+                event_type="re_extraction_failed",
+                stage="failed",
+                actor_type="api",
+                new_value={"job_id": job_id, "status_code": exc.status_code, "error": error_message},
+                notes=error_message,
+            )
+            setattr(exc, "_audit_logged", True)
         raise
     except Exception as exc:
         if job_id:
@@ -2152,9 +1891,11 @@ def run_invoice_re_extraction(
             organisation_id=org_id,
             invoice_raw_id=payload.invoice_raw_id,
             invoice_extracted_id=extracted_invoice_id,
+            job_id=job_id,
             event_type="re_extraction_failed",
             stage="failed",
             actor_type="api",
+            new_value={"job_id": job_id, "error": str(exc)},
             notes=str(exc),
         )
         raise HTTPException(status_code=400, detail=f"Deep re-extraction failed: {str(exc)}")
@@ -2164,8 +1905,22 @@ def run_reextract_job_background(job_id: str, payload_data: dict) -> None:
     try:
         payload = ReExtractInvoiceRequest(**payload_data)
         run_invoice_re_extraction(payload, job_id=job_id)
+    except HTTPException as exc:
+        error_message = _stringify_http_detail(exc.detail) if exc.detail else "Re-extraction failed"
+        update_reextract_job(job_id, status="failed", stage="failed", error=error_message)
+        if not getattr(exc, "_audit_logged", False):
+            log_reextract_failure(
+                payload_data=payload_data,
+                job_id=job_id,
+                error=error_message,
+            )
     except Exception as exc:
         update_reextract_job(job_id, status="failed", stage="failed", error=str(exc))
+        log_reextract_failure(
+            payload_data=payload_data,
+            job_id=job_id,
+            error=str(exc),
+        )
 
 
 @router.post("/re-extract")
@@ -2182,11 +1937,32 @@ def re_extract_invoice(
     if not org_id:
         raise HTTPException(status_code=400, detail="Missing organisation_id")
     if not raw.get("file_path"):
+        log_reextract_failure(
+            payload_data={**payload.model_dump(), "organisation_id": org_id},
+            job_id=None,
+            error="Missing file_path on invoices_raw row",
+        )
         raise HTTPException(status_code=400, detail="Missing file_path on invoices_raw row")
 
     job = create_reextract_job(
         invoice_raw_id=payload.invoice_raw_id,
         organisation_id=org_id,
+    )
+    queued_context = _resolve_reextract_context({**payload.model_dump(), "organisation_id": org_id})
+    log_invoice_event(
+        supabase,
+        organisation_id=org_id,
+        invoice_raw_id=payload.invoice_raw_id,
+        invoice_extracted_id=queued_context.get("extracted_invoice_id"),
+        event_type="re_extraction_queued",
+        stage="queued",
+        actor_type="api",
+        job_id=job["job_id"],
+        new_value={
+            "job_id": job["job_id"],
+            "force_update": payload.force_update,
+        },
+        notes="Re-extraction queued.",
     )
     payload_data = payload.model_dump()
     payload_data["organisation_id"] = org_id
@@ -2356,6 +2132,27 @@ def get_invoice_review_data(invoice_id: str):
                 .execute()
             )
             line_items = line_items_res.data or []
+            line_item_ids = [row.get("id") for row in line_items if row.get("id")]
+            if line_item_ids:
+                try:
+                    allocations_res = (
+                        supabase
+                        .table("invoice_line_item_allocations")
+                        .select("*")
+                        .in_("invoice_line_item_id", line_item_ids)
+                        .order("sort_order", desc=False)
+                        .order("created_at", desc=False)
+                        .execute()
+                    )
+                    allocations_by_line: dict[str, list[dict]] = {}
+                    for allocation in allocations_res.data or []:
+                        line_id = allocation.get("invoice_line_item_id")
+                        if line_id:
+                            allocations_by_line.setdefault(line_id, []).append(allocation)
+                    for line_item in line_items:
+                        line_item["allocations"] = allocations_by_line.get(line_item.get("id"), [])
+                except Exception as exc:
+                    fetch_errors["line_item_allocations"] = str(exc)
         except Exception as exc:
             fetch_errors["line_items"] = str(exc)
 
@@ -2636,14 +2433,20 @@ def save_invoice_line_items(req: SaveLineItemsRequest):
             rounding_applied = "needs_review"
 
     # 5. Persist line items (always delete-and-replace on explicit save)
-    diagnostics = replace_invoice_line_items(
-        supabase,
-        invoice_extracted_id=req.invoice_extracted_id,
-        organisation_id=req.organisation_id,
-        line_items=final_line_items,
-        invoice_total=computed_total,
-        delete_when_empty=True,
-    )
+    try:
+        diagnostics = replace_invoice_line_items(
+            supabase,
+            invoice_extracted_id=req.invoice_extracted_id,
+            organisation_id=req.organisation_id,
+            line_items=final_line_items,
+            invoice_total=computed_total,
+            delete_when_empty=True,
+            raise_on_error=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save line items: {exc}")
 
     # 6. Update invoices_extracted with derived totals
     patch: dict = {
