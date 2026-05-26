@@ -161,7 +161,6 @@ def _preprocess_for_vlm(file_bytes: bytes, effective_mime: str) -> list[tuple[by
         import fitz
         from PIL import Image
         from app.services.invoice_ocr_pipeline import DEEP_OCR_RENDER_DPI, resize_for_ocr
-        from app.services.invoice_extraction.receipt_preprocessing import preprocess_receipt_photo
 
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         if not doc.page_count:
@@ -175,9 +174,8 @@ def _preprocess_for_vlm(file_bytes: bytes, effective_mime: str) -> list[tuple[by
                 pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
                 image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
                 image = resize_for_ocr(image)
-                processed = preprocess_receipt_photo(image)
                 buf = io.BytesIO()
-                processed.processed_image.save(buf, format="PNG")
+                image.save(buf, format="PNG")
                 page_parts.append((buf.getvalue(), "image/png"))
             except Exception:
                 continue

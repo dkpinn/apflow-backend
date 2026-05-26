@@ -10,6 +10,7 @@ from app.db.supabase_client import get_supabase_client
 from app.routers import invoices
 from app.routers import suppliers
 from app.routers import themes
+from app.routers import consolidation
 
 
 def _rescue_pending_invoices() -> None:
@@ -251,6 +252,7 @@ app.include_router(reconciliation_router)
 app.include_router(invoices.router)
 app.include_router(suppliers.router)
 app.include_router(themes.router)
+app.include_router(consolidation.router)
 
 
 @app.get("/")

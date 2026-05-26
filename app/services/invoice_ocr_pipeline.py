@@ -42,6 +42,7 @@ from app.services.invoice_extraction.preprocessing import (
     preprocess_image_for_ocr,
 )
 from app.services.invoice_extraction.receipt_preprocessing import (
+    enhance_for_receipt_ocr,
     generate_preview_images,
     preprocess_receipt_photo,
     split_deep_document_ocr_regions,
@@ -427,6 +428,19 @@ def _upscale_deep_region(image: Image.Image) -> Image.Image:
     return resize_for_ocr(upscaled.convert("RGB"))
 
 
+def _crop_area_ratio(crop_box: Optional[dict[str, int]], image_size: tuple[int, int]) -> Optional[float]:
+    if not crop_box:
+        return None
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return None
+    crop_width = max(0, int(crop_box.get("x2", 0)) - int(crop_box.get("x1", 0)))
+    crop_height = max(0, int(crop_box.get("y2", 0)) - int(crop_box.get("y1", 0)))
+    if crop_width <= 0 or crop_height <= 0:
+        return None
+    return round((crop_width * crop_height) / float(width * height), 4)
+
+
 def _ocr_deep_document_regions(processed_image: Image.Image) -> dict:
     region_images = split_deep_document_ocr_regions(processed_image)
     region_results = [
@@ -452,6 +466,67 @@ def _ocr_deep_document_regions(processed_image: Image.Image) -> dict:
 
     return {
         "strategy": "deep_region_ocr",
+        "text": combined,
+        "text_length": len(combined),
+        "regions": region_results,
+        "regions_attempted": [region["region"] for region in region_results],
+        "confidence_by_region": {
+            region["region"]: region.get("ocr_confidence")
+            for region in region_results
+        },
+        "region_text_by_name": {
+            region["region"]: region.get("text") or ""
+            for region in region_results
+        },
+        "ocr_confidence": _average([region.get("ocr_confidence") for region in region_results]),
+    }
+
+
+def _ocr_full_page_supplier_regions(image: Image.Image) -> dict:
+    """
+    Keep a full-page supplier recovery pass separate from the selected OCR text.
+
+    The main OCR candidate can still prefer a cropped receipt body because it has
+    cleaner totals/line text. This recovery pass preserves header evidence and is
+    only used downstream for supplier identity/contact fields.
+    """
+    image = resize_for_ocr(image)
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return {
+            "strategy": "full_page_supplier_recovery",
+            "text": "",
+            "text_length": 0,
+            "regions": [],
+            "regions_attempted": [],
+            "confidence_by_region": {},
+        }
+
+    def crop(name: str, x1_ratio: float, y1_ratio: float, x2_ratio: float, y2_ratio: float) -> tuple[str, Image.Image]:
+        x1 = max(0, min(width - 1, int(width * x1_ratio)))
+        y1 = max(0, min(height - 1, int(height * y1_ratio)))
+        x2 = max(x1 + 1, min(width, int(width * x2_ratio)))
+        y2 = max(y1 + 1, min(height, int(height * y2_ratio)))
+        return name, image.crop((x1, y1, x2, y2))
+
+    regions = [
+        ("full_page_supplier_recovery", image),
+        crop("upper_65_percent_supplier_recovery", 0.0, 0.0, 1.0, 0.65),
+        crop("center_band_supplier_recovery", 0.10, 0.12, 0.90, 0.82),
+    ]
+
+    region_results = [
+        _ocr_image_region(
+            enhance_for_receipt_ocr(region_image),
+            region_name=region_name,
+            psms=["6", "11", "4"],
+        )
+        for region_name, region_image in regions
+    ]
+    combined = _dedupe_ocr_lines([region.get("text") or "" for region in region_results])
+
+    return {
+        "strategy": "full_page_supplier_recovery",
         "text": combined,
         "text_length": len(combined),
         "regions": region_results,
@@ -586,11 +661,13 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
     receipt_preprocessing = preprocess_receipt_photo(image)
     preview_images = generate_preview_images(image, receipt_preprocessing.processed_image)
     receipt_region_ocr = _ocr_receipt_regions(receipt_preprocessing.processed_image)
+    supplier_recovery_ocr = _ocr_full_page_supplier_regions(image)
     receipt_region_notes = [
         "receipt_regions_ocr_applied",
         f"receipt_region_header_ocr_confidence={receipt_region_ocr.get('confidence_by_region', {}).get('header_top_30_percent')}",
         f"receipt_region_middle_ocr_confidence={receipt_region_ocr.get('confidence_by_region', {}).get('middle_40_percent')}",
         f"receipt_region_bottom_ocr_confidence={receipt_region_ocr.get('confidence_by_region', {}).get('bottom_35_percent')}",
+        f"supplier_recovery_text_length={supplier_recovery_ocr.get('text_length') or 0}",
         "receipt_region_selected_strategy=combined_regions",
     ]
 
@@ -634,7 +711,9 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
         "deskew_applied": receipt_preprocessing.deskew_applied,
         "preprocessing_notes": receipt_preprocessing.preprocessing_notes + receipt_region_notes,
         "crop_box": receipt_preprocessing.crop_box,
+        "crop_area_ratio": _crop_area_ratio(receipt_preprocessing.crop_box, resized_size),
         "receipt_region_ocr": receipt_region_ocr,
+        "supplier_recovery_ocr": supplier_recovery_ocr,
         "original_image_size": {"width": original_size[0], "height": original_size[1]},
         "resized_image_size": {"width": resized_size[0], "height": resized_size[1]},
         "original_image_quality": original_quality.as_dict(),
@@ -700,7 +779,9 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
                 "deskew_applied": receipt_preprocessing.deskew_applied,
                 "preprocessing_notes": receipt_preprocessing.preprocessing_notes + receipt_region_notes,
                 "crop_box": receipt_preprocessing.crop_box,
+                "crop_area_ratio": _crop_area_ratio(receipt_preprocessing.crop_box, resized_size),
                 "receipt_region_ocr": receipt_region_ocr,
+                "supplier_recovery_ocr": supplier_recovery_ocr,
                 "original_image_size": {"width": original_size[0], "height": original_size[1]},
                 "resized_image_size": {"width": resized_size[0], "height": resized_size[1]},
                 "original_image_quality": original_quality.as_dict(),
@@ -730,6 +811,8 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
         "deskew_applied": receipt_preprocessing.deskew_applied,
         "preprocessing_notes": receipt_preprocessing.preprocessing_notes,
         "crop_box": receipt_preprocessing.crop_box,
+        "crop_area_ratio": _crop_area_ratio(receipt_preprocessing.crop_box, resized_size),
+        "supplier_recovery_ocr": supplier_recovery_ocr,
         "original_image_size": {"width": original_size[0], "height": original_size[1]},
         "resized_image_size": {"width": resized_size[0], "height": resized_size[1]},
         "original_image_quality": original_quality.as_dict(),

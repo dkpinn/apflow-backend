@@ -282,6 +282,16 @@ def reapply_supplier_rules_to_invoice(
     if invoice_extracted_id:
         supabase.table("invoices_extracted").update(invoice_patch).eq("id", invoice_extracted_id).execute()
 
+    # Safety guard: if rule processing returned no items but the source had items,
+    # do NOT delete existing line items — a silent wipe is worse than stale data.
+    if not applied.get("line_items") and raw_line_items:
+        return {
+            "skipped": True,
+            "reason": "processing_produced_no_items",
+            "source": source,
+            "needs_reextract": False,
+        }
+
     diagnostics = replace_invoice_line_items(
         supabase,
         invoice_extracted_id=invoice_extracted_id,

@@ -574,12 +574,48 @@ REEXTRACT_FIELD_MAP = {
     "validation_notes": "validation_notes",
 }
 
+SUPPLIER_RECOVERY_FIELDS = [
+    "supplier_name_extracted",
+    "supplier_del_address_extracted",
+    "supplier_pos_address_extracted",
+    "supplier_email_extracted",
+    "supplier_acc_email_extracted",
+    "supplier_telephone_extracted",
+    "supplier_fax_extracted",
+    "supplier_cell_extracted",
+    "supplier_website_extracted",
+    "vat_number_extracted",
+    "cus_code_extracted",
+    "company_registration_number_extracted",
+]
+
+SUPPLIER_RECOVERY_SUPPORT_FIELDS = {
+    "supplier_del_address_extracted",
+    "supplier_pos_address_extracted",
+    "supplier_email_extracted",
+    "supplier_acc_email_extracted",
+    "supplier_telephone_extracted",
+    "supplier_fax_extracted",
+    "supplier_cell_extracted",
+    "supplier_website_extracted",
+    "vat_number_extracted",
+    "company_registration_number_extracted",
+}
+
+MISSING_SUPPLIER_VALIDATION_STATUS = "failed_missing_supplier"
+MISSING_SUPPLIER_NOTE = (
+    "No supplier name could be obtained from the document after OCR, supplier recovery, "
+    "VLM fallback, and issuer detection. Manual supplier editing is required."
+)
+
 
 def _has_value(value) -> bool:
     if value is None:
         return False
     if isinstance(value, str):
         return bool(value.strip())
+    if isinstance(value, (int, float)):
+        return value != 0  # treat 0 the same as null — a zeroed numeric field has no useful data
     return True
 
 
@@ -647,6 +683,86 @@ def _valid_reextract_value(field_name: str, value) -> bool:
     return True
 
 
+
+# Status/classification fields whose latest extraction value should always win —
+def _append_validation_note(existing: Optional[str], note: str) -> str:
+    if not existing:
+        return note
+    if note in existing:
+        return existing
+    return f"{existing} {note}"
+
+
+def merge_supplier_recovery_fields(parsed_data: dict, text_result: dict) -> dict:
+    """
+    Fill missing supplier identity/contact fields from full-page OCR only.
+
+    This intentionally never updates amounts, dates, invoice numbers or line
+    items, so supplier recovery cannot change accounting calculations.
+    """
+    pages = text_result.get("pages") or []
+    recovery_texts = [
+        ((page.get("supplier_recovery_ocr") or {}).get("text") or "")
+        for page in pages
+    ]
+    recovery_text = "\n\n".join(text for text in recovery_texts if text.strip()).strip()
+    if not recovery_text:
+        return {"applied": False, "fields": [], "text_length": 0}
+
+    recovery_parsed = parse_invoice_fields(recovery_text)
+    has_supporting_supplier_evidence = any(
+        _has_value(recovery_parsed.get(field))
+        for field in SUPPLIER_RECOVERY_SUPPORT_FIELDS
+    )
+
+    applied_fields: list[str] = []
+    for field in SUPPLIER_RECOVERY_FIELDS:
+        if _has_value(parsed_data.get(field)):
+            continue
+
+        value = recovery_parsed.get(field)
+        if not _valid_reextract_value(field, value):
+            continue
+
+        if field == "supplier_name_extracted" and not has_supporting_supplier_evidence:
+            continue
+
+        parsed_data[field] = value
+        applied_fields.append(field)
+
+    if applied_fields:
+        parsed_data["validation_notes"] = _append_validation_note(
+            parsed_data.get("validation_notes"),
+            "Supplier identity/contact fields were recovered from a full-page OCR pass.",
+        )
+
+    return {
+        "applied": bool(applied_fields),
+        "fields": applied_fields,
+        "text_length": len(recovery_text),
+        "supplier_candidate": recovery_parsed.get("supplier_name_extracted"),
+        "supporting_supplier_evidence": has_supporting_supplier_evidence,
+    }
+
+
+def apply_missing_supplier_failure(parsed_data: dict) -> bool:
+    if _has_value(parsed_data.get("supplier_name_extracted")):
+        return False
+
+    parsed_data["validation_status"] = MISSING_SUPPLIER_VALIDATION_STATUS
+    parsed_data["validation_notes"] = _append_validation_note(
+        parsed_data.get("validation_notes"),
+        MISSING_SUPPLIER_NOTE,
+    )
+    parsed_data["confidence_score"] = min(float(parsed_data.get("confidence_score") or 0), 0.45)
+    return True
+
+
+# Status/classification fields whose latest extraction value should always win.
+# The "has old value" guard does not apply to these.
+_ALWAYS_UPDATE_FIELDS = {"validation_status", "document_direction", "organisation_match_status"}
+
+
 def build_reextract_update(
     *,
     existing: dict,
@@ -678,6 +794,7 @@ def build_reextract_update(
 
         should_update = (
             force_update
+            or target_field in _ALWAYS_UPDATE_FIELDS
             or not _has_value(old_value)
             or _looks_suspicious_value(target_field, old_value)
             or confidence_materially_improved
@@ -766,6 +883,8 @@ def store_basic_document_page_snapshot(
                     "processed_preview_path": page.get("processed_preview_path"),
                     "preprocessing_notes": _preprocessing_notes_text(page.get("preprocessing_notes")),
                     "crop_applied": bool(page.get("crop_applied")),
+                    "crop_box": page.get("crop_box"),
+                    "crop_area_ratio": page.get("crop_area_ratio"),
                     "deskew_applied": bool(page.get("deskew_applied")),
                 })
 
@@ -800,6 +919,8 @@ def store_basic_document_page_snapshot(
                 "processed_preview_path": text_result.get("processed_preview_path"),
                 "preprocessing_notes": _preprocessing_notes_text(text_result.get("preprocessing_notes")),
                 "crop_applied": bool(text_result.get("crop_applied")),
+                "crop_box": text_result.get("crop_box"),
+                "crop_area_ratio": text_result.get("crop_area_ratio"),
                 "deskew_applied": bool(text_result.get("deskew_applied")),
             })
 
@@ -931,6 +1052,8 @@ def run_invoice_extraction(
                     "crop_applied": first_page.get("crop_applied"),
                     "deskew_applied": first_page.get("deskew_applied"),
                     "preprocessing_notes": first_page.get("preprocessing_notes") or [],
+                    "crop_box": first_page.get("crop_box"),
+                    "crop_area_ratio": first_page.get("crop_area_ratio"),
                     "original_preview_path": first_page.get("original_preview_path"),
                     "processed_preview_path": first_page.get("processed_preview_path"),
                     "image_quality_score": first_page.get("image_quality_score"),
@@ -1021,6 +1144,43 @@ def run_invoice_extraction(
                     },
                     notes=f"Gemini VLM fallback merged. VLM confidence={vlm_confidence:.2f}, Tesseract confidence={tesseract_confidence:.2f}.",
                 )
+            else:
+                # VLM was needed but returned None — API key missing, rate-limited, or an error
+                # was silently swallowed inside extract_with_gemini. Log so it shows in the Audit
+                # trail and operators can distinguish "VLM ran, found nothing" from "VLM never ran".
+                log_invoice_event(
+                    supabase,
+                    organisation_id=org_id,
+                    invoice_raw_id=invoice_raw_id,
+                    job_id=job_id,
+                    event_type="vlm_skipped",
+                    stage="field_extraction",
+                    actor_type="worker" if job_id else "api",
+                    new_value={
+                        "tesseract_confidence": parsed_data.get("confidence_score", 0),
+                        "missing_supplier": not bool(parsed_data.get("supplier_name_extracted")),
+                        "missing_invoice_number": not bool(parsed_data.get("invoice_number")),
+                        "missing_total": not bool(parsed_data.get("total_amount")),
+                    },
+                    notes="VLM fallback was needed (low confidence or missing fields) but extract_with_gemini returned None. Check GOOGLE_API_KEY and Gemini availability.",
+                )
+
+        supplier_recovery_result = {"applied": False, "fields": []}
+        if not parsed_data.get("supplier_name_extracted"):
+            supplier_recovery_result = merge_supplier_recovery_fields(parsed_data, text_result)
+            if supplier_recovery_result.get("applied"):
+                parsed_data["confidence_score"] = calculate_confidence(parsed_data)
+                log_invoice_event(
+                    supabase,
+                    organisation_id=org_id,
+                    invoice_raw_id=invoice_raw_id,
+                    job_id=job_id,
+                    event_type="supplier_recovery_ocr_applied",
+                    stage="field_extraction",
+                    actor_type="worker" if job_id else "api",
+                    new_value=supplier_recovery_result,
+                    notes="Missing supplier fields were recovered from full-page OCR without changing totals or line items.",
+                )
 
         organisation = get_organisation(org_id)
         direction_result = classify_document_direction(text, organisation)
@@ -1084,6 +1244,8 @@ def run_invoice_extraction(
                 2,
             )
 
+        missing_supplier_failure = apply_missing_supplier_failure(parsed_data)
+
         log_invoice_event(
             supabase,
             organisation_id=org_id,
@@ -1123,6 +1285,22 @@ def run_invoice_extraction(
                 notes=supplier_correction_reason,
             )
 
+        if missing_supplier_failure:
+            log_invoice_event(
+                supabase,
+                organisation_id=org_id,
+                invoice_raw_id=invoice_raw_id,
+                job_id=job_id,
+                event_type="supplier_missing_failed",
+                stage="entity_validation",
+                actor_type="worker" if job_id else "api",
+                new_value={
+                    "validation_status": parsed_data.get("validation_status"),
+                    "supplier_recovery": supplier_recovery_result,
+                },
+                notes=MISSING_SUPPLIER_NOTE,
+            )
+
         ocr_quality_needs_review = False
         if text_result.get("ocr_used"):
             ocr_confidence = text_result.get("ocr_confidence")
@@ -1141,7 +1319,8 @@ def run_invoice_extraction(
                     "OCR/image quality is low. Manual review is required. "
                     f"OCR confidence={ocr_confidence}; image quality={image_quality_score}; notes={quality_notes}."
                 )
-                parsed_data["validation_status"] = "needs_review"
+                if parsed_data.get("validation_status") != MISSING_SUPPLIER_VALIDATION_STATUS:
+                    parsed_data["validation_status"] = "needs_review"
                 parsed_data["validation_notes"] = (
                     (parsed_data.get("validation_notes") + " " if parsed_data.get("validation_notes") else "")
                     + quality_note
@@ -1718,6 +1897,20 @@ def run_invoice_re_extraction(
             and not parsed_data.get("supplier_name_extracted")
         ):
             parsed_data["supplier_name_extracted"] = direction_result.issuer_name
+
+        missing_supplier_failure = apply_missing_supplier_failure(parsed_data)
+        if missing_supplier_failure:
+            log_invoice_event(
+                supabase,
+                organisation_id=org_id,
+                invoice_raw_id=payload.invoice_raw_id,
+                invoice_extracted_id=extracted_invoice_id,
+                event_type="supplier_missing_failed",
+                stage="entity_validation",
+                actor_type="api",
+                new_value={"validation_status": parsed_data.get("validation_status")},
+                notes=MISSING_SUPPLIER_NOTE,
+            )
 
         if deep_attempt:
             deep_attempt["parsed_data"] = dict(parsed_data)
@@ -2483,7 +2676,51 @@ def reapply_supplier_rules_endpoint(req: ReapplyRulesRequest):
         actor_type="user",
         event_reason="Manual re-apply of supplier rules via UI.",
     )
+
+    # Recompute and persist subtotal / tax / total from the fresh line items
+    if not rules_applied.get("skipped"):
+        _recompute_invoice_totals(supabase, req.invoice_extracted_id, invoice)
+
     return {"success": True, "rules_applied": rules_applied}
+
+
+def _recompute_invoice_totals(supabase_client, invoice_extracted_id: str, invoice: dict) -> None:
+    """After line items are replaced, recompute subtotal and tax_amount on invoices_extracted.
+
+    NOTE: total_amount is intentionally NOT updated here — it holds the value extracted
+    from the source document (OCR/VLM) and must not be overwritten by a line-items
+    recalculation (doing so would corrupt the 'Invoice total (from document)' display
+    and break the reconciliation green/red dot logic).
+    """
+    try:
+        rows = (
+            supabase_client.table("invoice_line_items")
+            .select("line_total")
+            .eq("invoice_extracted_id", invoice_extracted_id)
+            .execute()
+        ).data or []
+
+        subtotal = round(sum(float(r.get("line_total") or 0) for r in rows), 2)
+
+        # Determine VAT rate from the linked supplier (already joined in the invoice dict)
+        supplier = invoice.get("supplier") or {}
+        vat_rate = 0.0
+        if supplier.get("vat_number"):
+            raw_rate = supplier.get("default_vat_rate")
+            vat_rate = float(raw_rate) / 100 if raw_rate else 0.15
+
+        tax_amount = round(subtotal * vat_rate, 2)
+
+        supabase_client.table("invoices_extracted").update({
+            "subtotal": subtotal,
+            "tax_amount": tax_amount,
+            # total_amount deliberately omitted — preserve the document-extracted value
+        }).eq("id", invoice_extracted_id).execute()
+
+        print(f"REAPPLY: recomputed totals for {invoice_extracted_id}: "
+              f"subtotal={subtotal}, tax={tax_amount}")
+    except Exception as exc:
+        print(f"REAPPLY: failed to recompute totals for {invoice_extracted_id}: {exc}")
 
 
 class MergeInvoicesPayload(BaseModel):

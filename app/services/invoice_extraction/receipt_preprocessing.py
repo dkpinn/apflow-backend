@@ -49,6 +49,12 @@ class ReceiptOcrRegion:
     image: Image.Image
 
 
+@dataclass
+class ReceiptCropDetection:
+    box: Optional[tuple[int, int, int, int]]
+    notes: list[str]
+
+
 def _scale_for_limits(width: float, height: float, *, max_width: int, max_height: int, max_pixels: int) -> float:
     if width <= 0 or height <= 0:
         return 1.0
@@ -171,7 +177,7 @@ def _scale_crop_box(
     return x1, y1, x2, y2
 
 
-def find_document_or_receipt_crop(image: Image.Image) -> Optional[tuple[int, int, int, int]]:
+def _find_document_or_receipt_crop(image: Image.Image) -> ReceiptCropDetection:
     """
     Find a likely document/receipt bounding box in a photographed page.
 
@@ -179,6 +185,7 @@ def find_document_or_receipt_crop(image: Image.Image) -> Optional[tuple[int, int
     when the detector is not confident. The caller should fall back to the full
     resized image when None is returned.
     """
+    notes: list[str] = []
     image = resize_for_ocr(image)
     width, height = image.size
 
@@ -207,7 +214,8 @@ def find_document_or_receipt_crop(image: Image.Image) -> Optional[tuple[int, int
         block_size,
         11,
     )
-    thresholded = cv2.morphologyEx(thresholded, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8), iterations=2)
+    thresholded = cv2.morphologyEx(thresholded, cv2.MORPH_CLOSE, np.ones((25, 9), np.uint8), iterations=2)
+    thresholded = cv2.dilate(thresholded, np.ones((5, 5), np.uint8), iterations=1)
     text_contours, _ = cv2.findContours(thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours.extend(text_contours)
 
@@ -215,9 +223,11 @@ def find_document_or_receipt_crop(image: Image.Image) -> Optional[tuple[int, int
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
         area_ratio = (w * h) / analysis_area
-        if area_ratio < 0.05 or area_ratio > 0.96:
+        if area_ratio < 0.00015 or area_ratio > 0.92:
             continue
-        if w < analysis_width * 0.18 or h < analysis_height * 0.18:
+        if w < analysis_width * 0.025 and h < analysis_height * 0.01:
+            continue
+        if area_ratio < 0.001 and (w < analysis_width * 0.06 or h < analysis_height * 0.008):
             continue
 
         aspect = h / max(w, 1)
@@ -225,12 +235,35 @@ def find_document_or_receipt_crop(image: Image.Image) -> Optional[tuple[int, int
         candidates.append((x, y, w, h, area_ratio * aspect_bonus))
 
     if not candidates:
-        return None
+        notes.append("receipt_crop_no_candidate_contours")
+        return ReceiptCropDetection(None, notes)
 
-    x, y, w, h, _ = max(candidates, key=lambda candidate: candidate[4])
-    padding = max(16, int(min(width, height) * 0.025))
+    seed = max(candidates, key=lambda candidate: candidate[4])
+    sx, _sy, sw, _sh, _score = seed
+    expanded_seed_x1 = sx - int(analysis_width * 0.22)
+    expanded_seed_x2 = sx + sw + int(analysis_width * 0.22)
+
+    clustered: list[tuple[int, int, int, int, float]] = []
+    for candidate in candidates:
+        x, y, w, h, score = candidate
+        cx = x + (w / 2)
+        overlap = max(0, min(x + w, sx + sw) - max(x, sx))
+        overlap_ratio = overlap / max(1, min(w, sw))
+        if expanded_seed_x1 <= cx <= expanded_seed_x2 or overlap_ratio >= 0.15:
+            clustered.append(candidate)
+
+    if not clustered:
+        clustered = [seed]
+
+    x1a = min(candidate[0] for candidate in clustered)
+    y1a = min(candidate[1] for candidate in clustered)
+    x2a = max(candidate[0] + candidate[2] for candidate in clustered)
+    y2a = max(candidate[1] + candidate[3] for candidate in clustered)
+    notes.append(f"receipt_crop_union_candidates={len(clustered)}")
+
+    padding = max(24, int(min(width, height) * 0.045))
     x1, y1, x2, y2 = _scale_crop_box(
-        (x, y, w, h),
+        (x1a, y1a, x2a - x1a, y2a - y1a),
         scale_x=scale_x,
         scale_y=scale_y,
         image_width=width,
@@ -238,22 +271,40 @@ def find_document_or_receipt_crop(image: Image.Image) -> Optional[tuple[int, int
         padding=padding,
     )
 
+    if y1 > height * 0.18:
+        original_y1 = y1
+        crop_height = y2 - y1
+        y1 = max(0, y1 - max(int(height * 0.14), int(crop_height * 0.35)))
+        notes.append(f"receipt_crop_expanded_upward_from_y={original_y1}_to_y={y1}")
+
+    if y1 > height * 0.28:
+        notes.append("receipt_crop_rejected_starts_too_low_using_full_image")
+        return ReceiptCropDetection(None, notes)
+
     crop_width = x2 - x1
     crop_height = y2 - y1
     if crop_width <= 0 or crop_height <= 0:
-        return None
+        notes.append("receipt_crop_rejected_invalid_dimensions")
+        return ReceiptCropDetection(None, notes)
 
     crop_area_ratio = (crop_width * crop_height) / float(width * height)
-    if crop_area_ratio > 0.94 or crop_area_ratio < 0.04:
-        return None
+    notes.append(f"receipt_crop_area_ratio={crop_area_ratio:.4f}")
+    if crop_area_ratio > 0.94 or crop_area_ratio < 0.035:
+        notes.append("receipt_crop_rejected_area_ratio_using_full_image")
+        return ReceiptCropDetection(None, notes)
 
-    return x1, y1, x2, y2
+    return ReceiptCropDetection((x1, y1, x2, y2), notes)
+
+
+def find_document_or_receipt_crop(image: Image.Image) -> Optional[tuple[int, int, int, int]]:
+    return _find_document_or_receipt_crop(image).box
 
 
 def crop_receipt_region(image: Image.Image) -> tuple[Image.Image, bool, Optional[dict[str, int]], list[str]]:
     resized = resize_for_ocr(image)
-    notes: list[str] = []
-    crop_box = find_document_or_receipt_crop(resized)
+    crop_detection = _find_document_or_receipt_crop(resized)
+    notes = crop_detection.notes
+    crop_box = crop_detection.box
 
     if not crop_box:
         notes.append("receipt_crop_not_detected_using_full_image")
