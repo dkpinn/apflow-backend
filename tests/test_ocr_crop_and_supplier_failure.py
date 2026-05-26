@@ -1,6 +1,6 @@
 from PIL import Image, ImageDraw
 
-from app.routers.invoices import (
+from app.services.invoice_data_builders import (
     MISSING_SUPPLIER_VALIDATION_STATUS,
     apply_missing_supplier_failure,
     merge_supplier_recovery_fields,
