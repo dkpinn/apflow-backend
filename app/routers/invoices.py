@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import io as _io
+import re
 from typing import Optional
 
 import fitz  # PyMuPDF
@@ -8,6 +9,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from app.routers.organisations import ExtractionStrategy
 from app.db.supabase_client import get_supabase_client
 from app.services.audit_log import log_invoice_event
 from app.services.invoice_supplier_rules import reapply_supplier_rules_to_invoice
@@ -47,6 +49,10 @@ class ExtractInvoiceRequest(BaseModel):
     invoice_raw_id: str
     organisation_id: Optional[str] = None
     batch_id: Optional[str] = None
+    extraction_strategy: Optional[ExtractionStrategy] = Field(
+        default=None,
+        description="Optional override extraction strategy for this upload.",
+    )
     process_mode: str = Field(
         default="queued",
         description="Default extraction requests are queued. Use the sync=true query flag for legacy synchronous extraction.",
@@ -57,6 +63,7 @@ class QueueInvoiceRequest(BaseModel):
     invoice_raw_id: str
     organisation_id: Optional[str] = None
     batch_id: Optional[str] = None
+    extraction_strategy: Optional[ExtractionStrategy] = None
     priority: int = 100
 
 
@@ -102,12 +109,14 @@ def extract_invoice(
         return run_invoice_extraction(
             invoice_raw_id=payload.invoice_raw_id,
             organisation_id=payload.organisation_id,
+            extraction_strategy=payload.extraction_strategy,
         )
 
     job = queue_invoice_job(
         invoice_raw_id=payload.invoice_raw_id,
         organisation_id=payload.organisation_id,
         batch_id=payload.batch_id,
+        extraction_strategy=payload.extraction_strategy,
     )
     background_tasks.add_task(run_extract_worker_until_empty)
     return {
@@ -197,6 +206,7 @@ def queue_invoice(payload: QueueInvoiceRequest):
         invoice_raw_id=payload.invoice_raw_id,
         organisation_id=payload.organisation_id,
         batch_id=payload.batch_id,
+        extraction_strategy=payload.extraction_strategy,
         priority=payload.priority,
     )
     return {
@@ -936,12 +946,12 @@ def process_page_groups(payload: ProcessPageGroupsPayload, background_tasks: Bac
         .select("id, file_path, file_name, file_type")
         .eq("id", payload.invoice_raw_id)
         .eq("organisation_id", payload.organisation_id)
-        .single()
+        .limit(1)
         .execute()
     )
-    row = row_result.data
-    if not row:
+    if not row_result.data:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    row = row_result.data[0]
 
     # Step 2 — download and open original PDF
     file_bytes = supabase.storage.from_("invoices").download(row["file_path"])
@@ -1008,7 +1018,13 @@ def process_page_groups(payload: ProcessPageGroupsPayload, background_tasks: Bac
 
     doc.close()
 
-    # Step 4 — delete original record (same cascade as split/merge)
+    # Step 4 — queue extraction for all new records (before deleting original,
+    # so a queue failure leaves the original intact and the user can retry)
+    for new_id in new_raw_ids:
+        queue_invoice_job(invoice_raw_id=new_id, organisation_id=payload.organisation_id)
+    background_tasks.add_task(run_extract_worker_until_empty)
+
+    # Step 5 — delete original record now that all new records are safely queued
     extracted_rows = (
         supabase.from_("invoices_extracted")
         .select("id")
@@ -1035,11 +1051,6 @@ def process_page_groups(payload: ProcessPageGroupsPayload, background_tasks: Bac
         pass
 
     supabase.from_("invoices_raw").delete().eq("id", payload.invoice_raw_id).execute()
-
-    # Step 5 — queue extraction for all new records
-    for new_id in new_raw_ids:
-        queue_invoice_job(invoice_raw_id=new_id, organisation_id=payload.organisation_id)
-    background_tasks.add_task(run_extract_worker_until_empty)
 
     return {"success": True, "group_count": len(new_raw_ids), "new_raw_ids": new_raw_ids}
 

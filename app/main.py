@@ -8,27 +8,35 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routers.reconciliation import router as reconciliation_router
 from app.db.supabase_client import get_supabase_client
 from app.routers import invoices
+from app.routers import organisations
 from app.routers import suppliers
 from app.routers import themes
 from app.routers import consolidation
 
 
-def _rescue_pending_invoices() -> None:
+def _sweep_log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"[{ts} SWEEP] {msg}")
+
+
+def _rescue_pending_invoices(supabase_client) -> None:
     """
     Startup + periodic sweep:
     1.  Reset invoices stuck in 'processing' for > 10 min back to 'pending'
     1b. Reset 'completed' invoices that have no extracted record back to 'pending'
     2.  Queue any 'pending' invoices that have no active processing job
-    3.  Run the extraction worker to drain the queue
+    3.  Drain the extraction queue per-org (sequential, lock-guarded inside worker)
     """
     from app.services.document_jobs import create_processing_job, safe_update_invoice_raw_status
     from app.services.audit_log import log_invoice_event
 
-    try:
-        supabase_client = get_supabase_client()
-    except Exception as exc:
-        print(f"SWEEP: Cannot connect to Supabase: {exc}")
-        return
+    sweep_start = datetime.now(timezone.utc)
+    _sweep_log("=== Sweep start ===")
+
+    stale_reset    = 0
+    orphans_reset  = 0
+    orphans_failed = 0
+    newly_queued   = 0
 
     # Step 1 — reset stale 'processing' items (stuck > 10 min) back to 'pending'
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
@@ -41,10 +49,11 @@ def _rescue_pending_invoices() -> None:
             .execute()
         ).data or []
         for row in stale:
-            print(f"SWEEP: Resetting stale invoice {row['id']} (processing → pending)")
+            _sweep_log(f"Resetting stale invoice {row['id']} (processing → pending)")
             safe_update_invoice_raw_status(supabase_client, invoice_raw_id=row["id"], parse_status="pending")
+            stale_reset += 1
     except Exception as exc:
-        print(f"SWEEP: Error resetting stale processing items: {exc}")
+        _sweep_log(f"Error resetting stale processing items: {exc}")
 
     # Step 1b — detect 'completed' raw invoices with no extracted record and reset to 'pending'
     try:
@@ -86,7 +95,7 @@ def _rescue_pending_invoices() -> None:
                     past_jobs = 0
 
                 if past_jobs >= MAX_SWEEP_ATTEMPTS:
-                    print(f"SWEEP: Giving up on orphaned invoice {raw_id} after {past_jobs} attempts → marking failed")
+                    _sweep_log(f"Giving up on orphaned invoice {raw_id} after {past_jobs} attempts → marking failed")
                     safe_update_invoice_raw_status(
                         supabase_client,
                         invoice_raw_id=raw_id,
@@ -103,9 +112,10 @@ def _rescue_pending_invoices() -> None:
                             actor_type="system",
                             notes=f"Marked failed by SWEEP after {past_jobs} extraction attempts with no extracted record.",
                         )
+                    orphans_failed += 1
                     continue
 
-                print(f"SWEEP: Orphaned invoice {raw_id} (completed but no extracted record, attempt {past_jobs + 1}/{MAX_SWEEP_ATTEMPTS}) → resetting to pending")
+                _sweep_log(f"Orphaned invoice {raw_id} (completed, no extracted record, attempt {past_jobs + 1}/{MAX_SWEEP_ATTEMPTS}) → resetting to pending")
                 safe_update_invoice_raw_status(
                     supabase_client,
                     invoice_raw_id=raw_id,
@@ -122,10 +132,14 @@ def _rescue_pending_invoices() -> None:
                         actor_type="system",
                         notes=f"Reset to pending by SWEEP (attempt {past_jobs + 1}/{MAX_SWEEP_ATTEMPTS}): completed status but no extracted record found.",
                     )
+                orphans_reset += 1
     except Exception as exc:
-        print(f"SWEEP: Error checking for orphaned completed invoices: {exc}")
+        _sweep_log(f"Error checking for orphaned completed invoices: {exc}")
 
-    # Step 2 — find 'pending' items with no active job and queue them
+    # Step 2 — find 'pending' items with no active job and queue them.
+    # Collect orgs_to_drain here; do NOT return early — step 3 must always run.
+    orgs_to_drain: set[str] = set()
+
     try:
         pending_rows = (
             supabase_client.table("invoices_raw")
@@ -134,82 +148,122 @@ def _rescue_pending_invoices() -> None:
             .execute()
         ).data or []
 
-        if not pending_rows:
-            return
+        if pending_rows:
+            pending_ids = [r["id"] for r in pending_rows]
 
-        pending_ids = [r["id"] for r in pending_rows]
+            # Collect orgs now, before we filter to_queue
+            for r in pending_rows:
+                if r.get("organisation_id"):
+                    orgs_to_drain.add(r["organisation_id"])
 
-        # Two separate .eq() calls to avoid enum cast issues with .in_() on status column
-        queued_jobs = (
-            supabase_client.table("document_processing_jobs")
-            .select("invoice_raw_id")
-            .in_("invoice_raw_id", pending_ids)
-            .eq("status", "queued")
-            .execute()
-        ).data or []
-        processing_jobs = (
-            supabase_client.table("document_processing_jobs")
-            .select("invoice_raw_id")
-            .in_("invoice_raw_id", pending_ids)
-            .eq("status", "processing")
-            .execute()
-        ).data or []
-        already_active = {j["invoice_raw_id"] for j in queued_jobs + processing_jobs}
+            # Two separate .eq() calls to avoid enum cast issues with .in_() on status column
+            queued_jobs = (
+                supabase_client.table("document_processing_jobs")
+                .select("invoice_raw_id")
+                .in_("invoice_raw_id", pending_ids)
+                .eq("status", "queued")
+                .execute()
+            ).data or []
+            processing_jobs = (
+                supabase_client.table("document_processing_jobs")
+                .select("invoice_raw_id")
+                .in_("invoice_raw_id", pending_ids)
+                .eq("status", "processing")
+                .execute()
+            ).data or []
+            already_active = {j["invoice_raw_id"] for j in queued_jobs + processing_jobs}
 
-        to_queue = [r for r in pending_rows if r["id"] not in already_active]
-        if not to_queue:
-            return
-
-        for row in to_queue:
-            raw_id = row["id"]
-            org_id = row.get("organisation_id")
-            if not org_id:
-                continue
-            try:
-                job = create_processing_job(
-                    supabase_client,
-                    organisation_id=org_id,
-                    invoice_raw_id=raw_id,
-                )
-                safe_update_invoice_raw_status(
-                    supabase_client,
-                    invoice_raw_id=raw_id,
-                    parse_status="queued",
-                    extra={"parse_started_at": None, "parse_completed_at": None},
-                )
-                log_invoice_event(
-                    supabase_client,
-                    organisation_id=org_id,
-                    invoice_raw_id=raw_id,
-                    job_id=job["id"],
-                    event_type="queued_for_processing",
-                    stage="queued",
-                    actor_type="system",
-                    notes="Queued by startup/periodic sweep.",
-                )
-                print(f"SWEEP: Queued invoice {raw_id}")
-            except Exception as exc:
-                print(f"SWEEP: Failed to queue {raw_id}: {exc}")
+            to_queue = [r for r in pending_rows if r["id"] not in already_active]
+            for row in to_queue:
+                raw_id = row["id"]
+                org_id = row.get("organisation_id")
+                if not org_id:
+                    continue
+                try:
+                    job = create_processing_job(
+                        supabase_client,
+                        organisation_id=org_id,
+                        invoice_raw_id=raw_id,
+                    )
+                    safe_update_invoice_raw_status(
+                        supabase_client,
+                        invoice_raw_id=raw_id,
+                        parse_status="queued",
+                        extra={"parse_started_at": None, "parse_completed_at": None},
+                    )
+                    log_invoice_event(
+                        supabase_client,
+                        organisation_id=org_id,
+                        invoice_raw_id=raw_id,
+                        job_id=job["id"],
+                        event_type="queued_for_processing",
+                        stage="queued",
+                        actor_type="system",
+                        notes="Queued by startup/periodic sweep.",
+                    )
+                    _sweep_log(f"Queued invoice {raw_id}")
+                    newly_queued += 1
+                except Exception as exc:
+                    _sweep_log(f"Failed to queue {raw_id}: {exc}")
 
     except Exception as exc:
-        print(f"SWEEP: Error finding pending items: {exc}")
-        return
+        _sweep_log(f"Error finding pending items: {exc}")
+        # orgs_to_drain may be partial; fall through to step 3 anyway
 
-    # Step 3 — drain the extraction queue
+    # Step 3 — augment orgs_to_drain with any org that already has queued jobs
+    # (covers the case where pending_rows was empty but leftover jobs exist from
+    # a prior sweep cycle or an API-triggered queue call)
     try:
-        invoices.run_extract_worker_until_empty()
+        pre_queued = (
+            supabase_client.table("document_processing_jobs")
+            .select("organisation_id")
+            .eq("status", "queued")
+            .limit(500)
+            .execute()
+        ).data or []
+        for row in pre_queued:
+            if row.get("organisation_id"):
+                orgs_to_drain.add(row["organisation_id"])
     except Exception as exc:
-        print(f"SWEEP: Worker error: {exc}")
+        _sweep_log(f"Error fetching pre-queued orgs: {exc}")
+
+    # Step 3 — drain per-org (sequential; EXTRACT_WORKER_LOCK guards inside)
+    for org_id in orgs_to_drain:
+        try:
+            invoices.run_extract_worker_until_empty(organisation_id=org_id)
+        except Exception as exc:
+            _sweep_log(f"Worker error for org {org_id}: {exc}")
+
+    elapsed = (datetime.now(timezone.utc) - sweep_start).total_seconds()
+    _sweep_log(
+        f"Done in {elapsed:.2f}s — "
+        f"stale={stale_reset} orphans_reset={orphans_reset} "
+        f"orphans_failed={orphans_failed} queued={newly_queued} "
+        f"drain_orgs={len(orgs_to_drain)}"
+    )
 
 
 def _background_sweep_thread() -> None:
     """Daemon thread: 5s startup delay then sweep every 60s."""
     time.sleep(5)
+
+    supabase_client = None
     while True:
+        if supabase_client is None:
+            try:
+                supabase_client = get_supabase_client()
+            except Exception as exc:
+                _sweep_log(f"Cannot connect to Supabase, will retry next cycle: {exc}")
+                time.sleep(60)
+                continue
+
         try:
-            _rescue_pending_invoices()
+            _rescue_pending_invoices(supabase_client)
         except Exception as exc:
-            print(f"SWEEP THREAD ERROR: {exc}")
+            _sweep_log(f"THREAD ERROR: {exc}")
+            # Reset client so the next cycle gets a fresh connection
+            supabase_client = None
+
         time.sleep(60)
 
 
@@ -250,6 +304,7 @@ app.add_middleware(
 
 app.include_router(reconciliation_router)
 app.include_router(invoices.router)
+app.include_router(organisations.router)
 app.include_router(suppliers.router)
 app.include_router(themes.router)
 app.include_router(consolidation.router)

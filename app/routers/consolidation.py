@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from app.db.supabase_client import get_supabase_client
+from app.dependencies import authenticated_user
 from app.services.consolidation import (
     ConsolidationAccessError,
     ConsolidationValidationError,
@@ -22,10 +22,8 @@ from app.services.consolidation import (
 )
 
 router = APIRouter(prefix="/api/consolidation", tags=["consolidation"])
-try:
-    supabase = get_supabase_client()
-except Exception:
-    supabase = None
+
+UserAuth = Annotated[tuple, Depends(authenticated_user)]
 
 
 class ReportingGroupRequest(BaseModel):
@@ -89,34 +87,6 @@ class AdjustmentRequest(BaseModel):
     lines: list[AdjustmentLineRequest]
 
 
-def _db():
-    if supabase is None:
-        raise HTTPException(status_code=500, detail="Supabase credentials missing")
-    return supabase
-
-
-def _current_user_id(supabase_client, authorization: Optional[str]) -> str:
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-
-    token = authorization.split(" ", 1)[1].strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-
-    try:
-        response = supabase_client.auth.get_user(token)
-    except Exception as exc:
-        raise HTTPException(status_code=401, detail="Invalid bearer token") from exc
-
-    user = response.get("user") if isinstance(response, dict) else getattr(response, "user", None)
-    user_id = getattr(user, "id", None)
-    if user_id is None and isinstance(user, dict):
-        user_id = user.get("id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid bearer token")
-    return str(user_id)
-
-
 def _handle_error(exc: Exception) -> None:
     if isinstance(exc, ConsolidationAccessError):
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -126,19 +96,17 @@ def _handle_error(exc: Exception) -> None:
 
 
 @router.get("/groups")
-def get_reporting_groups(authorization: Optional[str] = Header(default=None, alias="Authorization")) -> dict:
-    db = _db()
-    user_id = _current_user_id(db, authorization)
+def get_reporting_groups(auth: UserAuth) -> dict:
+    user_id, db = auth
     return {"reporting_groups": list_reporting_groups(db, user_id=user_id)}
 
 
 @router.post("/groups")
 def create_group(
     payload: ReportingGroupRequest,
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    auth: UserAuth,
 ) -> dict:
-    db = _db()
-    user_id = _current_user_id(db, authorization)
+    user_id, db = auth
     try:
         return create_reporting_group(db, user_id=user_id, payload=payload.model_dump())
     except Exception as exc:
@@ -148,10 +116,9 @@ def create_group(
 @router.get("/groups/{reporting_group_id}/entities")
 def get_group_entities(
     reporting_group_id: str,
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    auth: UserAuth,
 ) -> dict:
-    db = _db()
-    user_id = _current_user_id(db, authorization)
+    user_id, db = auth
     try:
         require_group_read(db, user_id=user_id, reporting_group_id=reporting_group_id)
         rows = (
@@ -169,10 +136,9 @@ def get_group_entities(
 def add_group_entity(
     reporting_group_id: str,
     payload: ReportingGroupEntityRequest,
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    auth: UserAuth,
 ) -> dict:
-    db = _db()
-    user_id = _current_user_id(db, authorization)
+    user_id, db = auth
     try:
         return create_group_entity(
             db,
@@ -188,10 +154,9 @@ def add_group_entity(
 def add_period(
     reporting_group_id: str,
     payload: ConsolidationPeriodRequest,
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    auth: UserAuth,
 ) -> dict:
-    db = _db()
-    user_id = _current_user_id(db, authorization)
+    user_id, db = auth
     try:
         return create_period(db, user_id=user_id, reporting_group_id=reporting_group_id, payload=payload.model_dump())
     except Exception as exc:
@@ -202,10 +167,9 @@ def add_period(
 def add_account_mapping(
     reporting_group_id: str,
     payload: AccountMappingRequest,
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    auth: UserAuth,
 ) -> dict:
-    db = _db()
-    user_id = _current_user_id(db, authorization)
+    user_id, db = auth
     try:
         return upsert_account_mapping(
             db,
@@ -221,10 +185,9 @@ def add_account_mapping(
 def add_exchange_rate(
     reporting_group_id: str,
     payload: ExchangeRateRequest,
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    auth: UserAuth,
 ) -> dict:
-    db = _db()
-    user_id = _current_user_id(db, authorization)
+    user_id, db = auth
     try:
         return create_exchange_rate(
             db,
@@ -240,10 +203,9 @@ def add_exchange_rate(
 def add_adjustment(
     reporting_group_id: str,
     payload: AdjustmentRequest,
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    auth: UserAuth,
 ) -> dict:
-    db = _db()
-    user_id = _current_user_id(db, authorization)
+    user_id, db = auth
     try:
         return create_adjustment(
             db,
@@ -258,10 +220,9 @@ def add_adjustment(
 @router.post("/adjustments/{adjustment_id}/post")
 def post_consolidation_adjustment(
     adjustment_id: str,
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    auth: UserAuth,
 ) -> dict:
-    db = _db()
-    user_id = _current_user_id(db, authorization)
+    user_id, db = auth
     try:
         return post_adjustment(db, user_id=user_id, adjustment_id=adjustment_id)
     except Exception as exc:
@@ -270,13 +231,12 @@ def post_consolidation_adjustment(
 
 @router.get("/reports/trial-balance")
 def trial_balance_report(
+    auth: UserAuth,
     reporting_group_id: str = Query(...),
     period_id: str = Query(...),
     rate_type: str = Query(default="closing"),
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> dict:
-    db = _db()
-    user_id = _current_user_id(db, authorization)
+    user_id, db = auth
     try:
         return consolidated_trial_balance(
             db,

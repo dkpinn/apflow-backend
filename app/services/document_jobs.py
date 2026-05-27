@@ -16,6 +16,7 @@ def create_processing_job(
     batch_id: Optional[str] = None,
     job_type: str = "invoice_extract",
     priority: int = 100,
+    extraction_strategy: Optional[str] = None,
 ) -> dict:
     payload = {
         "organisation_id": organisation_id,
@@ -25,6 +26,7 @@ def create_processing_job(
         "status": "queued",
         "current_stage": "queued",
         "priority": priority,
+        "extraction_strategy": extraction_strategy,
         "created_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
     }

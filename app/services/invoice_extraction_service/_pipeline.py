@@ -52,10 +52,13 @@ from app.services.invoice_data_builders import (
     utc_now_iso,
 )
 from ._helpers import (
+    get_organisation_extraction_settings,
     get_raw_invoice,
     get_organisation,
+    persist_invoice_page_group,
     rename_invoice_file_after_extraction,
     store_basic_document_page_snapshot,
+    update_invoice_raw_grouping,
     _preprocessing_notes_text,
 )
 
@@ -70,6 +73,7 @@ def run_invoice_extraction(
     invoice_raw_id: str,
     organisation_id: Optional[str] = None,
     job_id: Optional[str] = None,
+    extraction_strategy: Optional[str] = None,
 ) -> dict:
     print("RUN INVOICE EXTRACTION:", {"invoice_raw_id": invoice_raw_id, "organisation_id": organisation_id, "job_id": job_id})
 
@@ -195,10 +199,40 @@ def run_invoice_extraction(
         if job_id:
             mark_job_stage(supabase, job_id=job_id, stage="field_extraction")
 
+        organisation_settings = get_organisation_extraction_settings(org_id)
+        strategy = extraction_strategy or organisation_settings.get("extraction_strategy") or "auto_group"
+        vlm_enabled = organisation_settings.get("vlm_enabled", False)
+
         parsed_data = parse_invoice_fields(text)
 
+        page_count = text_result.get("page_count") or 1
+        page_numbers = list(range(1, page_count + 1))
+        try:
+            update_invoice_raw_grouping(
+                invoice_raw_id=invoice_raw_id,
+                page_numbers=page_numbers,
+                strategy=strategy,
+                total_pages=page_count,
+            )
+        except Exception as _grouping_exc:
+            print(f"GROUPING METADATA UPDATE FAILED (non-fatal): {_grouping_exc}")
+
+        if page_count > 1 or strategy != "auto_group":
+            try:
+                persist_invoice_page_group(
+                    invoice_raw_id=invoice_raw_id,
+                    page_numbers=page_numbers,
+                    strategy=strategy,
+                    supplier_detected=parsed_data.get("supplier_name_extracted"),
+                    confidence=parsed_data.get("confidence_score"),
+                )
+            except Exception as _page_group_exc:
+                print(f"PERSIST PAGE GROUP FAILED (non-fatal): {_page_group_exc}")
+
+        force_vlm = strategy == "vlm" and vlm_enabled
         vlm_should_try = (
-            parsed_data.get("confidence_score", 0) < 0.70
+            force_vlm
+            or parsed_data.get("confidence_score", 0) < 0.70
             or not parsed_data.get("invoice_number")
             or not parsed_data.get("total_amount")
             or not parsed_data.get("supplier_name_extracted")

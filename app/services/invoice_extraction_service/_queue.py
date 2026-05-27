@@ -40,6 +40,7 @@ def queue_invoice_job(
     invoice_raw_id: str,
     organisation_id: Optional[str] = None,
     batch_id: Optional[str] = None,
+    extraction_strategy: Optional[str] = None,
     priority: int = 100,
 ) -> dict:
     raw = get_raw_invoice(invoice_raw_id)
@@ -54,6 +55,7 @@ def queue_invoice_job(
         invoice_raw_id=invoice_raw_id,
         batch_id=batch_id,
         priority=priority,
+        extraction_strategy=extraction_strategy,
     )
 
     safe_update_invoice_raw_status(
@@ -110,10 +112,12 @@ def process_next_queued_invoice_job(*, organisation_id: Optional[str] = None) ->
             actor_type="worker",
         )
 
+        strategy_override = job.get("extraction_strategy")
         result = run_invoice_extraction(
             invoice_raw_id=invoice_raw_id,
             organisation_id=organisation_id,
             job_id=job_id,
+            extraction_strategy=strategy_override,
         )
 
         mark_job_completed(supabase, job_id=job_id, stage="completed")

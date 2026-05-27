@@ -28,6 +28,15 @@
 - Priority 3 is the GL integration (significant new feature).
 - looking at the invoice page, I am not sure if there are documents being processed or what is in the queue, or the current status of a document.
 - drop down box to link supplier is not working. It is showing archived suppliers.
+- line items and extracted data and excl VAT and VAT is not working. Need to understanding why this is not calculating or processing correctly.
+- need to add a filter for the drop down when choosing an account code or a dimension. ie when the user starts typing it narrows down the drop down options. The up and down arrow must work to select the correct account.
+- the cropped receipts are not showing the entire cropped area.
+- when double clicking the picture to crop, the picture becomes larger than the screen and one cannot the buttons at the bottom.
+- merge and re-extract needs to be formatted properly.
+- merge and re-extract needs to have a delete option.
+- merge and re-extract needs have a drag and drop to order the pages. Possibly change to similar view when extracting documents 3 x 3 view.
+
+
 
 
 

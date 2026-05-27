@@ -141,6 +141,77 @@ def get_organisation(organisation_id: str) -> Optional[dict]:
     return org_res.data[0] if org_res.data else None
 
 
+def get_organisation_extraction_settings(organisation_id: str) -> dict:
+    settings_res = (
+        supabase
+        .table("organisations")
+        .select("extraction_strategy, ask_per_upload, vlm_enabled")
+        .eq("id", organisation_id)
+        .limit(1)
+        .execute()
+    )
+
+    settings = settings_res.data[0] if settings_res.data else {}
+    return {
+        "extraction_strategy": settings.get("extraction_strategy") or "auto_group",
+        "ask_per_upload": bool(settings.get("ask_per_upload")),
+        "vlm_enabled": bool(settings.get("vlm_enabled")),
+    }
+
+
+def update_organisation_extraction_settings(organisation_id: str, updates: dict) -> dict:
+    if not updates:
+        raise ValueError("No settings provided to update")
+
+    update_res = (
+        supabase
+        .table("organisations")
+        .update(updates)
+        .eq("id", organisation_id)
+        .execute()
+    )
+
+    if not update_res.data:
+        raise HTTPException(status_code=404, detail="Organisation not found")
+
+    return get_organisation_extraction_settings(organisation_id)
+
+
+def persist_invoice_page_group(
+    invoice_raw_id: str,
+    page_numbers: list[int],
+    strategy: str,
+    supplier_detected: Optional[str] = None,
+    confidence: Optional[float] = None,
+) -> dict:
+    payload = {
+        "invoice_raw_id": invoice_raw_id,
+        "page_numbers": page_numbers,
+        "strategy": strategy,
+        "supplier_detected": supplier_detected,
+        "confidence": confidence,
+    }
+    res = supabase.table("invoice_page_groups").insert(payload).execute()
+    return res.data[0] if res.data else {}
+
+
+def update_invoice_raw_grouping(
+    invoice_raw_id: str,
+    page_numbers: list[int],
+    strategy: str,
+    total_pages: Optional[int] = None,
+) -> None:
+    payload = {
+        "grouped_from_pages": page_numbers,
+        "page_grouping_strategy": strategy,
+        "updated_at": utc_now_iso(),
+    }
+    if total_pages is not None:
+        payload["total_pages_in_upload"] = total_pages
+
+    supabase.table("invoices_raw").update(payload).eq("id", invoice_raw_id).execute()
+
+
 # ---------------------------------------------------------------------------
 # Group E — File & storage helpers
 # ---------------------------------------------------------------------------
