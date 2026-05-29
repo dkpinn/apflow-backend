@@ -3,9 +3,9 @@ Shared FastAPI dependencies for authenticated routes.
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Annotated, Optional, Tuple
 
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException
 from supabase import Client
 
 from app.db.supabase_client import get_supabase_client, get_user_supabase_client
@@ -53,3 +53,59 @@ def authenticated_user(
     # Per-request user-scoped client (RLS enforced via user JWT)
     db = get_user_supabase_client(token)
     return str(user_id), db
+
+
+# ── Shared type alias ─────────────────────────────────────────────────────────
+
+# Use this as the `auth: UserAuth` parameter type in any authenticated route.
+# It resolves to (user_id: str, user_scoped_db_client: Client).
+UserAuth = Annotated[tuple, Depends(authenticated_user)]
+
+# ── Org-scoped authorisation helpers ─────────────────────────────────────────
+
+WRITE_ROLES: frozenset[str] = frozenset({"owner", "admin", "accountant"})
+
+
+def org_role_for_user(user_id: str, organisation_id: Optional[str]) -> Optional[str]:
+    """
+    Return the user's active role in the organisation, or None if not a member.
+
+    Uses the service-role client so the check bypasses RLS — membership lookups
+    must be reliable regardless of the user's own permissions.
+    """
+    if not user_id or not organisation_id:
+        return None
+    try:
+        res = (
+            get_supabase_client()
+            .table("organisation_users")
+            .select("role")
+            .eq("user_id", user_id)
+            .eq("organisation_id", organisation_id)
+            .eq("status", "active")
+            .limit(1)
+            .execute()
+        )
+        row = res.data[0] if res.data else None
+        return row.get("role") if row else None
+    except Exception:
+        return None
+
+
+def ensure_org_read(user_id: str, organisation_id: Optional[str]) -> None:
+    """Raise 403 if the user is not an active member of the organisation."""
+    if not org_role_for_user(user_id, organisation_id):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have access to this organisation",
+        )
+
+
+def ensure_org_write(user_id: str, organisation_id: Optional[str]) -> None:
+    """Raise 403 unless the user holds a write-capable role (owner/admin/accountant)."""
+    role = org_role_for_user(user_id, organisation_id)
+    if role not in WRITE_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail="Only owners, admins, and accountants can perform this action",
+        )

@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from app.db.supabase_client import get_supabase_client
+from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
 from app.services.audit_log import log_invoice_event
 from app.services.invoice_data_builders import utc_now_iso
 from app.services.supplier_service import (
@@ -25,6 +26,55 @@ from app.services.supplier_service import (
 
 router = APIRouter(prefix="/api/suppliers", tags=["suppliers"])
 supabase = get_supabase_client()
+
+
+# ---------------------------------------------------------------------------
+# Cross-entity org resolution (used for auth validation in branch endpoints)
+# ---------------------------------------------------------------------------
+
+def _org_for_supplier(supplier_id: str) -> Optional[str]:
+    """Return the organisation_id that owns this supplier, or None."""
+    try:
+        res = (
+            supabase.table("suppliers")
+            .select("organisation_id")
+            .eq("id", supplier_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0]["organisation_id"] if res.data else None
+    except Exception:
+        return None
+
+
+def _org_for_branch(branch_id: str) -> Optional[str]:
+    """Return the organisation_id that owns this supplier branch, or None."""
+    try:
+        res = (
+            supabase.table("supplier_branches")
+            .select("organisation_id")
+            .eq("id", branch_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0]["organisation_id"] if res.data else None
+    except Exception:
+        return None
+
+
+def _org_for_invoice_extracted(invoice_extracted_id: str) -> Optional[str]:
+    """Return the organisation_id of the extracted invoice, or None."""
+    try:
+        res = (
+            supabase.table("invoices_extracted")
+            .select("organisation_id")
+            .eq("id", invoice_extracted_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0]["organisation_id"] if res.data else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +250,15 @@ def list_supplier_branches(
     supplier_id: str,
     organisation_id: str = Query(...),
     active_only: bool = True,
+    auth: UserAuth = ...,
 ):
+    user_id, _db = auth
+    # Verify the supplier actually belongs to the requested org (prevents org hopping)
+    supplier_org = _org_for_supplier(supplier_id)
+    if supplier_org and supplier_org != organisation_id:
+        raise HTTPException(status_code=404, detail="Supplier not found")
+    ensure_org_read(user_id, organisation_id)
+
     query = (
         supabase
         .table("supplier_branches")
@@ -348,7 +406,14 @@ def _link_branch_to_invoice(*, invoice_extracted_id: str, supplier_branch_id: st
 
 
 @router.post("/branches")
-def create_supplier_branch(payload: SupplierBranchCreateRequest):
+def create_supplier_branch(payload: SupplierBranchCreateRequest, auth: UserAuth):
+    user_id, _db = auth
+    # Verify the supplier belongs to the declared org
+    supplier_org = _org_for_supplier(payload.supplier_id)
+    if supplier_org and supplier_org != payload.organisation_id:
+        raise HTTPException(status_code=400, detail="Supplier does not belong to the specified organisation")
+    ensure_org_write(user_id, payload.organisation_id)
+
     insert_payload = _normalise_branch_payload({
         **payload.model_dump(exclude={"invoice_extracted_id", "link_invoice"}),
         "source_invoice_extracted_id": payload.invoice_extracted_id,
@@ -377,7 +442,18 @@ def create_supplier_branch(payload: SupplierBranchCreateRequest):
 
 
 @router.post("/branches/from-invoice")
-def create_supplier_branch_from_invoice(payload: SupplierBranchFromInvoiceRequest):
+def create_supplier_branch_from_invoice(payload: SupplierBranchFromInvoiceRequest, auth: UserAuth):
+    user_id, _db = auth
+    # Derive org from invoice (authoritative source of truth)
+    invoice_org = _org_for_invoice_extracted(payload.invoice_extracted_id)
+    if not invoice_org:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    # Verify supplier belongs to the same org
+    supplier_org = _org_for_supplier(payload.supplier_id)
+    if supplier_org and supplier_org != invoice_org:
+        raise HTTPException(status_code=400, detail="Supplier and invoice belong to different organisations")
+    ensure_org_write(user_id, invoice_org)
+
     invoice = get_extracted_invoice(payload.invoice_extracted_id)
     if invoice.get("supplier_id") and invoice.get("supplier_id") != payload.supplier_id:
         raise HTTPException(status_code=400, detail="Invoice is linked to a different supplier")
@@ -440,7 +516,18 @@ def create_supplier_branch_from_invoice(payload: SupplierBranchFromInvoiceReques
 
 
 @router.post("/branches/link")
-def link_supplier_branch(payload: SupplierBranchLinkRequest):
+def link_supplier_branch(payload: SupplierBranchLinkRequest, auth: UserAuth):
+    user_id, _db = auth
+    # Resolve org from invoice (authoritative)
+    invoice_org = _org_for_invoice_extracted(payload.invoice_extracted_id)
+    if not invoice_org:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    # Verify the branch belongs to the same org
+    branch_org = _org_for_branch(payload.supplier_branch_id)
+    if branch_org and branch_org != invoice_org:
+        raise HTTPException(status_code=400, detail="Branch and invoice belong to different organisations")
+    ensure_org_write(user_id, invoice_org)
+
     linked = _link_branch_to_invoice(
         invoice_extracted_id=payload.invoice_extracted_id,
         supplier_branch_id=payload.supplier_branch_id,
@@ -450,7 +537,13 @@ def link_supplier_branch(payload: SupplierBranchLinkRequest):
 
 
 @router.post("/branches/unlink")
-def unlink_supplier_branch(payload: SupplierBranchUnlinkRequest):
+def unlink_supplier_branch(payload: SupplierBranchUnlinkRequest, auth: UserAuth):
+    user_id, _db = auth
+    invoice_org = _org_for_invoice_extracted(payload.invoice_extracted_id)
+    if not invoice_org:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    ensure_org_write(user_id, invoice_org)
+
     invoice = get_extracted_invoice(payload.invoice_extracted_id)
     if payload.supplier_id and invoice.get("supplier_id") and invoice.get("supplier_id") != payload.supplier_id:
         raise HTTPException(status_code=400, detail="Invoice is linked to a different supplier")
