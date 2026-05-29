@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
+import re
 from typing import Optional
 
 from app.services.audit_log import log_invoice_event
@@ -21,6 +22,7 @@ DEFAULT_SUPPLIER_PROCESSING_SETTINGS = {
     "default_expense_account": None,
     "track_inventory": False,
     "use_uom_from_description": False,
+    "allocation_rules": [],
 }
 
 
@@ -55,6 +57,181 @@ def _round_money(value) -> Optional[float]:
     if numeric is None:
         return None
     return round(numeric, 2)
+
+
+def _normalise_text(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+
+def _document_scope(parsed_data: dict) -> str:
+    document_type = _normalise_text(parsed_data.get("document_type"))
+    if "credit" in document_type:
+        return "credit_note"
+    try:
+        total = _numeric_amount(parsed_data.get("total_amount"))
+        if total is not None and total < 0:
+            return "credit_note"
+    except Exception:
+        pass
+    return "invoice"
+
+
+def _rule_specificity(rule: dict) -> int:
+    match_type = rule.get("match_type")
+    if match_type == "regex":
+        return 4
+    if match_type == "exact":
+        return 3
+    if match_type == "contains":
+        return 2
+    return 1
+
+
+def _sorted_rules(rules: list[dict]) -> list[dict]:
+    return sorted(
+        [rule for rule in rules or [] if rule.get("active", True)],
+        key=lambda rule: (
+            int(rule.get("priority") or 100),
+            -_rule_specificity(rule),
+            str(rule.get("name") or ""),
+        ),
+    )
+
+
+def _line_match_value(item: dict, rule: dict) -> str:
+    match_field = rule.get("match_field") or "description"
+    description = str(item.get("description") or "")
+    code = str(item.get("code") or "")
+    if match_field == "code":
+        return code
+    if match_field == "description_or_code":
+        return f"{description} {code}"
+    return description
+
+
+def _rule_matches_document(rule: dict, parsed_data: dict) -> bool:
+    scope = rule.get("document_scope") or "all"
+    return scope == "all" or scope == _document_scope(parsed_data)
+
+
+def _rule_matches_line(rule: dict, item: dict) -> bool:
+    match_type = rule.get("match_type") or "all_lines"
+    if match_type == "all_lines":
+        return True
+
+    pattern = str(rule.get("pattern") or "").strip()
+    if not pattern:
+        return False
+
+    value = _line_match_value(item, rule)
+    normalised_value = _normalise_text(value)
+    normalised_pattern = _normalise_text(pattern)
+    if match_type == "contains":
+        return normalised_pattern in normalised_value
+    if match_type == "exact":
+        return normalised_pattern == normalised_value
+    if match_type == "regex":
+        try:
+            return re.search(pattern, value, re.IGNORECASE) is not None
+        except re.error:
+            return False
+    return False
+
+
+def _normalise_tracking(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): val for key, val in value.items() if val not in (None, "")}
+
+
+def _normalise_rule_splits(rule: dict) -> list[dict]:
+    splits = rule.get("splits") or []
+    normalised: list[dict] = []
+    for index, split in enumerate(splits):
+        if not isinstance(split, dict):
+            continue
+        percent = _numeric_amount(split.get("percent"))
+        if percent is None or percent <= 0:
+            continue
+        normalised.append({
+            "expense_account": split.get("expense_account"),
+            "tracking": _normalise_tracking(split.get("tracking")),
+            "percent": percent,
+            "note": split.get("note"),
+            "sort_order": int(split.get("sort_order") or index),
+        })
+    return sorted(normalised, key=lambda split: split.get("sort_order") or 0)
+
+
+def _allocation_amounts(line_total: float, splits: list[dict]) -> list[float]:
+    amounts: list[float] = []
+    running = 0.0
+    for index, split in enumerate(splits):
+        if index == len(splits) - 1:
+            amount = round(line_total - running, 2)
+        else:
+            amount = round(line_total * (float(split.get("percent") or 0) / 100), 2)
+            running = round(running + amount, 2)
+        amounts.append(amount)
+    return amounts
+
+
+def _apply_allocation_rule_to_line(item: dict, rule: dict) -> dict:
+    splits = _normalise_rule_splits(rule)
+    if not splits:
+        return item
+
+    updated = dict(item)
+    first_split = splits[0]
+    if first_split.get("expense_account"):
+        updated["expense_account"] = first_split.get("expense_account")
+    if first_split.get("tracking"):
+        updated["tracking"] = first_split.get("tracking")
+
+    line_total = _round_money(item.get("line_total") if item.get("line_total") is not None else item.get("amount"))
+    if line_total is not None:
+        amounts = _allocation_amounts(line_total, splits)
+        updated["allocations"] = [
+            {
+                "expense_account": split.get("expense_account"),
+                "tracking": split.get("tracking") or {},
+                "amount": amounts[index],
+                "percent": split.get("percent"),
+                "note": split.get("note") or rule.get("name"),
+                "sort_order": index,
+            }
+            for index, split in enumerate(splits)
+            if amounts[index] >= 0
+        ]
+
+    updated["pricing_notes"] = {
+        **(item.get("pricing_notes") or {}),
+        "supplier_allocation_rule_id": rule.get("id"),
+        "supplier_allocation_rule_name": rule.get("name"),
+    }
+    return updated
+
+
+def apply_supplier_allocation_rules(parsed_data: dict, line_items: list[dict], rules: list[dict]) -> list[dict]:
+    matching_rules = [
+        rule for rule in _sorted_rules(rules)
+        if _rule_matches_document(rule, parsed_data)
+    ]
+    if not matching_rules or not line_items:
+        return line_items
+
+    updated_items: list[dict] = []
+    for item in line_items:
+        matched_rule = next(
+            (rule for rule in matching_rules if _rule_matches_line(rule, item)),
+            None,
+        )
+        updated_items.append(
+            _apply_allocation_rule_to_line(item, matched_rule)
+            if matched_rule
+            else item
+        )
+    return updated_items
 
 
 def _sum_line_totals(line_items: list[dict]) -> Optional[float]:
@@ -147,7 +324,60 @@ def fetch_supplier_processing_settings(supabase, supplier_id: Optional[str]) -> 
         except Exception:
             continue
 
+    settings["allocation_rules"] = fetch_supplier_allocation_rules(supabase, supplier_id)
     return settings
+
+
+def fetch_supplier_allocation_rules(supabase, supplier_id: Optional[str], *, active_only: bool = True) -> list[dict]:
+    if not supplier_id:
+        return []
+
+    try:
+        query = (
+            supabase
+            .table("supplier_line_item_allocation_rules")
+            .select("*")
+            .eq("supplier_id", supplier_id)
+            .order("priority", desc=False)
+            .order("created_at", desc=False)
+        )
+        if active_only:
+            query = query.eq("active", True)
+        rules = query.execute().data or []
+    except Exception:
+        return []
+
+    rule_ids = [rule.get("id") for rule in rules if rule.get("id")]
+    if not rule_ids:
+        return rules
+
+    try:
+        splits_query = (
+            supabase
+            .table("supplier_line_item_allocation_rule_splits")
+            .select("*")
+            .order("sort_order", desc=False)
+        )
+        if hasattr(splits_query, "in_"):
+            splits_query = splits_query.in_("rule_id", rule_ids)
+        splits = splits_query.execute().data or []
+    except Exception:
+        splits = []
+
+    by_rule: dict[str, list[dict]] = {}
+    rule_id_set = set(rule_ids)
+    for split in splits:
+        rule_id = split.get("rule_id")
+        if rule_id in rule_id_set:
+            by_rule.setdefault(rule_id, []).append(split)
+
+    return [
+        {
+            **rule,
+            "splits": by_rule.get(rule.get("id"), []),
+        }
+        for rule in rules
+    ]
 
 
 def apply_supplier_processing_rules(
@@ -216,6 +446,12 @@ def apply_supplier_processing_rules(
         invoice_patch["expense_account"] = default_expense_account
         if line_items:
             line_items = [{**item, "expense_account": default_expense_account} for item in line_items]
+
+    line_items = apply_supplier_allocation_rules(
+        parsed_data,
+        line_items,
+        settings.get("allocation_rules") or [],
+    )
 
     return {
         "line_items": line_items,
@@ -320,7 +556,15 @@ def reapply_supplier_rules_to_invoice(
 
     settings = fetch_supplier_processing_settings(supabase, supplier_id)
     parsed_data, raw_line_items, source = build_invoice_rule_source(supabase, invoice)
-    if source == "current_invoice" and _looks_like_generated_summary_line(raw_line_items, invoice):
+    # Only block on the generated-summary-line guard when parse_line_items is ON for this
+    # supplier.  When parse_line_items=False (or None/unset), the single summary line IS the
+    # correct extracted representation — blocking and asking for re-extraction is a dead end.
+    parse_line_items_on = settings.get("parse_line_items", True)
+    if (
+        source == "current_invoice"
+        and parse_line_items_on
+        and _looks_like_generated_summary_line(raw_line_items, invoice)
+    ):
         result = {
             "source": source,
             "supplier_id": supplier_id,
