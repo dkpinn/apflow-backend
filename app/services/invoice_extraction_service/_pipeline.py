@@ -22,6 +22,7 @@ from app.services.document_jobs import (
 )
 from app.services.invoice_extraction.entity_detection import (
     classify_document_direction,
+    name_matches_org,
     normalise_name,
 )
 from app.services.invoice_extraction.vlm_parser import VLM_MERGE_FIELDS, extract_with_gemini
@@ -230,6 +231,10 @@ def run_invoice_extraction(
             except Exception as _page_group_exc:
                 print(f"PERSIST PAGE GROUP FAILED (non-fatal): {_page_group_exc}")
 
+        # Fetch org early — needed to detect when Tesseract picked up the org's own name
+        # as the supplier (a common AP error when the customer block appears before the issuer).
+        organisation = get_organisation(org_id)
+
         force_vlm = strategy == "vlm" and vlm_enabled
         vlm_should_try = (
             force_vlm
@@ -237,6 +242,9 @@ def run_invoice_extraction(
             or not parsed_data.get("invoice_number")
             or not parsed_data.get("total_amount")
             or not parsed_data.get("supplier_name_extracted")
+            # If OCR extracted the org's own name as the supplier, force VLM — Gemini
+            # has image context to correctly identify the invoice issuer/vendor.
+            or name_matches_org(parsed_data.get("supplier_name_extracted"), organisation)
         )
 
         if vlm_should_try:
@@ -310,7 +318,7 @@ def run_invoice_extraction(
                     notes="Missing supplier fields were recovered from full-page OCR without changing totals or line items.",
                 )
 
-        organisation = get_organisation(org_id)
+        # organisation already fetched above (before VLM trigger) — reused here
         direction_result = classify_document_direction(text, organisation)
 
         parsed_data["issuer_name_extracted"] = direction_result.issuer_name

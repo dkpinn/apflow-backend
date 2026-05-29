@@ -102,11 +102,31 @@ def extract_vat_number(text: str) -> Optional[str]:
 
 
 def extract_customer_code(text: str) -> Optional[str]:
-    patterns = [
-        r"(?:Customer\s+Code|Customer\s+No\.?|Customer\s+Number|Account\s+No\.?|Account\s+Number)\s*[:#\-]?\s*([A-Z0-9\-\/]{1,30})",
+    # High-specificity labels — unambiguously a customer/account code
+    high_priority = [
+        r"(?:Customer\s+Code|Customer\s+No\.?|Customer\s+Number)\s*[:#\-]?\s*([A-Z0-9\-\/]{1,30})",
     ]
+    result = extract_first_match(text, high_priority)
+    if result:
+        return result
 
-    return extract_first_match(text, patterns)
+    # "Account No." / "Account Number" — lower specificity.
+    # Only match when banking keywords are NOT present in the preceding ~300 chars,
+    # so we don't accidentally capture a bank account number as a customer code.
+    _BANKING_CTX = re.compile(
+        r"\b(?:bank|fnb|absa|nedbank|standard\s+bank|capitec|investec|branch\s+code|swift|iban|bic)\b",
+        re.IGNORECASE,
+    )
+    _ACCT_PATTERN = re.compile(
+        r"(?:Account\s+No\.?|Account\s+Number)\s*[:#\-]?\s*([A-Z0-9\-\/]{1,30})",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for match in _ACCT_PATTERN.finditer(text):
+        context_before = text[max(0, match.start() - 300): match.start()]
+        if not _BANKING_CTX.search(context_before):
+            return match.group(1).strip()
+
+    return None
 
 
 def extract_company_registration_number(text: str) -> Optional[str]:
