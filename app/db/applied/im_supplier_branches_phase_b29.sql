@@ -47,10 +47,6 @@ create index if not exists supplier_branches_vat_idx
 create index if not exists invoices_extracted_supplier_branch_idx
   on public.invoices_extracted(supplier_branch_id);
 
-create or replace function public.set_updated_at()
-returns trigger language plpgsql as $$
-begin new.updated_at = now(); return new; end $$;
-
 drop trigger if exists supplier_branches_set_updated_at
   on public.supplier_branches;
 create trigger supplier_branches_set_updated_at

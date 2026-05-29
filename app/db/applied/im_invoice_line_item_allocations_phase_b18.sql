@@ -30,10 +30,6 @@ create index if not exists invoice_line_item_allocations_line_idx
 create index if not exists invoice_line_item_allocations_org_idx
   on public.invoice_line_item_allocations(organisation_id);
 
-create or replace function public.set_updated_at()
-returns trigger language plpgsql as $$
-begin new.updated_at = now(); return new; end $$;
-
 drop trigger if exists invoice_line_item_allocations_set_updated_at
   on public.invoice_line_item_allocations;
 create trigger invoice_line_item_allocations_set_updated_at

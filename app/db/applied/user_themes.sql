@@ -44,10 +44,6 @@ create index if not exists user_theme_entitlements_theme_idx
 create index if not exists user_theme_preferences_active_theme_idx
   on public.user_theme_preferences(active_theme_id);
 
-create or replace function public.set_updated_at()
-returns trigger language plpgsql as $$
-begin new.updated_at = now(); return new; end $$;
-
 drop trigger if exists themes_set_updated_at on public.themes;
 create trigger themes_set_updated_at
   before update on public.themes

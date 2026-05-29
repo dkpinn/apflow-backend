@@ -376,6 +376,8 @@ def get_invoice_review_data(invoice_id: str):
                         .table("supplier_branches")
                         .select("*")
                         .eq("id", supplier_branch_id)
+                        .eq("organisation_id", organisation_id)
+                        .eq("supplier_id", supplier_id)
                         .limit(1)
                         .execute()
                     )
@@ -482,7 +484,6 @@ def get_invoice_review_data(invoice_id: str):
         "invoice": {
             **invoice,
             "supplier": supplier,
-            "supplier_branch": supplier_branch,
         },
         "supplier_branch": supplier_branch,
         "supplier_branches": supplier_branches,

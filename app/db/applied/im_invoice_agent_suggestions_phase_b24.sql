@@ -45,10 +45,6 @@ create unique index if not exists invoice_agent_suggestions_raw_fp_idx
   on public.invoice_agent_suggestions(organisation_id, invoice_raw_id, fingerprint)
   where invoice_extracted_id is null and invoice_raw_id is not null;
 
-create or replace function public.set_updated_at()
-returns trigger language plpgsql as $$
-begin new.updated_at = now(); return new; end $$;
-
 drop trigger if exists invoice_agent_suggestions_set_updated_at
   on public.invoice_agent_suggestions;
 create trigger invoice_agent_suggestions_set_updated_at

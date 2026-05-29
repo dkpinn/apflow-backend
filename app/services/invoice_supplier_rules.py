@@ -193,15 +193,15 @@ def apply_supplier_processing_rules(
             and subtotal is not None
             and abs(line_total_sum - subtotal) <= 0.02
         )
-        line_items_match_total = (
+        # Don't strip only if the line sum significantly exceeds the invoice total —
+        # that would imply items are already ex-VAT and the total is wrong.
+        # Extra charges (delivery, rounding) mean total_amount > line_total_sum is fine.
+        line_sum_exceeds_total = (
             line_total_sum is not None
             and total_amount is not None
-            and abs(line_total_sum - total_amount) <= 0.02
+            and line_total_sum > total_amount + 0.50
         )
-
-        should_strip_line_items = (not line_items_already_ex_vat) and (
-            line_items_match_total or subtotal is None
-        )
+        should_strip_line_items = not line_items_already_ex_vat and not line_sum_exceeds_total
 
         if should_strip_line_items:
             stripped: list[dict] = []

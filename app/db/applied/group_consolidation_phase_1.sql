@@ -173,10 +173,6 @@ create index if not exists consolidation_adjustments_period_idx
 create index if not exists consolidation_adjustment_lines_adjustment_idx
   on public.consolidation_adjustment_lines(adjustment_id);
 
-create or replace function public.set_updated_at()
-returns trigger language plpgsql as $$
-begin new.updated_at = now(); return new; end $$;
-
 drop trigger if exists reporting_groups_set_updated_at on public.reporting_groups;
 create trigger reporting_groups_set_updated_at
   before update on public.reporting_groups

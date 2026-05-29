@@ -28,27 +28,6 @@ create table if not exists public.invoice_parse_attempts (
   created_at timestamptz not null default now()
 );
 
-alter table public.invoice_parse_attempts
-  add column if not exists organisation_id uuid,
-  add column if not exists invoice_raw_id uuid,
-  add column if not exists invoice_extracted_id uuid,
-  add column if not exists attempt_number integer,
-  add column if not exists strategy text,
-  add column if not exists dpi integer,
-  add column if not exists ocr_variant text,
-  add column if not exists ocr_psm text,
-  add column if not exists ocr_used boolean default false,
-  add column if not exists ocr_confidence numeric,
-  add column if not exists image_quality_score numeric,
-  add column if not exists candidate_score numeric,
-  add column if not exists confidence_score numeric,
-  add column if not exists parsed_data jsonb default '{}'::jsonb,
-  add column if not exists line_items jsonb default '[]'::jsonb,
-  add column if not exists text_preview text,
-  add column if not exists selected boolean default false,
-  add column if not exists accepted_at timestamptz,
-  add column if not exists created_at timestamptz default now();
-
 create index if not exists invoice_parse_attempts_raw_idx
   on public.invoice_parse_attempts(invoice_raw_id, attempt_number);
 
