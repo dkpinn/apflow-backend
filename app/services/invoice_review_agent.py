@@ -98,6 +98,79 @@ def compact_string(value: Any) -> str:
     return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
 
 
+def digits_only(value: Any) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def phone_matches(left: Any, right: Any) -> bool:
+    left_digits = digits_only(left)
+    right_digits = digits_only(right)
+    if not left_digits or not right_digits:
+        return False
+    if left_digits == right_digits:
+        return True
+    longer, shorter = (left_digits, right_digits) if len(left_digits) >= len(right_digits) else (right_digits, left_digits)
+    if len(shorter) < 7:
+        return False
+    return longer.startswith(shorter) or longer[-len(shorter):] == shorter
+
+
+BANK_ALIASES = {
+    "fnb": "firstnationalbank",
+    "firstnationalbank": "firstnationalbank",
+    "firstnational": "firstnationalbank",
+    "absa": "absa",
+    "absabank": "absa",
+    "standardbank": "standardbank",
+    "thestandardbankofsouthafrica": "standardbank",
+    "nedbank": "nedbank",
+    "capitec": "capitec",
+    "capitecbank": "capitec",
+    "investec": "investec",
+}
+
+
+def normalise_bank_name(value: Any) -> str:
+    compact = compact_string(value)
+    return BANK_ALIASES.get(compact, compact)
+
+
+def bank_values_match(invoice_key: str, invoice_value: Any, supplier_value: Any) -> bool:
+    if invoice_key == "bank_name_extracted":
+        return normalise_bank_name(invoice_value) == normalise_bank_name(supplier_value)
+    return compact_string(invoice_value) == compact_string(supplier_value)
+
+
+def is_cash_or_card_document(invoice: dict) -> bool:
+    document_type = compact_string(invoice.get("document_type"))
+    payment_method = compact_string(invoice.get("payment_method"))
+    return document_type in {"cardreceipt", "cashreceipt"} or payment_method in {"cash", "card", "creditcard", "debitcard", "cashcard"}
+
+
+def branch_value(branch: Optional[dict], supplier: Optional[dict], key: str) -> Any:
+    if branch and has_value(branch.get(key)):
+        return branch.get(key)
+    return (supplier or {}).get(key)
+
+
+def find_branch_match(invoice: dict, branches: list[dict]) -> Optional[dict]:
+    invoice_vat = compact_string(invoice.get("vat_number_extracted"))
+    invoice_code = compact_string(invoice.get("cus_code_extracted"))
+    invoice_address = compact_string(invoice.get("supplier_del_address_extracted"))
+    invoice_name = compact_string(invoice.get("supplier_name_extracted") or invoice.get("issuer_name_extracted"))
+    for branch in branches:
+        if invoice_vat and invoice_vat == compact_string(branch.get("vat_number") or branch.get("tax_number")):
+            return branch
+        if invoice_code and invoice_code == compact_string(branch.get("branch_code")):
+            return branch
+        if invoice_address and compact_string(branch.get("delivery_address")) and invoice_address == compact_string(branch.get("delivery_address")):
+            return branch
+        branch_name = compact_string(branch.get("branch_name"))
+        if invoice_name and branch_name and (branch_name in invoice_name or invoice_name in branch_name):
+            return branch
+    return None
+
+
 def normalise_tracking(value: Any) -> dict:
     if not isinstance(value, dict):
         return {}
@@ -148,7 +221,12 @@ def _supplier_value(invoice: dict, supplier: Optional[dict], supplier_key: str, 
     return invoice.get(invoice_key)
 
 
-def _supplier_identity_suggestions(invoice: dict, supplier: Optional[dict]) -> list[AgentSuggestion]:
+def _supplier_identity_suggestions(
+    invoice: dict,
+    supplier: Optional[dict],
+    supplier_branch: Optional[dict] = None,
+    supplier_branches: Optional[list[dict]] = None,
+) -> list[AgentSuggestion]:
     suggestions: list[AgentSuggestion] = []
     supplier_name = (
         invoice.get("supplier_name_extracted")
@@ -175,7 +253,9 @@ def _supplier_identity_suggestions(invoice: dict, supplier: Optional[dict]) -> l
         ))
 
     tax_amount = money(invoice.get("tax_amount"))
-    vat_value = _supplier_value(invoice, supplier, "vat_number", "vat_number_extracted")
+    branches = supplier_branches or []
+    matched_branch = supplier_branch or find_branch_match(invoice, branches)
+    vat_value = branch_value(matched_branch, supplier, "vat_number") or invoice.get("vat_number_extracted")
     if tax_amount and tax_amount > 0 and not has_value(vat_value):
         suggestions.append(AgentSuggestion(
             category="vat_tax",
@@ -183,6 +263,21 @@ def _supplier_identity_suggestions(invoice: dict, supplier: Optional[dict]) -> l
             message="VAT/tax amount is present but no supplier VAT number is recorded.",
             reason="The document shows tax, but neither the invoice extraction nor linked supplier master has a VAT number.",
             confidence=0.82,
+            target={"tab": "supplier", "field": "vat_number_extracted"},
+        ))
+    elif (
+        supplier
+        and has_value(invoice.get("vat_number_extracted"))
+        and has_value(supplier.get("vat_number"))
+        and compact_string(invoice.get("vat_number_extracted")) != compact_string(supplier.get("vat_number"))
+        and not matched_branch
+    ):
+        suggestions.append(AgentSuggestion(
+            category="supplier_branch",
+            severity="warning",
+            message="Supplier VAT differs from the master and may belong to a branch.",
+            reason="Create or link a supplier branch instead of overwriting the supplier-level VAT number.",
+            confidence=0.84,
             target={"tab": "supplier", "field": "vat_number_extracted"},
         ))
 
@@ -247,7 +342,7 @@ def _supplier_master_update_suggestions(invoice: dict, supplier: Optional[dict])
     return suggestions
 
 
-def _banking_suggestions(invoice: dict, supplier: Optional[dict]) -> list[AgentSuggestion]:
+def _banking_suggestions(invoice: dict, supplier: Optional[dict], supplier_branch: Optional[dict] = None) -> list[AgentSuggestion]:
     if not supplier:
         return []
     suggestions: list[AgentSuggestion] = []
@@ -258,9 +353,13 @@ def _banking_suggestions(invoice: dict, supplier: Optional[dict]) -> list[AgentS
         ("bank_branch_code_extracted", "bank_branch_code", "bank branch code"),
         ("bank_swift_code_extracted", "bank_swift_code", "bank SWIFT code"),
     ]
+    effective_supplier = {**supplier, **{k: v for k, v in (supplier_branch or {}).items() if has_value(v)}}
     any_invoice_bank = any(has_value(invoice.get(invoice_key)) for invoice_key, _, _ in comparisons)
-    any_supplier_bank = any(has_value(supplier.get(supplier_key)) for _, supplier_key, _ in comparisons)
+    any_supplier_bank = any(has_value(effective_supplier.get(supplier_key)) for _, supplier_key, _ in comparisons)
+    cash_or_card = is_cash_or_card_document(invoice)
     if not any_invoice_bank and not any_supplier_bank:
+        if cash_or_card:
+            return suggestions
         suggestions.append(AgentSuggestion(
             category="banking",
             severity="warning",
@@ -273,16 +372,20 @@ def _banking_suggestions(invoice: dict, supplier: Optional[dict]) -> list[AgentS
 
     for invoice_key, supplier_key, label in comparisons:
         invoice_value = invoice.get(invoice_key)
-        supplier_value = supplier.get(supplier_key)
+        supplier_value = effective_supplier.get(supplier_key)
         if not has_value(invoice_value) or not has_value(supplier_value):
             continue
-        if compact_string(invoice_value) != compact_string(supplier_value):
+        if bank_values_match(invoice_key, invoice_value, supplier_value):
+            continue
+        is_required_field = supplier_key in {"bank_name", "bank_account_number", "bank_branch_code"}
+        severity = "info" if cash_or_card else ("critical" if is_required_field else "warning")
+        if True:
             suggestions.append(AgentSuggestion(
                 category="banking",
-                severity="critical" if supplier_key == "bank_account_number" else "warning",
+                severity=severity,
                 message=f"Invoice {label} differs from supplier master.",
-                reason=f"Invoice value is {invoice_value}; supplier master value is {supplier_value}. Confirm before approval.",
-                confidence=0.9,
+                reason=f"Invoice value is {invoice_value}; supplier/branch value is {supplier_value}. Confirm before approval.",
+                confidence=0.9 if is_required_field else 0.74,
                 target={"tab": "supplier", "field": invoice_key, "section": "banking"},
             ))
     return suggestions
@@ -494,6 +597,8 @@ def generate_invoice_agent_suggestions(
     *,
     invoice: dict,
     supplier: Optional[dict] = None,
+    supplier_branch: Optional[dict] = None,
+    supplier_branches: Optional[list[dict]] = None,
     line_items: Optional[list[dict]] = None,
     accounts: Optional[list[dict]] = None,
     tracking_dimensions: Optional[list[dict]] = None,
@@ -511,10 +616,11 @@ def generate_invoice_agent_suggestions(
     _ = accounts, tracking_values, audit_events, parse_attempts
     source_line_items = line_items or []
     source_tracking_dimensions = tracking_dimensions or []
+    effective_branch = supplier_branch or find_branch_match(invoice, supplier_branches or [])
     suggestions: list[AgentSuggestion] = []
-    suggestions.extend(_supplier_identity_suggestions(invoice, supplier))
+    suggestions.extend(_supplier_identity_suggestions(invoice, supplier, effective_branch, supplier_branches or []))
     suggestions.extend(_supplier_master_update_suggestions(invoice, supplier))
-    suggestions.extend(_banking_suggestions(invoice, supplier))
+    suggestions.extend(_banking_suggestions(invoice, supplier, effective_branch))
     suggestions.extend(_coding_suggestions(invoice, supplier, source_line_items, source_tracking_dimensions))
     suggestions.extend(_allocation_suggestions(source_line_items))
     suggestions.extend(_total_suggestions(invoice, source_line_items))

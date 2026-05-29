@@ -48,6 +48,7 @@ from app.services.invoice_data_builders import (
     build_extracted_document_profile,
     build_extracted_supplier_profile,
     build_supplier_create_payload,
+    clear_organisation_vat_from_supplier,
     merge_supplier_recovery_fields,
     utc_now_iso,
 )
@@ -369,6 +370,22 @@ def run_invoice_extraction(
             parsed_data["confidence_score"] = round(
                 max(0.0, min(1.0, (parsed_data.get("confidence_score") or 0) + direction_result.confidence_adjustment)),
                 2,
+            )
+
+        vat_guard_result = clear_organisation_vat_from_supplier(parsed_data, organisation)
+        if vat_guard_result:
+            log_invoice_event(
+                supabase,
+                organisation_id=org_id,
+                invoice_raw_id=invoice_raw_id,
+                job_id=job_id,
+                event_type="supplier_vat_cleared_organisation_match",
+                stage="entity_validation",
+                actor_type="worker" if job_id else "api",
+                field_name="vat_number_extracted",
+                old_value=vat_guard_result.get("cleared_vat_number"),
+                new_value=None,
+                notes=vat_guard_result.get("note"),
             )
 
         missing_supplier_failure = apply_missing_supplier_failure(parsed_data)

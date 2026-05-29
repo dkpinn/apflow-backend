@@ -148,3 +148,74 @@ def test_checked_findings_reopen_when_regenerated():
     assert agent_status_after_regeneration("open") == "open"
     assert agent_status_after_regeneration("dismissed") == "dismissed"
     assert agent_status_after_regeneration("applied") == "applied"
+
+
+def test_agent_treats_fnb_as_first_national_bank():
+    suggestions = generate_invoice_agent_suggestions(
+        invoice={
+            "supplier_id": "supplier-1",
+            "supplier_name_extracted": "Example Supplier",
+            "document_type": "tax_invoice",
+            "bank_name_extracted": "FNB",
+            "bank_account_number_extracted": "123456789",
+            "bank_branch_code_extracted": "250655",
+        },
+        supplier={
+            "id": "supplier-1",
+            "supplier_name": "Example Supplier",
+            "bank_name": "First National Bank",
+            "bank_account_number": "123456789",
+            "bank_branch_code": "250655",
+        },
+    )
+
+    assert not _by_category(suggestions, "banking")
+
+
+def test_agent_flags_required_banking_mismatch_for_supplier_invoice():
+    suggestions = generate_invoice_agent_suggestions(
+        invoice={
+            "supplier_id": "supplier-1",
+            "supplier_name_extracted": "Example Supplier",
+            "document_type": "tax_invoice",
+            "bank_name_extracted": "FNB",
+            "bank_account_number_extracted": "123456789",
+            "bank_branch_code_extracted": "250655",
+        },
+        supplier={
+            "id": "supplier-1",
+            "supplier_name": "Example Supplier",
+            "bank_name": "First National Bank",
+            "bank_account_number": "987654321",
+            "bank_branch_code": "250655",
+        },
+    )
+
+    banking = _by_category(suggestions, "banking")
+    assert banking
+    assert banking[0]["severity"] == "critical"
+    assert "bank account number" in banking[0]["message"]
+
+
+def test_agent_softens_banking_mismatch_for_card_receipt():
+    suggestions = generate_invoice_agent_suggestions(
+        invoice={
+            "supplier_id": "supplier-1",
+            "supplier_name_extracted": "Example Supplier",
+            "document_type": "card_receipt",
+            "bank_name_extracted": "Some Bank",
+            "bank_account_number_extracted": "123456789",
+            "bank_branch_code_extracted": "250655",
+        },
+        supplier={
+            "id": "supplier-1",
+            "supplier_name": "Example Supplier",
+            "bank_name": "First National Bank",
+            "bank_account_number": "987654321",
+            "bank_branch_code": "999999",
+        },
+    )
+
+    banking = _by_category(suggestions, "banking")
+    assert banking
+    assert {item["severity"] for item in banking} == {"info"}

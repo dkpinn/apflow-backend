@@ -36,6 +36,7 @@ from app.services.invoice_data_builders import (
     build_extracted_document_profile,
     build_extracted_supplier_profile,
     build_reextract_update,
+    clear_organisation_vat_from_supplier,
 )
 from ._helpers import (
     get_raw_invoice,
@@ -233,6 +234,23 @@ def run_invoice_re_extraction(
             and not parsed_data.get("supplier_name_extracted")
         ):
             parsed_data["supplier_name_extracted"] = direction_result.issuer_name
+
+        vat_guard_result = clear_organisation_vat_from_supplier(parsed_data, organisation)
+        if vat_guard_result:
+            log_invoice_event(
+                supabase,
+                organisation_id=org_id,
+                invoice_raw_id=invoice_raw_id,
+                invoice_extracted_id=extracted_invoice_id,
+                job_id=job_id,
+                event_type="supplier_vat_cleared_organisation_match",
+                stage="entity_validation",
+                actor_type="api",
+                field_name="vat_number_extracted",
+                old_value=vat_guard_result.get("cleared_vat_number"),
+                new_value=None,
+                notes=vat_guard_result.get("note"),
+            )
 
         missing_supplier_failure = apply_missing_supplier_failure(parsed_data)
         if missing_supplier_failure:

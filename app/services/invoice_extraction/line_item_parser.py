@@ -35,6 +35,77 @@ def clean_amount(value: str) -> Optional[float]:
     except Exception:
         return None
 
+
+def _round_money(value: float | int | None) -> Optional[float]:
+    if value is None:
+        return None
+    return round(float(value), 2)
+
+
+def _discount_column_mode(text: str) -> Optional[str]:
+    lower = (text or "").lower()
+    if re.search(r"\b(?:disc(?:ount)?|nett?|net)\s*(?:unit\s*)?price\b", lower):
+        return "discounted_unit_price"
+    if re.search(r"\b(?:disc(?:ount)?)\s*%\b|\b%\s*(?:disc(?:ount)?)\b", lower):
+        return "discount_percent"
+    if re.search(r"\b(?:disc(?:ount)?|less)\b", lower):
+        return "discount_amount"
+    return None
+
+
+def _with_discount_pricing(item: dict, *, mode: Optional[str] = None) -> dict:
+    quantity = clean_amount(item.get("quantity"))
+    unit_price = clean_amount(item.get("unit_price"))
+    line_total = clean_amount(item.get("line_total"))
+    discount_amount = clean_amount(item.get("discount_amount") or item.get("discount"))
+    discount_percent = clean_amount(item.get("discount_percent"))
+    discounted_unit_price = clean_amount(item.get("discounted_unit_price"))
+
+    if quantity is None or quantity <= 0:
+        return item
+
+    gross_total = _round_money(quantity * unit_price) if unit_price is not None else None
+
+    if discounted_unit_price is not None:
+        discount_amount = (
+            _round_money((unit_price - discounted_unit_price) * quantity)
+            if unit_price is not None
+            else discount_amount
+        )
+        if line_total is None:
+            line_total = _round_money(quantity * discounted_unit_price)
+        item["pricing_basis"] = item.get("pricing_basis") or "discounted_unit_price"
+    elif discount_percent is not None and unit_price is not None:
+        discount_amount = _round_money(quantity * unit_price * (discount_percent / 100))
+        if line_total is None:
+            line_total = _round_money((quantity * unit_price) - (discount_amount or 0))
+        item["pricing_basis"] = item.get("pricing_basis") or "discount_percent"
+    elif discount_amount is not None and unit_price is not None:
+        if line_total is None:
+            line_total = _round_money((quantity * unit_price) - discount_amount)
+        item["pricing_basis"] = item.get("pricing_basis") or "discount_amount"
+    elif gross_total is not None and line_total is not None and abs(gross_total - line_total) > 0.02:
+        discount_amount = _round_money(gross_total - line_total)
+        if 0 < (discount_amount or 0) < gross_total:
+            discounted_unit_price = _round_money(line_total / quantity)
+            item["pricing_basis"] = item.get("pricing_basis") or "extended_price_inferred_discount"
+
+    if discount_amount is not None and discount_amount > 0:
+        item["discount_amount"] = discount_amount
+    if discount_percent is not None and discount_percent > 0:
+        item["discount_percent"] = discount_percent
+    if discounted_unit_price is not None and discounted_unit_price > 0:
+        item["discounted_unit_price"] = discounted_unit_price
+    if line_total is not None:
+        item["line_total"] = line_total
+    if mode:
+        item["pricing_notes"] = {
+            **(item.get("pricing_notes") or {}),
+            "discount_column_mode": mode,
+        }
+
+    return item
+
 def is_amount(value: str) -> bool:
     return clean_amount(value) is not None and bool(
         re.fullmatch(r"(?:[A-Z]{0,3}\s*)?[0-9][0-9,\s]*[,.][0-9]{2}", value.strip())
@@ -94,6 +165,7 @@ def extract_line_items_from_vertical_block(lines: list[str]) -> list[dict]:
     """
 
     items: list[dict] = []
+    discount_mode = _discount_column_mode("\n".join(lines))
     index = 0
 
     while index < len(lines):
@@ -137,12 +209,22 @@ def extract_line_items_from_vertical_block(lines: list[str]) -> list[dict]:
                 "description": f"{code} {description}".strip(),
                 "quantity": numeric_values[0],
                 "unit_price": numeric_values[1],
-                "tax_amount": numeric_values[2],
                 "line_total": numeric_values[3],
                 "raw_line": " | ".join([code, description] + raw_numeric_lines[:4]),
             }
+            if discount_mode == "discounted_unit_price":
+                item["discounted_unit_price"] = numeric_values[2]
+                item["pricing_basis"] = "discounted_unit_price"
+            elif discount_mode == "discount_percent":
+                item["discount_percent"] = numeric_values[2]
+                item["pricing_basis"] = "discount_percent"
+            elif discount_mode == "discount_amount":
+                item["discount_amount"] = numeric_values[2]
+                item["pricing_basis"] = "discount_amount"
+            else:
+                item["tax_amount"] = numeric_values[2]
 
-            items.append(item)
+            items.append(_with_discount_pricing(item, mode=discount_mode))
 
             # Move past this parsed block
             index += 2 + len(raw_numeric_lines[:4])
@@ -158,7 +240,8 @@ def extract_line_items_from_single_rows(lines: list[str]) -> list[dict]:
     """
 
     items: list[dict] = []
-    amount_pattern = r"[0-9][0-9,\s]*[,.][0-9]{2}"
+    discount_mode = _discount_column_mode("\n".join(lines))
+    amount_pattern = r"(?:\d{1,3}(?:[\s,]\d{3})+|\d{1,6})[,.]\d{2}"
 
     for line in lines:
         lower = line.lower()
@@ -193,17 +276,27 @@ def extract_line_items_from_single_rows(lines: list[str]) -> list[dict]:
         if len(numeric_values) < 3:
             continue
 
-        items.append(
-            {
-                "code": None,
-                "description": description,
-                "quantity": numeric_values[0],
-                "unit_price": numeric_values[1] if len(numeric_values) >= 2 else None,
-                "tax_amount": numeric_values[-2] if len(numeric_values) >= 4 else None,
-                "line_total": numeric_values[-1],
-                "raw_line": line,
-            }
-        )
+        item = {
+            "code": None,
+            "description": description,
+            "quantity": numeric_values[0],
+            "unit_price": numeric_values[1] if len(numeric_values) >= 2 else None,
+            "line_total": numeric_values[-1],
+            "raw_line": line,
+        }
+        if len(numeric_values) >= 4 and discount_mode == "discounted_unit_price":
+            item["discounted_unit_price"] = numeric_values[2]
+            item["pricing_basis"] = "discounted_unit_price"
+        elif len(numeric_values) >= 4 and discount_mode == "discount_percent":
+            item["discount_percent"] = numeric_values[2]
+            item["pricing_basis"] = "discount_percent"
+        elif len(numeric_values) >= 4 and discount_mode == "discount_amount":
+            item["discount_amount"] = numeric_values[2]
+            item["pricing_basis"] = "discount_amount"
+        elif len(numeric_values) >= 4:
+            item["tax_amount"] = numeric_values[-2]
+
+        items.append(_with_discount_pricing(item, mode=discount_mode))
 
     return items
 
@@ -352,7 +445,7 @@ def extract_narrow_receipt_line_items(text: str) -> list[dict]:
         if unit_price is None and quantity and quantity > 0:
             unit_price = round(line_total / quantity, 2)
 
-        items.append({
+        items.append(_with_discount_pricing({
             "code": None,
             "description": description,
             "quantity": quantity,
@@ -360,7 +453,7 @@ def extract_narrow_receipt_line_items(text: str) -> list[dict]:
             "tax_amount": None,
             "line_total": line_total,
             "raw_line": combined,
-        })
+        }))
 
         index += max(1, len(window_lines))
 
@@ -429,7 +522,7 @@ def extract_chimes_line_items(text: str) -> list[dict]:
                 break
 
         if len(numeric_candidates) >= 4:
-            items.append({
+            items.append(_with_discount_pricing({
                 "code": code,
                 "description": description,
                 "quantity": numeric_candidates[0],
@@ -439,7 +532,7 @@ def extract_chimes_line_items(text: str) -> list[dict]:
                 "raw_line": " | ".join(
                     [code, description] + raw_numeric_candidates[:4]
                 ),
-            })
+            }))
 
             index += 6
             continue

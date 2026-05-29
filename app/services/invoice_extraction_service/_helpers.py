@@ -132,7 +132,7 @@ def get_organisation(organisation_id: str) -> Optional[dict]:
     org_res = (
         supabase
         .table("organisations")
-        .select("id, name, legal_name, trading_name, country, base_currency, currency")
+        .select("id, name, legal_name, trading_name, country, base_currency, currency, vat_number, tax_number")
         .eq("id", organisation_id)
         .limit(1)
         .execute()

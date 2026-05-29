@@ -28,10 +28,13 @@ _EXTRACTION_PROMPT = (
     "If the document uses commas as a decimal separator (e.g. South African format '1 234,56'), "
     "convert to a decimal point. "
     "For line_items: extract EVERY individual product or service line visible in the document. "
-    "unit_price must be the EXCLUDING-VAT (ex-VAT / net) price per unit. "
-    "line_total must be the EXCLUDING-VAT (ex-VAT / net) total for the line (unit_price × quantity). "
+    "unit_price must be the printed original/list unit price before line-level discount when both original and discounted prices are shown. "
+    "If a discounted/net unit price is printed (for example Disc Price, Nett Price, Net Unit), put it in discounted_unit_price. "
+    "If a discount percentage or amount is printed, put it in discount_percent or discount_amount. "
+    "When discount evidence exists, line_total is the printed net/extended amount after discount, not unit_price times quantity. "
+    "line_total must be the printed net/extended line amount after discount, excluding VAT when the document labels it as ex-VAT. "
     "VAT / tax is applied at the invoice level, not per line — do not include tax in unit_price or line_total. "
-    "Each line item should include the item description, quantity, unit price (ex-VAT), line total (ex-VAT), "
+    "Each line item should include the item description, quantity, unit price, discounted unit price/discount if printed, line total, "
     "and the item/product code or SKU if printed. "
     "Even if the image is dark or low contrast, do your best to read each line. "
     "Set confidence_score to your confidence that the extraction is accurate and complete "
@@ -53,8 +56,13 @@ _EXTRACTION_PROMPT = (
 class _VLMLineItem(BaseModel):
     description: str = Field("", description="Product or service name / description")
     quantity: Optional[float] = Field(None, description="Quantity of units")
-    unit_price: Optional[float] = Field(None, description="Ex-VAT (net) price per unit, excluding tax")
-    line_total: Optional[float] = Field(None, description="Ex-VAT (net) line total: unit_price × quantity, excluding tax")
+    unit_price: Optional[float] = Field(None, description="Printed original/list price per unit before discount when shown")
+    discount_amount: Optional[float] = Field(None, description="Total discount amount for this line, if printed or inferable")
+    discount_percent: Optional[float] = Field(None, description="Discount percentage for this line, if printed")
+    discounted_unit_price: Optional[float] = Field(None, description="Printed discounted/net unit price, such as Disc Price or Nett Price")
+    pricing_basis: Optional[str] = Field(None, description="How the line total was derived: unit_price, discount_amount, discount_percent, discounted_unit_price, or extended_price")
+    pricing_notes: dict = Field(default_factory=dict, description="Small pricing evidence notes")
+    line_total: Optional[float] = Field(None, description="Printed net/extended line total after discount, excluding tax when labelled ex-VAT")
     code: Optional[str] = Field(None, description="Product code, SKU, or barcode printed on the line")
 
 

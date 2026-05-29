@@ -50,6 +50,73 @@ def _numeric_amount(value) -> Optional[float]:
         return None
 
 
+def _round_money(value) -> Optional[float]:
+    numeric = _numeric_amount(value)
+    if numeric is None:
+        return None
+    return round(numeric, 2)
+
+
+def _sum_line_totals(line_items: list[dict]) -> Optional[float]:
+    total = 0.0
+    found = False
+    for item in line_items or []:
+        line_total = _numeric_amount(item.get("line_total"))
+        if line_total is None:
+            continue
+        total += line_total
+        found = True
+    return round(total, 2) if found else None
+
+
+def _strip_vat_from_line_item(item: dict, vat_rate: float) -> dict:
+    divisor = 1 + vat_rate
+    if divisor <= 0:
+        return item
+
+    quantity = _numeric_amount(item.get("quantity")) or 1
+    unit_price = _round_money((_numeric_amount(item.get("unit_price")) or 0) / divisor) if item.get("unit_price") is not None else None
+    discounted_unit_price = (
+        _round_money((_numeric_amount(item.get("discounted_unit_price")) or 0) / divisor)
+        if item.get("discounted_unit_price") is not None
+        else None
+    )
+    discount_amount = (
+        _round_money((_numeric_amount(item.get("discount_amount") or item.get("discount")) or 0) / divisor)
+        if item.get("discount_amount") is not None or item.get("discount") is not None
+        else None
+    )
+    line_total = (
+        _round_money((_numeric_amount(item.get("line_total")) or 0) / divisor)
+        if item.get("line_total") is not None
+        else None
+    )
+
+    updated = dict(item)
+    if unit_price is not None:
+        updated["unit_price"] = unit_price
+    if discounted_unit_price is not None:
+        updated["discounted_unit_price"] = discounted_unit_price
+        if discount_amount is None and unit_price is not None:
+            discount_amount = _round_money((unit_price - discounted_unit_price) * quantity)
+    if discount_amount is not None:
+        updated["discount_amount"] = discount_amount
+    if line_total is not None:
+        updated["line_total"] = line_total
+    elif discounted_unit_price is not None:
+        updated["line_total"] = _round_money(discounted_unit_price * quantity)
+    elif unit_price is not None:
+        updated["line_total"] = _round_money((unit_price * quantity) - (discount_amount or 0))
+
+    if updated != item:
+        updated["pricing_notes"] = {
+            **(item.get("pricing_notes") or {}),
+            "vat_stripped_from_line_item": True,
+            "vat_rate": vat_rate,
+        }
+    return updated
+
+
 def fetch_supplier_processing_settings(supabase, supplier_id: Optional[str]) -> dict:
     settings = dict(DEFAULT_SUPPLIER_PROCESSING_SETTINGS)
     settings["supplier_id"] = supplier_id
@@ -110,6 +177,7 @@ def apply_supplier_processing_rules(
     elif line_items_include_vat and line_items:
         subtotal = _numeric_amount(parsed_data.get("subtotal"))
         tax_amount = _numeric_amount(parsed_data.get("tax_amount"))
+        total_amount = _numeric_amount(parsed_data.get("total_amount"))
         default_vat_rate = _numeric_amount(settings.get("default_vat_rate"))
 
         if tax_amount is not None and subtotal and subtotal > 0:
@@ -119,19 +187,30 @@ def apply_supplier_processing_rules(
         else:
             vat_rate = 0.15
 
-        stripped: list[dict] = []
-        for item in line_items:
-            unit_price = _numeric_amount(item.get("unit_price"))
-            quantity = _numeric_amount(item.get("quantity")) or 1
-            if unit_price is not None:
+        line_total_sum = _sum_line_totals(line_items)
+        line_items_already_ex_vat = (
+            line_total_sum is not None
+            and subtotal is not None
+            and abs(line_total_sum - subtotal) <= 0.02
+        )
+        line_items_match_total = (
+            line_total_sum is not None
+            and total_amount is not None
+            and abs(line_total_sum - total_amount) <= 0.02
+        )
+
+        should_strip_line_items = (not line_items_already_ex_vat) and (
+            line_items_match_total or subtotal is None
+        )
+
+        if should_strip_line_items:
+            stripped: list[dict] = []
+            for item in line_items:
                 try:
-                    ex_price = round(unit_price / (1 + vat_rate), 2)
-                    ex_total = round(ex_price * quantity, 2)
-                    item = {**item, "unit_price": ex_price, "line_total": ex_total}
+                    stripped.append(_strip_vat_from_line_item(item, vat_rate))
                 except (TypeError, ValueError, ZeroDivisionError):
-                    pass
-            stripped.append(item)
-        line_items = stripped
+                    stripped.append(item)
+            line_items = stripped
 
     if default_expense_account:
         invoice_patch["expense_account"] = default_expense_account

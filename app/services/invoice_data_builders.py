@@ -82,6 +82,45 @@ def build_extracted_document_profile(parsed_data: dict) -> dict:
     }
 
 
+def normalise_identifier(value: object) -> str:
+    return re.sub(r"[^0-9a-z]+", "", str(value or "").lower())
+
+
+def clear_organisation_vat_from_supplier(parsed_data: dict, organisation: Optional[dict]) -> Optional[dict]:
+    """
+    Prevent the selected organisation's VAT/tax number being stored as supplier VAT.
+
+    In supplier invoices the organisation often appears as the recipient. OCR can
+    pick the recipient VAT number when the supplier header is weak; that value
+    must not become supplier master data.
+    """
+    extracted_vat = parsed_data.get("vat_number_extracted")
+    extracted_norm = normalise_identifier(extracted_vat)
+    if not extracted_norm or not organisation:
+        return None
+
+    org_candidates = [
+        organisation.get("vat_number"),
+        organisation.get("tax_number"),
+    ]
+    matched = next(
+        (candidate for candidate in org_candidates if normalise_identifier(candidate) == extracted_norm),
+        None,
+    )
+    if not matched:
+        return None
+
+    parsed_data["vat_number_extracted"] = None
+    note = "Supplier VAT cleared because OCR matched the selected organisation VAT/tax number."
+    existing_notes = str(parsed_data.get("validation_notes") or "").strip()
+    parsed_data["validation_notes"] = f"{existing_notes} {note}".strip()
+    return {
+        "cleared_vat_number": extracted_vat,
+        "matched_organisation_vat_number": matched,
+        "note": note,
+    }
+
+
 def build_supplier_create_payload(
     *,
     organisation_id: str,

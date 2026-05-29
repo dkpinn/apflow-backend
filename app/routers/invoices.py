@@ -102,6 +102,21 @@ class AgentSuggestionActionRequest(BaseModel):
     note: Optional[str] = None
 
 
+class SupplierComparisonIgnoreRequest(BaseModel):
+    field_key: str
+    reason: Optional[str] = None
+
+
+IGNORABLE_SUPPLIER_COMPARISON_FIELDS = {
+    "supplier_name_extracted",
+    "supplier_telephone_extracted",
+    "supplier_email_extracted",
+    "supplier_website_extracted",
+    "supplier_del_address_extracted",
+    "company_registration_number_extracted",
+}
+
+
 @router.post("/extract")
 def extract_invoice(
     payload: ExtractInvoiceRequest,
@@ -334,6 +349,40 @@ def get_invoice_review_data(invoice_id: str):
         except Exception as exc:
             fetch_errors["supplier"] = str(exc)
 
+    supplier_branch = None
+    supplier_branches: list[dict] = []
+    if supplier_id:
+        try:
+            branches_res = (
+                supabase
+                .table("supplier_branches")
+                .select("*")
+                .eq("supplier_id", supplier_id)
+                .eq("organisation_id", organisation_id)
+                .eq("active", True)
+                .order("branch_name", desc=False)
+                .execute()
+            )
+            supplier_branches = branches_res.data or []
+            supplier_branch_id = invoice.get("supplier_branch_id")
+            if supplier_branch_id:
+                supplier_branch = next(
+                    (branch for branch in supplier_branches if branch.get("id") == supplier_branch_id),
+                    None,
+                )
+                if supplier_branch is None:
+                    branch_res = (
+                        supabase
+                        .table("supplier_branches")
+                        .select("*")
+                        .eq("id", supplier_branch_id)
+                        .limit(1)
+                        .execute()
+                    )
+                    supplier_branch = branch_res.data[0] if branch_res.data else None
+        except Exception as exc:
+            fetch_errors["supplier_branches"] = str(exc)
+
     document_pages: list[dict] = []
     if invoice_raw_id:
         try:
@@ -433,7 +482,10 @@ def get_invoice_review_data(invoice_id: str):
         "invoice": {
             **invoice,
             "supplier": supplier,
+            "supplier_branch": supplier_branch,
         },
+        "supplier_branch": supplier_branch,
+        "supplier_branches": supplier_branches,
         "raw": raw,
         "document_pages": document_pages,
         "line_items": line_items,
@@ -539,6 +591,8 @@ def _fetch_agent_context(invoice_id: str) -> dict:
     return {
         **review_data,
         "supplier": supplier,
+        "supplier_branch": review_data.get("supplier_branch"),
+        "supplier_branches": review_data.get("supplier_branches") or [],
         "accounts": accounts,
         "tracking_dimensions": tracking_dimensions,
         "tracking_values": tracking_values,
@@ -615,6 +669,20 @@ def _ensure_agent_write_access(user_id: str, organisation_id: str | None) -> Non
         raise HTTPException(status_code=403, detail="Only owners, admins, and accountants can update agent suggestions")
 
 
+def _fetch_supplier_comparison_ignores(invoice_extracted_id: str | None) -> list[dict]:
+    if not invoice_extracted_id:
+        return []
+    res = (
+        supabase
+        .table("invoice_supplier_comparison_ignores")
+        .select("*")
+        .eq("invoice_extracted_id", invoice_extracted_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return res.data or []
+
+
 def _persist_agent_suggestions(context: dict, generated: list[dict]) -> list[dict]:
     organisation_id = context.get("organisation_id")
     invoice_raw_id = context.get("invoice_raw_id")
@@ -687,6 +755,8 @@ def run_invoice_agent_review(invoice_id: str, auth: UserAuth):
     generated = generate_invoice_agent_suggestions(
         invoice=invoice,
         supplier=context.get("supplier"),
+        supplier_branch=context.get("supplier_branch"),
+        supplier_branches=context.get("supplier_branches") or [],
         line_items=context.get("line_items") or [],
         accounts=context.get("accounts") or [],
         tracking_dimensions=context.get("tracking_dimensions") or [],
@@ -916,6 +986,104 @@ def mark_agent_review_checked(
         "suggestions": suggestions,
         "summary": _agent_summary(suggestions),
     }
+
+
+@router.get("/{invoice_id}/supplier-comparison-ignores")
+def get_supplier_comparison_ignores(invoice_id: str, auth: UserAuth):
+    user_id, _db = auth
+    context = _fetch_agent_context(invoice_id)
+    _ensure_agent_read_access(user_id, context.get("organisation_id"))
+    return {
+        "success": True,
+        "ignores": _fetch_supplier_comparison_ignores(context.get("invoice_extracted_id")),
+    }
+
+
+@router.post("/{invoice_id}/supplier-comparison-ignores")
+def ignore_supplier_comparison_field(
+    invoice_id: str,
+    payload: SupplierComparisonIgnoreRequest,
+    auth: UserAuth,
+):
+    user_id, _db = auth
+    context = _fetch_agent_context(invoice_id)
+    organisation_id = context.get("organisation_id")
+    invoice_extracted_id = context.get("invoice_extracted_id")
+    invoice_raw_id = context.get("invoice_raw_id")
+    invoice = context.get("invoice") or {}
+    field_key = (payload.field_key or "").strip()
+
+    _ensure_agent_write_access(user_id, organisation_id)
+    if not invoice_extracted_id:
+        raise HTTPException(status_code=400, detail="Missing invoice_extracted_id")
+    if field_key not in IGNORABLE_SUPPLIER_COMPARISON_FIELDS:
+        raise HTTPException(status_code=422, detail="This supplier comparison field cannot be ignored")
+
+    insert_payload = {
+        "organisation_id": organisation_id,
+        "invoice_extracted_id": invoice_extracted_id,
+        "supplier_id": invoice.get("supplier_id"),
+        "field_key": field_key,
+        "reason": payload.reason,
+        "created_by": user_id,
+    }
+    res = (
+        supabase
+        .table("invoice_supplier_comparison_ignores")
+        .upsert(insert_payload, on_conflict="organisation_id,invoice_extracted_id,field_key")
+        .execute()
+    )
+    ignored = res.data[0] if res.data else insert_payload
+
+    log_invoice_event(
+        supabase,
+        organisation_id=organisation_id,
+        invoice_raw_id=invoice_raw_id,
+        invoice_extracted_id=invoice_extracted_id,
+        event_type="supplier_comparison_ignored",
+        stage="review",
+        field_name=field_key,
+        actor_type="user",
+        actor_user_id=user_id,
+        new_value=ignored,
+        notes=payload.reason or "Reviewer ignored supplier comparison difference.",
+    )
+    return {"success": True, "ignore": ignored}
+
+
+@router.delete("/{invoice_id}/supplier-comparison-ignores/{field_key}")
+def undo_supplier_comparison_ignore(invoice_id: str, field_key: str, auth: UserAuth):
+    user_id, _db = auth
+    context = _fetch_agent_context(invoice_id)
+    organisation_id = context.get("organisation_id")
+    invoice_extracted_id = context.get("invoice_extracted_id")
+    invoice_raw_id = context.get("invoice_raw_id")
+
+    _ensure_agent_write_access(user_id, organisation_id)
+    if not invoice_extracted_id:
+        raise HTTPException(status_code=400, detail="Missing invoice_extracted_id")
+    if field_key not in IGNORABLE_SUPPLIER_COMPARISON_FIELDS:
+        raise HTTPException(status_code=422, detail="This supplier comparison field cannot be ignored")
+
+    supabase.table("invoice_supplier_comparison_ignores").delete().eq(
+        "invoice_extracted_id",
+        invoice_extracted_id,
+    ).eq("organisation_id", organisation_id).eq("field_key", field_key).execute()
+
+    log_invoice_event(
+        supabase,
+        organisation_id=organisation_id,
+        invoice_raw_id=invoice_raw_id,
+        invoice_extracted_id=invoice_extracted_id,
+        event_type="supplier_comparison_ignore_removed",
+        stage="review",
+        field_name=field_key,
+        actor_type="user",
+        actor_user_id=user_id,
+        new_value={"field_key": field_key},
+        notes="Reviewer removed supplier comparison ignore.",
+    )
+    return {"success": True}
 
 
 @router.post("/jobs/process-next")
