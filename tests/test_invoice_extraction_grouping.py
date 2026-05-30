@@ -4,6 +4,27 @@ import sys
 import types
 import unittest
 
+_STUBBED_MODULES = [
+    "app.db.supabase_client",
+    "app.services.audit_log",
+    "app.services.invoice_extraction.file_naming",
+]
+_ORIGINAL_MODULES = {
+    name: sys.modules.get(name)
+    for name in _STUBBED_MODULES
+}
+_MISSING = object()
+
+
+def _restore_stubbed_modules() -> None:
+    for name in _STUBBED_MODULES:
+        original = _ORIGINAL_MODULES.get(name, _MISSING)
+        if original is None:
+            sys.modules.pop(name, None)
+        elif original is not _MISSING:
+            sys.modules[name] = original
+
+
 # Stub standard dependencies not installed in the test environment.
 if "fastapi" not in sys.modules:
     fastapi_stub = types.ModuleType("fastapi")
@@ -16,37 +37,27 @@ if "supabase" not in sys.modules:
     supabase_stub.create_client = lambda url, key: object()
     sys.modules["supabase"] = supabase_stub
 
-# Stub app package modules required by _helpers.py without importing the full app package.
-if "app" not in sys.modules:
-    sys.modules["app"] = types.ModuleType("app")
-if "app.db" not in sys.modules:
-    sys.modules["app.db"] = types.ModuleType("app.db")
+# Stub only leaf dependencies required by _helpers.py. Package parents must stay
+# importable packages so later tests can import real app modules.
 if "app.db.supabase_client" not in sys.modules:
     supabase_client_module = types.ModuleType("app.db.supabase_client")
     supabase_client_module.get_supabase_client = lambda: object()
     sys.modules["app.db.supabase_client"] = supabase_client_module
-if "app.services" not in sys.modules:
-    sys.modules["app.services"] = types.ModuleType("app.services")
 if "app.services.audit_log" not in sys.modules:
     audit_log_module = types.ModuleType("app.services.audit_log")
     audit_log_module.log_invoice_event = lambda *args, **kwargs: None
     sys.modules["app.services.audit_log"] = audit_log_module
-if "app.services.invoice_extraction" not in sys.modules:
-    sys.modules["app.services.invoice_extraction"] = types.ModuleType("app.services.invoice_extraction")
 if "app.services.invoice_extraction.file_naming" not in sys.modules:
     file_naming_module = types.ModuleType("app.services.invoice_extraction.file_naming")
     file_naming_module.build_invoice_storage_filename = lambda **kwargs: "invoice.pdf"
     sys.modules["app.services.invoice_extraction.file_naming"] = file_naming_module
-if "app.services.invoice_data_builders" not in sys.modules:
-    data_builders_module = types.ModuleType("app.services.invoice_data_builders")
-    data_builders_module.utc_now_iso = lambda: "2026-05-27T00:00:00Z"
-    sys.modules["app.services.invoice_data_builders"] = data_builders_module
 
 helpers_path = pathlib.Path(__file__).resolve().parents[1] / "app" / "services" / "invoice_extraction_service" / "_helpers.py"
 spec = importlib.util.spec_from_file_location("invoice_extraction_helpers", helpers_path)
 helpers = importlib.util.module_from_spec(spec)
 sys.modules["invoice_extraction_helpers"] = helpers
 spec.loader.exec_module(helpers)
+_restore_stubbed_modules()
 
 
 class _FakeResult:

@@ -25,14 +25,13 @@ from app.services.invoice_extraction.entity_detection import (
     name_matches_org,
     normalise_name,
 )
+from app.services.invoice_extraction.extraction_rules import looks_like_location_cluster
 from app.services.invoice_extraction.supplier_parser import (
     extract_supplier_name,
     is_valid_supplier_candidate,
 )
-from app.services.invoice_extraction.vlm_parser import (
-    VLM_MERGE_FIELDS,
-    extract_with_gemini_diagnostic,
-)
+from app.services.ai_provider_fallback import extract_with_vlm_fallback
+from app.services.invoice_extraction.vlm_parser import VLM_MERGE_FIELDS
 from app.services.invoice_line_items import replace_invoice_line_items
 from app.services.invoice_ocr_pipeline import (
     calculate_confidence,
@@ -307,13 +306,21 @@ def run_invoice_extraction(
             or not parsed_data.get("total_amount")
             or not parsed_data.get("supplier_name_extracted")
             or supplier_candidate_invalid
-            # If OCR extracted the org's own name as the supplier, force VLM — Gemini
-            # has image context to correctly identify the invoice issuer/vendor.
+            # If OCR extracted the org's own name as the supplier, force VLM —
+            # the platform VLM fallback has image context to identify the issuer.
             or name_matches_org(parsed_data.get("supplier_name_extracted"), organisation)
+            # If OCR extracted what looks like a suburb/area cluster instead of a
+            # business name (e.g. "COWIES HILL EURIKA"), fall back to VLM which has
+            # image context to find the real invoice issuer.
+            or looks_like_location_cluster(parsed_data.get("supplier_name_extracted") or "")
         )
 
         if vlm_should_try:
-            vlm_result = extract_with_gemini_diagnostic(file_bytes, raw.get("file_type"))
+            vlm_result = extract_with_vlm_fallback(
+                file_bytes,
+                raw.get("file_type"),
+                organisation_id=org_id,
+            )
             vlm_data = vlm_result.get("data")
             if vlm_data is not None:
                 vlm_confidence = vlm_data.get("confidence_score", 0)
@@ -343,8 +350,11 @@ def run_invoice_extraction(
                         "vlm_invoice_number": vlm_data.get("invoice_number"),
                         "vlm_total": vlm_data.get("total_amount"),
                         "vlm_line_items_count": len(vlm_data.get("line_items") or []),
+                        "vlm_provider": vlm_result.get("provider"),
+                        "vlm_model": vlm_result.get("model"),
+                        "vlm_attempts": vlm_result.get("attempts") or [],
                     },
-                    notes=f"Gemini VLM fallback merged. VLM confidence={vlm_confidence:.2f}, Tesseract confidence={tesseract_confidence:.2f}.",
+                    notes=f"VLM fallback merged via {vlm_result.get('provider') or 'unknown provider'}. VLM confidence={vlm_confidence:.2f}, Tesseract confidence={tesseract_confidence:.2f}.",
                 )
             else:
                 # VLM was needed but returned None — API key missing, rate-limited, or an error
@@ -367,6 +377,9 @@ def run_invoice_extraction(
                         "vlm_error": vlm_result.get("error"),
                         "vlm_error_type": vlm_result.get("error_type"),
                         "mime_type": vlm_result.get("mime_type"),
+                        "vlm_provider": vlm_result.get("provider"),
+                        "vlm_model": vlm_result.get("model"),
+                        "vlm_attempts": vlm_result.get("attempts") or [],
                     },
                     notes=f"VLM fallback was needed but could not complete: {vlm_result.get('reason') or 'unknown_error'}.",
                 )

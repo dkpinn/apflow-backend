@@ -3,6 +3,7 @@ Shared FastAPI dependencies for authenticated routes.
 """
 from __future__ import annotations
 
+import os
 from typing import Annotated, Optional, Tuple
 
 from fastapi import Depends, Header, HTTPException
@@ -108,4 +109,46 @@ def ensure_org_write(user_id: str, organisation_id: Optional[str]) -> None:
         raise HTTPException(
             status_code=403,
             detail="Only owners, admins, and accountants can perform this action",
+        )
+
+
+def _bootstrap_platform_owner_ids() -> set[str]:
+    raw = os.getenv("PLATFORM_OWNER_USER_IDS") or os.getenv("PLATFORM_OWNER_USER_ID") or ""
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def is_platform_owner(user_id: str) -> bool:
+    """
+    Return True when the user is allowed to manage platform-level settings.
+
+    PLATFORM_OWNER_USER_IDS is a bootstrap/backstop only. The normal source of
+    truth is public.platform_admin_users, which lets ownership be managed
+    without changing deployment environment variables.
+    """
+    if not user_id:
+        return False
+    if user_id in _bootstrap_platform_owner_ids():
+        return True
+    try:
+        res = (
+            get_supabase_client()
+            .table("platform_admin_users")
+            .select("role, status")
+            .eq("user_id", user_id)
+            .eq("role", "owner")
+            .eq("status", "active")
+            .limit(1)
+            .execute()
+        )
+        return bool(res.data)
+    except Exception:
+        return False
+
+
+def ensure_platform_owner(user_id: str) -> None:
+    """Raise 403 unless the user is a platform owner."""
+    if not is_platform_owner(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the platform owner can manage platform settings",
         )

@@ -2,6 +2,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.routers import consolidation as consolidation_router
 from app.routers.consolidation import router
 from app.services.consolidation import (
     ConsolidationAccessError,
@@ -343,10 +344,10 @@ def test_unbalanced_adjustments_are_rejected():
 
 def test_reporting_groups_endpoint_uses_bearer_token(monkeypatch):
     db = _base_db()
-    monkeypatch.setattr("app.routers.consolidation.supabase", db)
 
     app = FastAPI()
     app.include_router(router)
+    app.dependency_overrides[consolidation_router.authenticated_user] = lambda: ("owner-user", db)
     client = TestClient(app)
 
     response = client.get("/api/consolidation/groups", headers={"Authorization": "Bearer valid-token"})

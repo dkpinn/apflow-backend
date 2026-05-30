@@ -8,6 +8,7 @@ from app.services.invoice_extraction.extraction_rules import (
     is_document_metadata_value,
     is_recipient_block_label,
     looks_like_address_value,
+    looks_like_location_cluster,
 )
 
 
@@ -371,6 +372,7 @@ def extract_supplier_from_phone_header(lines: list[str]) -> Optional[str]:
                 continue
             if (
                 is_recipient_block_label(cleaned)
+                or looks_like_address_value(cleaned)  # stop scanning — delivery/street address
                 or re.search(r"\b(customer|client|bill to|invoice to|deliver to|delivery to|ship to|banking details|cash bank|paid)\b", lower)
             ):
                 break
@@ -392,7 +394,7 @@ def extract_supplier_from_phone_header(lines: list[str]) -> Optional[str]:
         chosen = business_lines or candidate_lines
         combined = " ".join(chosen[-3:])
         combined = re.sub(r"\s+", " ", combined).strip(" -:,.")
-        if is_valid_supplier_candidate(combined):
+        if is_valid_supplier_candidate(combined) and not looks_like_location_cluster(combined):
             return combined
 
     return None

@@ -61,6 +61,7 @@ _EXTRACTION_PROMPT = (
     "Set document_count to the number of physically separate documents visible on this page "
     "(e.g. a page with 3 stapled till slips has document_count = 3; a single invoice has document_count = 1)."
 )
+DEFAULT_EXTRACTION_PROMPT = _EXTRACTION_PROMPT
 
 
 class _VLMLineItem(BaseModel):
@@ -159,6 +160,26 @@ VLM_MERGE_FIELDS: list[str] = [
 ]
 
 
+def normalise_vlm_invoice(vlm: _VLMInvoiceSchema) -> dict:
+    parsed: dict = {}
+    for field in VLM_MERGE_FIELDS:
+        if field == "line_items":
+            parsed["line_items"] = [item.model_dump() for item in vlm.line_items]
+        else:
+            parsed[field] = getattr(vlm, field, None)
+
+    parsed["confidence_score"] = round(float(vlm.confidence_score), 2)
+    return parsed
+
+
+def normalise_vlm_json_response(response_text: str) -> dict:
+    return normalise_vlm_invoice(_VLMInvoiceSchema.model_validate_json(response_text))
+
+
+def vlm_invoice_json_schema() -> dict:
+    return _VLMInvoiceSchema.model_json_schema()
+
+
 def _to_png_bytes(file_bytes: bytes) -> bytes:
     from PIL import Image
 
@@ -209,26 +230,36 @@ def _preprocess_for_vlm(file_bytes: bytes, effective_mime: str) -> list[tuple[by
         return [(file_bytes, effective_mime)]
 
 
-def _call_gemini(file_bytes: bytes, effective_mime: str) -> Optional[dict]:
+def preprocess_for_vlm(file_bytes: bytes, effective_mime: str) -> list[tuple[bytes, str]]:
+    return _preprocess_for_vlm(file_bytes, effective_mime)
+
+
+def _call_gemini(
+    file_bytes: bytes,
+    effective_mime: str,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    prompt: Optional[str] = None,
+) -> Optional[dict]:
     """Blocking Gemini API call. Run inside a thread via extract_with_gemini."""
     from google import genai
     from google.genai import types
 
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
+    effective_api_key = api_key or os.getenv("GOOGLE_API_KEY")
+    if not effective_api_key:
         return None
 
     page_parts = _preprocess_for_vlm(file_bytes, effective_mime)
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=effective_api_key)
     contents: list = [
         types.Part.from_bytes(data=page_bytes, mime_type=page_mime)
         for page_bytes, page_mime in page_parts
     ]
-    contents.append(_EXTRACTION_PROMPT)
+    contents.append(prompt or _EXTRACTION_PROMPT)
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=model or os.getenv("GEMINI_VLM_MODEL") or "gemini-2.5-flash",
         contents=contents,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -238,17 +269,7 @@ def _call_gemini(file_bytes: bytes, effective_mime: str) -> Optional[dict]:
         ),
     )
 
-    vlm = _VLMInvoiceSchema.model_validate_json(response.text)
-
-    parsed: dict = {}
-    for field in VLM_MERGE_FIELDS:
-        if field == "line_items":
-            parsed["line_items"] = [item.model_dump() for item in vlm.line_items]
-        else:
-            parsed[field] = getattr(vlm, field, None)
-
-    parsed["confidence_score"] = round(float(vlm.confidence_score), 2)
-    return parsed
+    return normalise_vlm_json_response(response.text)
 
 
 def extract_with_gemini(
@@ -268,6 +289,9 @@ def extract_with_gemini(
 def extract_with_gemini_diagnostic(
     file_bytes: bytes,
     mime_type: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    prompt: Optional[str] = None,
 ) -> dict:
     """
     Extract invoice fields via Gemini and return failure diagnostics.
@@ -276,8 +300,8 @@ def extract_with_gemini_diagnostic(
     None, while the pipeline can use this function to write specific audit
     reasons when VLM fallback was needed but could not complete.
     """
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
+    effective_api_key = api_key or os.getenv("GOOGLE_API_KEY")
+    if not effective_api_key:
         return {
             "data": None,
             "reason": "missing_google_api_key",
@@ -307,7 +331,14 @@ def extract_with_gemini_diagnostic(
 
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_call_gemini, file_bytes, effective_mime)
+            future = executor.submit(
+                _call_gemini,
+                file_bytes,
+                effective_mime,
+                effective_api_key,
+                model,
+                prompt,
+            )
             try:
                 data = future.result(timeout=VLM_TIMEOUT_SECONDS)
             except FuturesTimeoutError:

@@ -144,6 +144,42 @@ def address_contains_metadata(value: Optional[str]) -> bool:
     return any(is_address_stop_line(line) or is_document_metadata_value(line) for line in str(value).splitlines())
 
 
+def looks_like_location_cluster(name: str) -> bool:
+    """Return True when a candidate looks like a suburb/area cluster rather than
+    a business name: ALL CAPS, 2-4 short words, no legal entity terms, no
+    industry keywords.
+
+    Catches:  "COWIES HILL EURIKA", "FALCON PARK", "NEW GERMANY WEST"
+    Excludes: "PRODEC PAINTS CC" (has CC), "SPAR" (single word),
+              "MIKE'S PLUMBING" (industry term), names with > 4 words.
+    """
+    if not name:
+        return False
+    clean = re.sub(r"\s+", " ", name).strip()
+    if clean != clean.upper():
+        return False  # Mixed case → business name
+    words = re.findall(r"[A-Za-z]+", clean)
+    if len(words) < 2 or len(words) > 4:
+        return False  # Single word (SPAR/SHELL) or too long
+    if any(len(w) > 12 for w in words):
+        return False  # Long word suggests company name
+    if re.search(
+        r"\b(pty|ltd|limited|cc|inc|company|corp|co)\b",
+        clean,
+        re.IGNORECASE,
+    ):
+        return False  # Legal entity term present
+    if re.search(
+        r"\b(trading|plumb(?:ers?|ing)?|electric(?:al|ians?)?|paint(?:s|ing)?|"
+        r"hardware|services?|construction|tyres?|repairs?|auto|motor|store|"
+        r"shop|supplies|wholesale|engineering|contractors?)\b",
+        clean,
+        re.IGNORECASE,
+    ):
+        return False  # Industry term present
+    return True  # Looks like suburb/area names
+
+
 @dataclass(frozen=True)
 class VatCandidate:
     value: str

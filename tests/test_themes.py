@@ -2,6 +2,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.routers import themes as themes_router
 from app.routers.themes import router
 from app.services import themes as theme_service
 
@@ -200,10 +201,10 @@ def test_update_active_theme_endpoint_persists_preference(monkeypatch):
         },
         token_users={"valid-token": "user-1"},
     )
-    monkeypatch.setattr("app.routers.themes.supabase", supabase)
 
     app = FastAPI()
     app.include_router(router)
+    app.dependency_overrides[themes_router.authenticated_user] = lambda: ("user-1", supabase)
     client = TestClient(app)
 
     response = client.patch(
@@ -218,8 +219,6 @@ def test_update_active_theme_endpoint_persists_preference(monkeypatch):
 
 
 def test_update_active_theme_endpoint_requires_bearer_token(monkeypatch):
-    monkeypatch.setattr("app.routers.themes.supabase", _MemorySupabase({}))
-
     app = FastAPI()
     app.include_router(router)
     client = TestClient(app)

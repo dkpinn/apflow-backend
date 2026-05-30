@@ -14,6 +14,8 @@ from app.routers import themes
 from app.routers import consolidation
 from app.routers import webhooks
 from app.routers import channels
+from app.routers import admin_integrations
+from app.routers import integrations
 
 
 def _sweep_log(msg: str) -> None:
@@ -312,6 +314,8 @@ app.include_router(themes.router)
 app.include_router(consolidation.router)
 app.include_router(webhooks.router)
 app.include_router(channels.router)
+app.include_router(admin_integrations.router)
+app.include_router(integrations.router)
 
 
 @app.get("/")

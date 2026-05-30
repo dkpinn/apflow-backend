@@ -45,6 +45,8 @@ if "fastapi" not in sys.modules:
     fastapi_stub.APIRouter = APIRouter
     sys.modules["fastapi"] = fastapi_stub
 
+from fastapi import HTTPException
+
 if "app.services.invoice_extraction_service._helpers" not in sys.modules:
     helpers_mod = types.ModuleType("app.services.invoice_extraction_service._helpers")
 
@@ -65,7 +67,7 @@ if "app.services.invoice_extraction_service._helpers" not in sys.modules:
             None,
         )
         if not row:
-            raise fastapi_stub.HTTPException("Organisation not found")
+            raise ValueError("Organisation not found")
         row.update(updates)
         return get_organisation_extraction_settings(organisation_id)
 
@@ -202,7 +204,7 @@ class OrganisationSettingsAPITests(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             update_organisation_settings("org-456", payload)
 
-        self.assertEqual(str(ctx.exception), "No settings were provided to update")
+        self.assertEqual(getattr(ctx.exception, "detail", str(ctx.exception)), "No settings were provided to update")
 
     def test_update_organisation_settings_returns_404_for_missing_org(self):
         payload = UpdateOrganisationSettingsRequest(vlm_enabled=True)
@@ -210,7 +212,7 @@ class OrganisationSettingsAPITests(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             update_organisation_settings("org-missing", payload)
 
-        self.assertEqual(str(ctx.exception), "Organisation not found")
+        self.assertEqual(getattr(ctx.exception, "detail", str(ctx.exception)), "Organisation not found")
 
 
 if __name__ == "__main__":

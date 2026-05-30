@@ -71,6 +71,9 @@ KNOWN_SUPPLIER_COLUMNS = {
     "use_uom_from_description",
     "default_expense_account",
     "default_vat_rate",
+    "kyc_status",
+    "kyc_verified_at",
+    "kyc_verified_by",
 }
 
 
