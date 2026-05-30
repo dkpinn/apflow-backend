@@ -4,6 +4,34 @@ import re
 from typing import Optional
 
 
+MONTH_NAMES = (
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "jan",
+    "feb",
+    "mar",
+    "apr",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "sept",
+    "oct",
+    "nov",
+    "dec",
+)
+
+
 def normalise_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
@@ -31,6 +59,65 @@ def line_has_bank_context(line: str) -> bool:
     ]
 
     return any(term in lower for term in bank_terms)
+
+
+def is_date_like_supplier_candidate(line: str) -> bool:
+    clean = re.sub(r"\s+", " ", (line or "").strip())
+    lower = clean.lower().strip(" :;,.")
+    if not lower:
+        return False
+
+    month_pattern = "|".join(MONTH_NAMES)
+    if re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", lower):
+        return True
+    if re.fullmatch(r"\d{4}[/-]\d{1,2}[/-]\d{1,2}", lower):
+        return True
+    if re.fullmatch(rf"\d{{1,2}}(?:st|nd|rd|th)?\s+({month_pattern})\s+\d{{2,4}}", lower):
+        return True
+    if re.fullmatch(rf"({month_pattern})\s+\d{{1,2}}(?:st|nd|rd|th)?[,]?\s+\d{{2,4}}", lower):
+        return True
+    if re.fullmatch(rf"({month_pattern})\s+\d{{2,4}}", lower):
+        return True
+
+    words = re.findall(r"[A-Za-z]+|\d{2,4}", lower)
+    if not words:
+        return False
+    month_hits = sum(1 for word in words if word in MONTH_NAMES)
+    year_hits = sum(1 for word in words if re.fullmatch(r"20\d{2}|19\d{2}", word))
+    return month_hits > 0 and year_hits > 0 and len(words) <= 5
+
+
+def is_metadata_supplier_candidate(line: str) -> bool:
+    lower = re.sub(r"\s+", " ", (line or "").lower()).strip(" :;,.")
+    if not lower:
+        return True
+
+    metadata_exact = {
+        "invoice",
+        "tax invoice",
+        "date",
+        "invoice date",
+        "not registered for vat",
+        "registered for vat",
+        "vat",
+        "vat number",
+        "description",
+        "unit price",
+        "total",
+        "paid",
+        "banking details",
+    }
+    if lower in metadata_exact:
+        return True
+
+    metadata_patterns = [
+        r"\bnot\s+registered\s+for\s+vat\b",
+        r"\bregistered\s+for\s+vat\b",
+        r"\binvoice\s+(date|number|no)\b",
+        r"\bvat\s*(number|no|registration)?\b",
+        r"\b(qty|quantity|description|unit\s+price|subtotal|total)\b",
+    ]
+    return any(re.search(pattern, lower) for pattern in metadata_patterns)
 
 
 def is_valid_supplier_candidate(line: str) -> bool:
@@ -81,6 +168,9 @@ def is_valid_supplier_candidate(line: str) -> bool:
     if not clean:
         return False
 
+    if is_date_like_supplier_candidate(clean) or is_metadata_supplier_candidate(clean):
+        return False
+
     if lower in {"pty", "(pty)", "ltd", "limited", "(pty) ltd", "pty ltd"}:
         return False
 
@@ -124,6 +214,17 @@ def is_valid_supplier_candidate(line: str) -> bool:
         return False
 
     return True
+
+
+def _phone_digits(line: str) -> str:
+    return re.sub(r"\D+", "", line or "")
+
+
+def line_has_phone_number(line: str) -> bool:
+    digits = _phone_digits(line)
+    if len(digits) < 10 or len(digits) > 13:
+        return False
+    return digits.startswith("0") or digits.startswith("27")
 
 
 def looks_like_legal_entity(line: str) -> bool:
@@ -231,6 +332,50 @@ def extract_supplier_from_evetech_layout(text: str) -> Optional[str]:
     for line in lines[:15]:
         if re.search(r"\bEVETECH\b", line, re.IGNORECASE):
             return "EVETECH (Pty) Ltd"
+
+    return None
+
+
+def extract_supplier_from_phone_header(lines: list[str]) -> Optional[str]:
+    """
+    Small service invoices often print a business logo/name block followed by a
+    mobile number, with no explicit "Supplier" label.
+    """
+
+    for index, line in enumerate(lines[:35]):
+        if not line_has_phone_number(line):
+            continue
+
+        candidate_lines: list[str] = []
+        for candidate in reversed(lines[max(0, index - 5):index]):
+            cleaned = _clean_receipt_supplier_candidate(candidate)
+            lower = cleaned.lower().strip()
+            if not cleaned:
+                continue
+            if is_metadata_supplier_candidate(cleaned) or is_date_like_supplier_candidate(cleaned):
+                continue
+            if re.search(r"\b(customer|client|bill to|invoice to|banking details|cash bank|paid)\b", lower):
+                break
+            if is_valid_supplier_candidate(cleaned):
+                candidate_lines.insert(0, cleaned)
+            if len(candidate_lines) >= 3:
+                break
+
+        if not candidate_lines:
+            continue
+
+        business_lines = [
+            candidate
+            for candidate in candidate_lines
+            if looks_like_legal_entity(candidate)
+            or candidate.isupper()
+            or re.search(r"\b(plumbers?|plumbing|electric|electrical|repairs?|services?|construction|trading)\b", candidate, re.IGNORECASE)
+        ]
+        chosen = business_lines or candidate_lines
+        combined = " ".join(chosen[-3:])
+        combined = re.sub(r"\s+", " ", combined).strip(" -:,.")
+        if is_valid_supplier_candidate(combined):
+            return combined
 
     return None
 
@@ -367,17 +512,22 @@ def extract_supplier_name(text: str, layout_type: str = "unknown") -> Optional[s
     if supplier:
         return supplier
 
-    # 2. FROM / TO blocks
+    # 2. Phone-backed small service invoice header
+    supplier = extract_supplier_from_phone_header(lines)
+    if supplier:
+        return supplier
+
+    # 3. FROM / TO blocks
     supplier = extract_supplier_from_from_to_block(lines)
     if supplier:
         return supplier
 
-    # 3. Explicit supplier/vendor labels
+    # 4. Explicit supplier/vendor labels
     supplier = extract_supplier_after_label(lines)
     if supplier:
         return supplier
 
-    # 4. Top-header legal entity fallback
+    # 5. Top-header legal entity fallback
     supplier = extract_supplier_from_top_header(lines)
     if supplier:
         return supplier

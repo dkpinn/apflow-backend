@@ -53,6 +53,10 @@ class _MemoryQuery:
         self.filters.append((key, value))
         return self
 
+    def in_(self, key, values):
+        self.filters.append((key, set(values)))
+        return self
+
     def order(self, *_args, **_kwargs):
         return self
 
@@ -74,7 +78,10 @@ class _MemoryQuery:
         return self
 
     def _matches(self, row):
-        return all(row.get(key) == value for key, value in self.filters)
+        return all(
+            row.get(key) in value if isinstance(value, set) else row.get(key) == value
+            for key, value in self.filters
+        )
 
     def execute(self):
         rows = self.client.tables.setdefault(self.table_name, [])
@@ -208,6 +215,86 @@ def test_supplier_rule_applies_default_expense_account_to_invoice_and_lines():
     assert result["line_items"][0]["expense_account"] == "6000/Office"
 
 
+def test_supplier_allocation_rule_overrides_default_account_and_balances_split():
+    parsed = {
+        "supplier_name_extracted": "Example Supplier",
+        "document_type": "tax_invoice",
+        "total_amount": 100.0,
+        "line_items": [
+            {"description": "Gate repair top gate", "quantity": 1, "unit_price": 100.0, "line_total": 100.0},
+        ],
+    }
+
+    result = apply_supplier_processing_rules(
+        parsed,
+        {
+            "default_expense_account": "6000/Default",
+            "allocation_rules": [{
+                "id": "rule-1",
+                "name": "Gate repairs",
+                "active": True,
+                "priority": 10,
+                "document_scope": "invoice",
+                "match_type": "contains",
+                "match_field": "description",
+                "pattern": "gate repair",
+                "splits": [
+                    {"expense_account": "7100/Repairs", "tracking": {"dim-1": "top-gate"}, "percent": 60},
+                    {"expense_account": "7200/Maintenance", "tracking": {"dim-1": "shared"}, "percent": 40},
+                ],
+            }],
+        },
+    )
+
+    item = result["line_items"][0]
+    assert item["expense_account"] == "7100/Repairs"
+    assert item["tracking"] == {"dim-1": "top-gate"}
+    assert [split["amount"] for split in item["allocations"]] == [60.0, 40.0]
+    assert sum(split["amount"] for split in item["allocations"]) == 100.0
+
+
+def test_supplier_allocation_rule_respects_document_scope_and_priority():
+    parsed = {
+        "supplier_name_extracted": "Example Supplier",
+        "document_type": "credit_note",
+        "total_amount": -50.0,
+        "line_items": [
+            {"description": "Gate repair reversal", "line_total": -50.0},
+        ],
+    }
+
+    result = apply_supplier_processing_rules(
+        parsed,
+        {
+            "allocation_rules": [
+                {
+                    "id": "invoice-rule",
+                    "name": "Invoice repairs",
+                    "active": True,
+                    "priority": 1,
+                    "document_scope": "invoice",
+                    "match_type": "contains",
+                    "pattern": "gate",
+                    "splits": [{"expense_account": "6000/Wrong", "percent": 100}],
+                },
+                {
+                    "id": "credit-rule",
+                    "name": "Credit repairs",
+                    "active": True,
+                    "priority": 20,
+                    "document_scope": "credit_note",
+                    "match_type": "contains",
+                    "pattern": "gate",
+                    "splits": [{"expense_account": "7000/Credit", "percent": 100}],
+                },
+            ],
+        },
+    )
+
+    assert result["line_items"][0]["expense_account"] == "7000/Credit"
+    assert result["line_items"][0]["allocations"][0]["amount"] == 50.0
+
+
 def test_line_item_payload_persists_expense_account():
     payload = build_line_item_payload(
         invoice_extracted_id="invoice-1",
@@ -229,6 +316,19 @@ def test_line_item_allocation_validation_accepts_balanced_split():
         {
             "description": "Shared expense",
             "line_total": 150,
+            "allocations": [
+                {"expense_account": "6000", "tracking": {"cost_centre": "head-office"}, "amount": 100},
+                {"expense_account": "6000", "tracking": {"cost_centre": "finance"}, "amount": 50},
+            ],
+        },
+    ])
+
+
+def test_line_item_allocation_validation_accepts_credit_note_magnitude_split():
+    validate_line_item_allocations([
+        {
+            "description": "Credit reversal",
+            "line_total": -150,
             "allocations": [
                 {"expense_account": "6000", "tracking": {"cost_centre": "head-office"}, "amount": 100},
                 {"expense_account": "6000", "tracking": {"cost_centre": "finance"}, "amount": 50},

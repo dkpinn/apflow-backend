@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from app.db.supabase_client import get_supabase_client
 from app.services.audit_log import log_invoice_event
 from app.services.invoice_data_builders import utc_now_iso
+from app.services.invoice_readiness import evaluate_invoice_readiness
 from app.services.invoice_supplier_rules import reapply_supplier_rules_to_invoice
 from app.services.supplier_matcher import attempt_supplier_auto_link, find_name_match_suggestion
 
@@ -347,5 +348,17 @@ def _link_supplier_to_invoice(
             )
         except Exception as exc:
             linked["rules_apply_error"] = str(exc)
+
+    if invoice_extracted_id:
+        try:
+            linked["readiness"] = evaluate_invoice_readiness(
+                supabase,
+                invoice_extracted_id=invoice_extracted_id,
+                organisation_id=organisation_id,
+                reason="Supplier linked or created.",
+                actor_type="api",
+            )
+        except Exception as exc:
+            linked["readiness_error"] = str(exc)
 
     return linked

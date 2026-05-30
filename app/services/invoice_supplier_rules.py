@@ -164,13 +164,14 @@ def _normalise_rule_splits(rule: dict) -> list[dict]:
 
 
 def _allocation_amounts(line_total: float, splits: list[dict]) -> list[float]:
+    allocation_total = abs(line_total)
     amounts: list[float] = []
     running = 0.0
     for index, split in enumerate(splits):
         if index == len(splits) - 1:
-            amount = round(line_total - running, 2)
+            amount = round(allocation_total - running, 2)
         else:
-            amount = round(line_total * (float(split.get("percent") or 0) / 100), 2)
+            amount = round(allocation_total * (float(split.get("percent") or 0) / 100), 2)
             running = round(running + amount, 2)
         amounts.append(amount)
     return amounts
@@ -201,7 +202,6 @@ def _apply_allocation_rule_to_line(item: dict, rule: dict) -> dict:
                 "sort_order": index,
             }
             for index, split in enumerate(splits)
-            if amounts[index] >= 0
         ]
 
     updated["pricing_notes"] = {

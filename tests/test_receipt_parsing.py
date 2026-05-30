@@ -3,7 +3,11 @@ from app.services.invoice_extraction.contact_parser import (
     extract_supplier_telephone,
 )
 from app.services.invoice_extraction.entity_detection import classify_document_direction
-from app.services.invoice_extraction.supplier_parser import extract_supplier_from_receipt_text
+from app.services.invoice_extraction.supplier_parser import (
+    extract_supplier_from_receipt_text,
+    extract_supplier_name,
+    is_valid_supplier_candidate,
+)
 from app.services.invoice_extraction.template_cleanups import apply_template_cleanups
 from app.services.invoice_ocr_pipeline import parse_invoice_fields
 
@@ -78,6 +82,30 @@ def test_builders_receipt_cleanup_clears_cash_customer_code_and_unprinted_fields
 def test_unlabelled_telephone_is_not_copied_to_cell():
     assert extract_supplier_telephone(BUILDERS_RECEIPT_TEXT) == "0860994195"
     assert extract_supplier_cell(BUILDERS_RECEIPT_TEXT) is None
+
+
+def test_date_and_vat_status_are_not_valid_supplier_candidates():
+    assert is_valid_supplier_candidate("4 January 2025") is False
+    assert is_valid_supplier_candidate("04/01/2025") is False
+    assert is_valid_supplier_candidate("2025-01-04") is False
+    assert is_valid_supplier_candidate("Not registered for VAT") is False
+
+
+def test_service_invoice_supplier_recovers_phone_backed_header():
+    text = """
+    INVOICE
+    4 January 2025
+    Not registered for VAT
+    PJPOTGIETER
+    PJ PLUMBERS
+    084 399 5249
+    Patric.
+    Vinos bakery and take away.
+    Call to assist with a leak in wall.
+    TOTAL R750.00
+    """
+
+    assert extract_supplier_name(text) == "PJPOTGIETER PJ PLUMBERS"
 
 
 def test_missing_receipt_number_falls_back_to_document_date_time():

@@ -1,18 +1,16 @@
 -- ============================================================
 -- WhatsApp Pending Selections — RLS Hardening Phase B33
--- Enables Row Level Security and adds explicit deny-by-default
--- policies for authenticated and anon roles.
--- The backend accesses this table exclusively via service_role,
--- which bypasses RLS automatically — no permissive policies needed.
+-- Idempotent upgrade for databases where B28 ran before RLS was
+-- added at creation time.  Fresh installs have these controls
+-- applied by B28 already; the ALTER TABLE statements are safe to
+-- repeat and the DROP/CREATE ensures policies are current.
 -- ============================================================
 
 alter table public.whatsapp_pending_selections enable row level security;
-
--- Force RLS even for the table owner so no role can accidentally
--- bypass these controls without the service_role privilege.
 alter table public.whatsapp_pending_selections force row level security;
 
--- Deny all operations for authenticated users.
+drop policy if exists "whatsapp_pending_selections: deny authenticated"
+  on public.whatsapp_pending_selections;
 create policy "whatsapp_pending_selections: deny authenticated"
   on public.whatsapp_pending_selections
   as restrictive
@@ -20,7 +18,8 @@ create policy "whatsapp_pending_selections: deny authenticated"
   using (false)
   with check (false);
 
--- Deny all operations for anonymous users.
+drop policy if exists "whatsapp_pending_selections: deny anon"
+  on public.whatsapp_pending_selections;
 create policy "whatsapp_pending_selections: deny anon"
   on public.whatsapp_pending_selections
   as restrictive

@@ -503,7 +503,7 @@ def _allocation_suggestions(line_items: list[dict]) -> list[AgentSuggestion]:
                 confidence=0.9,
                 target={"tab": "line_items", "line_item_id": item.get("id"), "section": "split"},
             ))
-        elif abs(allocation_total - line_total) > 0.02:
+        elif abs(allocation_total - abs(line_total)) > 0.02:
             suggestions.append(AgentSuggestion(
                 category="allocation_splits",
                 severity="critical",

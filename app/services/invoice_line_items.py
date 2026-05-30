@@ -142,8 +142,9 @@ def validate_line_item_allocations(line_items: list[dict], *, tolerance: float =
         if line_total is None:
             raise ValueError(f"Line {index + 1} has allocations but no line total.")
 
+        expected_total = abs(line_total)
         allocation_total = round(sum(float(allocation["amount"]) for allocation in allocations), 2)
-        if abs(allocation_total - line_total) > tolerance:
+        if abs(allocation_total - expected_total) > tolerance:
             raise ValueError(
                 f"Line {index + 1} allocations total {allocation_total:.2f}, "
                 f"but line total is {line_total:.2f}."

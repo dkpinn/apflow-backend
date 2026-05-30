@@ -16,6 +16,10 @@ from fastapi import HTTPException
 from app.db.supabase_client import get_supabase_client
 from app.services.audit_log import log_invoice_event
 from app.services.invoice_extraction.entity_detection import classify_document_direction
+from app.services.invoice_extraction.supplier_parser import (
+    extract_supplier_name,
+    is_valid_supplier_candidate,
+)
 from app.services.invoice_extraction.vlm_parser import VLM_MERGE_FIELDS, extract_with_gemini
 from app.services.invoice_line_items import build_line_item_diagnostics, replace_invoice_line_items
 from app.services.invoice_ocr_pipeline import calculate_confidence
@@ -25,6 +29,7 @@ from app.services.invoice_parse_attempts import (
     fetch_parse_attempts,
     persist_parse_attempts,
 )
+from app.services.invoice_readiness import evaluate_invoice_readiness
 from app.services.invoice_supplier_rules import (
     apply_supplier_processing_rules,
     fetch_supplier_processing_settings,
@@ -235,6 +240,41 @@ def run_invoice_re_extraction(
         ):
             parsed_data["supplier_name_extracted"] = direction_result.issuer_name
 
+        rejected_supplier_candidate = None
+        current_supplier_name = parsed_data.get("supplier_name_extracted")
+        if current_supplier_name and not is_valid_supplier_candidate(str(current_supplier_name)):
+            rejected_supplier_candidate = current_supplier_name
+            recovered_supplier_name = extract_supplier_name(deep_text)
+            if recovered_supplier_name and is_valid_supplier_candidate(recovered_supplier_name):
+                parsed_data["supplier_name_extracted"] = recovered_supplier_name
+            else:
+                parsed_data["supplier_name_extracted"] = None
+                parsed_data["validation_status"] = "needs_review"
+                rejection_note = (
+                    f"Rejected supplier candidate '{rejected_supplier_candidate}' because it looked like "
+                    "a date or document metadata. Manual supplier review is required."
+                )
+                parsed_data["validation_notes"] = (
+                    (parsed_data.get("validation_notes") + " " if parsed_data.get("validation_notes") else "")
+                    + rejection_note
+                )
+                parsed_data["supplier_candidate_rejected"] = True
+
+            log_invoice_event(
+                supabase,
+                organisation_id=org_id,
+                invoice_raw_id=invoice_raw_id,
+                invoice_extracted_id=extracted_invoice_id,
+                job_id=job_id,
+                event_type="supplier_candidate_rejected",
+                stage="entity_validation",
+                actor_type="api",
+                field_name="supplier_name_extracted",
+                old_value={"supplier_name_extracted": rejected_supplier_candidate},
+                new_value={"supplier_name_extracted": parsed_data.get("supplier_name_extracted")},
+                notes="Rejected supplier candidate because it looked like a date or document metadata.",
+            )
+
         vat_guard_result = clear_organisation_vat_from_supplier(parsed_data, organisation)
         if vat_guard_result:
             log_invoice_event(
@@ -252,7 +292,11 @@ def run_invoice_re_extraction(
                 notes=vat_guard_result.get("note"),
             )
 
-        missing_supplier_failure = apply_missing_supplier_failure(parsed_data)
+        missing_supplier_failure = (
+            False
+            if parsed_data.get("supplier_candidate_rejected")
+            else apply_missing_supplier_failure(parsed_data)
+        )
         if missing_supplier_failure:
             log_invoice_event(
                 supabase,
@@ -440,6 +484,15 @@ def run_invoice_re_extraction(
             notes="Deep region OCR re-extraction completed.",
         )
 
+        readiness_result = evaluate_invoice_readiness(
+            supabase,
+            invoice_extracted_id=extracted_invoice_id,
+            organisation_id=org_id,
+            reason="Re-extraction completed.",
+            actor_type="api",
+            job_id=job_id,
+        )
+
         response = {
             "success": True,
             "mode": "deep_region_ocr",
@@ -450,7 +503,8 @@ def run_invoice_re_extraction(
             "fields_unchanged": unchanged_fields,
             "line_items_replaced": line_items_replaced,
             **line_item_diagnostics,
-            "needs_review": True,
+            "needs_review": not readiness_result.get("ready"),
+            "readiness": readiness_result,
             "ocr_confidence": deep_result.get("ocr_confidence"),
             **parse_attempt_result,
             "regions_attempted": deep_result.get("regions_attempted") or [],

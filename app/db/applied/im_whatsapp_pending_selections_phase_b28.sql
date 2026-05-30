@@ -26,8 +26,24 @@ create unique index if not exists whatsapp_pending_phone_idx
 create index if not exists whatsapp_pending_expires_idx
   on public.whatsapp_pending_selections(expires_at);
 
--- No RLS: this table is managed entirely by the backend service role.
--- It contains no sensitive user data beyond the phone number and the
--- Meta media_id (which expires shortly after being issued by Meta).
+-- Enable RLS immediately so no window exists between creation and hardening.
+-- The backend accesses this table exclusively via service_role, which bypasses
+-- RLS automatically — no permissive policies are needed.
+alter table public.whatsapp_pending_selections enable row level security;
+alter table public.whatsapp_pending_selections force row level security;
+
+create policy "whatsapp_pending_selections: deny authenticated"
+  on public.whatsapp_pending_selections
+  as restrictive
+  to authenticated
+  using (false)
+  with check (false);
+
+create policy "whatsapp_pending_selections: deny anon"
+  on public.whatsapp_pending_selections
+  as restrictive
+  to anon
+  using (false)
+  with check (false);
 
 select 'im_whatsapp_pending_selections_phase_b28_applied' as migration_note;

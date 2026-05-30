@@ -13,7 +13,11 @@ from app.dependencies import authenticated_user
 from app.routers.organisations import ExtractionStrategy
 from app.db.supabase_client import get_supabase_client
 from app.services.audit_log import log_invoice_event
-from app.services.invoice_supplier_rules import reapply_supplier_rules_to_invoice
+from app.services.invoice_readiness import evaluate_invoice_readiness
+from app.services.invoice_supplier_rules import (
+    fetch_supplier_processing_settings,
+    reapply_supplier_rules_to_invoice,
+)
 from app.services.invoice_parse_attempts import fetch_parse_attempts, persist_parse_attempts
 from app.services.invoice_line_items import replace_invoice_line_items
 from app.services.invoice_review_agent import (
@@ -874,7 +878,19 @@ def apply_agent_suggestion(
         new_value=safe_payload,
         notes=(payload.note if payload else None) or suggestion.get("message"),
     )
-    return {"success": True, "suggestion": updated}
+
+    readiness = None
+    if suggestion.get("invoice_extracted_id"):
+        readiness = evaluate_invoice_readiness(
+            supabase,
+            invoice_extracted_id=suggestion["invoice_extracted_id"],
+            organisation_id=suggestion.get("organisation_id"),
+            reason="Agent suggestion applied.",
+            actor_type="user",
+            actor_user_id=user_id,
+        )
+
+    return {"success": True, "suggestion": updated, "readiness": readiness}
 
 
 @router.post("/agent-suggestions/{suggestion_id}/dismiss")
@@ -1229,6 +1245,14 @@ def save_invoice_line_items(req: SaveLineItemsRequest):
 
     supabase.table("invoices_extracted").update(patch).eq("id", req.invoice_extracted_id).execute()
 
+    readiness = evaluate_invoice_readiness(
+        supabase,
+        invoice_extracted_id=req.invoice_extracted_id,
+        organisation_id=req.organisation_id,
+        reason="Line items saved.",
+        actor_type="api",
+    )
+
     return {
         "subtotal": subtotal,
         "tax_amount": computed_vat,
@@ -1236,6 +1260,7 @@ def save_invoice_line_items(req: SaveLineItemsRequest):
         "rounding_applied": rounding_applied,
         "needs_review": needs_review,
         "diagnostics": diagnostics,
+        "readiness": readiness,
     }
 
 
@@ -1273,7 +1298,15 @@ def reapply_supplier_rules_endpoint(req: ReapplyRulesRequest):
     if not rules_applied.get("skipped"):
         _recompute_invoice_totals(supabase, req.invoice_extracted_id, invoice)
 
-    return {"success": True, "rules_applied": rules_applied}
+    readiness = evaluate_invoice_readiness(
+        supabase,
+        invoice_extracted_id=req.invoice_extracted_id,
+        organisation_id=req.organisation_id,
+        reason="Supplier rules re-applied.",
+        actor_type="user",
+    )
+
+    return {"success": True, "rules_applied": rules_applied, "readiness": readiness}
 
 
 def _recompute_invoice_totals(supabase_client, invoice_extracted_id: str, invoice: dict) -> None:

@@ -25,6 +25,9 @@ _EXTRACTION_PROMPT = (
     "Extract all invoice and receipt fields from this financial document. "
     "Return all dates in YYYY-MM-DD format. "
     "Return all monetary amounts as plain numbers (no currency symbols, no commas). "
+    "supplier_name_extracted must be the invoice issuer/vendor: the business that supplied the goods or services. "
+    "Never use the invoice date, due date, VAT status, customer name, address, invoice label, or other document metadata as the supplier. "
+    "If the supplier is unclear, set supplier_name_extracted to null instead of guessing. "
     "If the document uses commas as a decimal separator (e.g. South African format '1 234,56'), "
     "convert to a decimal point. "
     "For line_items: extract EVERY individual product or service line visible in the document. "
@@ -67,7 +70,13 @@ class _VLMLineItem(BaseModel):
 
 
 class _VLMInvoiceSchema(BaseModel):
-    supplier_name_extracted: Optional[str] = Field(None, description="Legal or trading name of the invoice issuer/vendor")
+    supplier_name_extracted: Optional[str] = Field(
+        None,
+        description=(
+            "Legal or trading name of the invoice issuer/vendor only. "
+            "Must not be a date, VAT status, invoice label, customer name, address, or document metadata."
+        ),
+    )
     invoice_number: Optional[str] = Field(None, description="Invoice or tax invoice reference number")
     invoice_date: Optional[str] = Field(None, description="Invoice date in YYYY-MM-DD format")
     due_date: Optional[str] = Field(None, description="Payment due date in YYYY-MM-DD format")

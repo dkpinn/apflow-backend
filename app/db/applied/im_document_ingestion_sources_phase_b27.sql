@@ -32,11 +32,12 @@ create or replace function public.assign_org_inbound_email()
 returns trigger
 language plpgsql
 security definer
+set search_path = ''
 as $$
 begin
   if new.inbound_email is null then
     new.inbound_email :=
-      'inv-' || substring(replace(new.id::text, '-', '') from 1 for 12) || '@mail.apflow.com';
+      'inv-' || pg_catalog.substring(pg_catalog.replace(new.id::text, '-', '') from 1 for 12) || '@mail.apflow.com';
   end if;
   return new;
 end;

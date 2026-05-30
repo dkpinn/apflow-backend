@@ -25,6 +25,10 @@ from app.services.invoice_extraction.entity_detection import (
     name_matches_org,
     normalise_name,
 )
+from app.services.invoice_extraction.supplier_parser import (
+    extract_supplier_name,
+    is_valid_supplier_candidate,
+)
 from app.services.invoice_extraction.vlm_parser import VLM_MERGE_FIELDS, extract_with_gemini
 from app.services.invoice_line_items import replace_invoice_line_items
 from app.services.invoice_ocr_pipeline import (
@@ -38,6 +42,7 @@ from app.services.invoice_parse_attempts import (
     persist_parse_attempts,
 )
 from app.services.invoice_previews import persist_preview_artifacts
+from app.services.invoice_readiness import evaluate_invoice_readiness
 from app.services.invoice_supplier_rules import (
     apply_supplier_processing_rules,
     fetch_supplier_processing_settings,
@@ -374,6 +379,31 @@ def run_invoice_extraction(
                 "Supplier corrected to issuer because selected organisation appears to be the recipient."
             )
 
+        rejected_supplier_candidate = None
+        current_supplier_name = parsed_data.get("supplier_name_extracted")
+        if current_supplier_name and not is_valid_supplier_candidate(str(current_supplier_name)):
+            rejected_supplier_candidate = current_supplier_name
+            recovered_supplier_name = extract_supplier_name(text)
+            if recovered_supplier_name and is_valid_supplier_candidate(recovered_supplier_name):
+                parsed_data["supplier_name_extracted"] = recovered_supplier_name
+                supplier_correction_reason = (
+                    "Supplier candidate looked like a date or document metadata. "
+                    "Supplier recovered from the document header."
+                )
+            else:
+                parsed_data["supplier_name_extracted"] = None
+                if parsed_data.get("validation_status") != MISSING_SUPPLIER_VALIDATION_STATUS:
+                    parsed_data["validation_status"] = "needs_review"
+                rejection_note = (
+                    f"Rejected supplier candidate '{rejected_supplier_candidate}' because it looked like "
+                    "a date or document metadata. Manual supplier review is required."
+                )
+                parsed_data["validation_notes"] = (
+                    (parsed_data.get("validation_notes") + " " if parsed_data.get("validation_notes") else "")
+                    + rejection_note
+                )
+                parsed_data["supplier_candidate_rejected"] = True
+
         if direction_result.confidence_adjustment:
             parsed_data["confidence_score"] = round(
                 max(0.0, min(1.0, (parsed_data.get("confidence_score") or 0) + direction_result.confidence_adjustment)),
@@ -396,7 +426,11 @@ def run_invoice_extraction(
                 notes=vat_guard_result.get("note"),
             )
 
-        missing_supplier_failure = apply_missing_supplier_failure(parsed_data)
+        missing_supplier_failure = (
+            False
+            if parsed_data.get("supplier_candidate_rejected")
+            else apply_missing_supplier_failure(parsed_data)
+        )
 
         log_invoice_event(
             supabase,
@@ -435,6 +469,21 @@ def run_invoice_extraction(
                     "document_direction": direction_result.document_direction,
                 },
                 notes=supplier_correction_reason,
+            )
+
+        if rejected_supplier_candidate:
+            log_invoice_event(
+                supabase,
+                organisation_id=org_id,
+                invoice_raw_id=invoice_raw_id,
+                job_id=job_id,
+                event_type="supplier_candidate_rejected",
+                stage="entity_validation",
+                actor_type="worker" if job_id else "api",
+                field_name="supplier_name_extracted",
+                old_value={"supplier_name_extracted": rejected_supplier_candidate},
+                new_value={"supplier_name_extracted": parsed_data.get("supplier_name_extracted")},
+                notes="Rejected supplier candidate because it looked like a date or document metadata.",
             )
 
         if missing_supplier_failure:
@@ -750,6 +799,7 @@ def run_invoice_extraction(
         parsed_data=parsed_data,
     )
 
+    readiness_result = None
     if extracted_invoice_id:
         if job_id:
             mark_job_stage(supabase, job_id=job_id, stage="save_parse_attempts")
@@ -779,6 +829,15 @@ def run_invoice_extraction(
             actor_type="worker" if job_id else "api",
             new_value=parse_attempt_result,
             notes=parse_attempt_result.get("parse_attempts_insert_error"),
+        )
+
+        readiness_result = evaluate_invoice_readiness(
+            supabase,
+            invoice_extracted_id=extracted_invoice_id,
+            organisation_id=org_id,
+            reason="Extraction completed.",
+            actor_type="worker" if job_id else "api",
+            job_id=job_id,
         )
 
     _doc_count = parsed_data.get("document_count") or 1
@@ -821,6 +880,7 @@ def run_invoice_extraction(
         "processed_preview_path": preview_result.get("processed_preview_path"),
         "parse_attempts": parse_attempts,
         **parse_attempt_result,
+        "readiness": readiness_result,
         "text_preview": text[:2000],
         "supplier_name": parsed_data.get("supplier_name_extracted"),
         "extracted_supplier_profile": build_extracted_supplier_profile(parsed_data),

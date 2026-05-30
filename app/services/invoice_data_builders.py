@@ -292,6 +292,10 @@ def _valid_reextract_value(field_name: str, value) -> bool:
     if field_name == "supplier_name_extracted":
         clean = str(value).strip()
         lower = clean.lower()
+        from app.services.invoice_extraction.supplier_parser import is_valid_supplier_candidate  # noqa: PLC0415
+
+        if not is_valid_supplier_candidate(clean):
+            return False
         if lower in {"copy", "original", "customer copy", "copy of original", "tax invoice", "welcome", "welcame", "welkom"}:
             return False
         if "copy of original" in lower or "customer copy" in lower:
