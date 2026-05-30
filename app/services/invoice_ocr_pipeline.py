@@ -8,6 +8,13 @@ import fitz  # PyMuPDF
 import os
 import pytesseract
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
 # Do not hardcode a Windows-only Tesseract path.
 # Set TESSERACT_CMD in local Windows development if needed, e.g.
 # C:\Program Files\Tesseract-OCR\tesseract.exe. On Linux/Render,
@@ -78,6 +85,63 @@ from app.services.invoice_extraction.contact_parser import (
     extract_supplier_website,
     extract_vat_number,
 )
+
+
+def _safe_error_message(exc: Exception, *, limit: int = 500) -> str:
+    return str(exc).strip()[:limit] or exc.__class__.__name__
+
+
+def _ocr_error_payload(exc: Exception, *, operation: str, psm: str | None = None) -> dict:
+    payload = {
+        "engine": "tesseract",
+        "command": getattr(pytesseract.pytesseract, "tesseract_cmd", "tesseract"),
+        "operation": operation,
+        "error_type": exc.__class__.__name__,
+        "message": _safe_error_message(exc),
+    }
+    if psm is not None:
+        payload["psm"] = psm
+    return payload
+
+
+def _dedupe_ocr_errors(errors: list[dict], *, limit: int = 12) -> list[dict]:
+    seen: set[tuple[str, str, str, str]] = set()
+    deduped: list[dict] = []
+    for error in errors:
+        key = (
+            str(error.get("engine") or ""),
+            str(error.get("operation") or ""),
+            str(error.get("error_type") or ""),
+            str(error.get("message") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(error)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def get_ocr_dependency_status() -> dict:
+    """Return Tesseract availability details for audit/diagnostics."""
+    command = getattr(pytesseract.pytesseract, "tesseract_cmd", "tesseract")
+    try:
+        version = pytesseract.get_tesseract_version()
+        return {
+            "engine": "tesseract",
+            "command": command,
+            "available": True,
+            "version": str(version),
+        }
+    except Exception as exc:
+        return {
+            "engine": "tesseract",
+            "command": command,
+            "available": False,
+            "error_type": exc.__class__.__name__,
+            "message": _safe_error_message(exc),
+        }
 
 from app.services.invoice_extraction.line_item_parser import extract_line_items
 from app.services.invoice_extraction.template_cleanups import apply_template_cleanups
@@ -311,9 +375,11 @@ def _ocr_image_region(image: Image.Image, *, region_name: str, psms: list[str] |
     psms = psms or ["6", "4", "11", "3"]
     quality = analyse_image_quality(image)
     best: dict | None = None
+    all_errors: list[dict] = []
 
     for psm in psms:
         config = f"--oem 3 --psm {psm}"
+        candidate_errors: list[dict] = []
         try:
             data = pytesseract.image_to_data(
                 image,
@@ -327,14 +393,17 @@ def _ocr_image_region(image: Image.Image, *, region_name: str, psms: list[str] |
                 if part and part.strip()
             ).strip()
             confidence = _ocr_confidence_from_data(data)
-        except Exception:
+        except Exception as data_exc:
+            candidate_errors.append(_ocr_error_payload(data_exc, operation="image_to_data", psm=psm))
             try:
                 text = pytesseract.image_to_string(image, config=config, timeout=OCR_TESSERACT_TIMEOUT).strip()
                 confidence = None
-            except Exception:
+            except Exception as string_exc:
+                candidate_errors.append(_ocr_error_payload(string_exc, operation="image_to_string", psm=psm))
                 text = ""
                 confidence = None
 
+        all_errors.extend(candidate_errors)
         score = _score_ocr_candidate(
             text=text,
             ocr_confidence=confidence,
@@ -349,9 +418,14 @@ def _ocr_image_region(image: Image.Image, *, region_name: str, psms: list[str] |
             "ocr_candidate_score": score,
             "receipt_indicator_score": _receipt_indicator_score(text),
             "ocr_noise_score": _ocr_noise_score(text),
+            "ocr_errors": _dedupe_ocr_errors(candidate_errors),
         }
         if best is None or candidate["ocr_candidate_score"] > best["ocr_candidate_score"]:
             best = candidate
+
+    if best is not None:
+        best["ocr_errors"] = _dedupe_ocr_errors(best.get("ocr_errors") or all_errors)
+        return best
 
     return best or {
         "region": region_name,
@@ -362,6 +436,7 @@ def _ocr_image_region(image: Image.Image, *, region_name: str, psms: list[str] |
         "ocr_candidate_score": 0.0,
         "receipt_indicator_score": 0.0,
         "ocr_noise_score": 0.0,
+        "ocr_errors": _dedupe_ocr_errors(all_errors),
     }
 
 
@@ -408,6 +483,11 @@ def _ocr_receipt_regions(processed_image: Image.Image) -> dict:
         "text_length": len(combined),
         "regions": region_results,
         "regions_attempted": [region["region"] for region in region_results],
+        "ocr_errors": _dedupe_ocr_errors([
+            error
+            for region in region_results
+            for error in (region.get("ocr_errors") or [])
+        ]),
         "confidence_by_region": {
             region["region"]: region.get("ocr_confidence")
             for region in region_results
@@ -470,6 +550,11 @@ def _ocr_deep_document_regions(processed_image: Image.Image) -> dict:
         "text_length": len(combined),
         "regions": region_results,
         "regions_attempted": [region["region"] for region in region_results],
+        "ocr_errors": _dedupe_ocr_errors([
+            error
+            for region in region_results
+            for error in (region.get("ocr_errors") or [])
+        ]),
         "confidence_by_region": {
             region["region"]: region.get("ocr_confidence")
             for region in region_results
@@ -500,6 +585,7 @@ def _ocr_full_page_supplier_regions(image: Image.Image) -> dict:
             "regions": [],
             "regions_attempted": [],
             "confidence_by_region": {},
+            "ocr_errors": [],
         }
 
     def crop(name: str, x1_ratio: float, y1_ratio: float, x2_ratio: float, y2_ratio: float) -> tuple[str, Image.Image]:
@@ -531,6 +617,11 @@ def _ocr_full_page_supplier_regions(image: Image.Image) -> dict:
         "text_length": len(combined),
         "regions": region_results,
         "regions_attempted": [region["region"] for region in region_results],
+        "ocr_errors": _dedupe_ocr_errors([
+            error
+            for region in region_results
+            for error in (region.get("ocr_errors") or [])
+        ]),
         "confidence_by_region": {
             region["region"]: region.get("ocr_confidence")
             for region in region_results
@@ -640,6 +731,8 @@ def deep_extract_text_with_regions(file_bytes: bytes, file_type: Optional[str] =
         "regions_attempted": region_ocr.get("regions_attempted") or [],
         "confidence_by_region": region_ocr.get("confidence_by_region") or {},
         "region_ocr": region_ocr,
+        "ocr_dependency": get_ocr_dependency_status(),
+        "ocr_errors": region_ocr.get("ocr_errors") or [],
         "parsed_data": parsed,
         "preprocessing_notes": receipt_preprocessing.preprocessing_notes + [
             "deep_region_ocr_applied",
@@ -721,6 +814,10 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
         "receipt_preprocessing_quality": receipt_preprocessing.image_quality,
         "original_preview_image": preview_images.original_preview,
         "processed_preview_image": preview_images.processed_preview,
+        "ocr_errors": _dedupe_ocr_errors(
+            (receipt_region_ocr.get("ocr_errors") or [])
+            + (supplier_recovery_ocr.get("ocr_errors") or [])
+        ),
     }
 
     for variant_name, processed_image in variants:
@@ -728,6 +825,7 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
 
         for psm in ["6", "4", "11", "3"]:
             config = f"--oem 3 --psm {psm}"
+            candidate_errors: list[dict] = []
             try:
                 data = pytesseract.image_to_data(
                     processed_image,
@@ -741,11 +839,13 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
                     if part and part.strip()
                 ).strip()
                 confidence = _ocr_confidence_from_data(data)
-            except Exception:
+            except Exception as data_exc:
+                candidate_errors.append(_ocr_error_payload(data_exc, operation="image_to_data", psm=psm))
                 try:
                     text = pytesseract.image_to_string(processed_image, config=config, timeout=OCR_TESSERACT_TIMEOUT).strip()
                     confidence = None
-                except Exception:
+                except Exception as string_exc:
+                    candidate_errors.append(_ocr_error_payload(string_exc, operation="image_to_string", psm=psm))
                     text = ""
                     confidence = None
 
@@ -789,6 +889,7 @@ def ocr_image_detailed(image: Image.Image, page_number: int = 1, page_count: int
                 "receipt_preprocessing_quality": receipt_preprocessing.image_quality,
                 "original_preview_image": preview_images.original_preview,
                 "processed_preview_image": preview_images.processed_preview,
+                "ocr_errors": _dedupe_ocr_errors(candidate_errors),
             }
 
             if candidate["ocr_candidate_score"] > best["ocr_candidate_score"]:
@@ -884,6 +985,7 @@ def extract_text_with_fallback(file_bytes: bytes, file_type: Optional[str] = Non
     except Exception:
         images = [Image.open(io.BytesIO(file_bytes))]
 
+    ocr_dependency = get_ocr_dependency_status()
     page_count = len(images) or 1
     ocr_pages: list[dict] = []
 
@@ -894,6 +996,15 @@ def extract_text_with_fallback(file_bytes: bytes, file_type: Optional[str] = Non
     avg_ocr_confidence = _average([page.get("ocr_confidence") for page in ocr_pages])
     avg_image_quality = _average([page.get("image_quality_score") for page in ocr_pages])
     notes = sorted({note for page in ocr_pages for note in (page.get("quality_notes") or [])})
+    ocr_errors = _dedupe_ocr_errors([
+        error
+        for page in ocr_pages
+        for error in (
+            (page.get("ocr_errors") or [])
+            + ((page.get("receipt_region_ocr") or {}).get("ocr_errors") or [])
+            + ((page.get("supplier_recovery_ocr") or {}).get("ocr_errors") or [])
+        )
+    ])
 
     return {
         "method": "ocr",
@@ -904,6 +1015,8 @@ def extract_text_with_fallback(file_bytes: bytes, file_type: Optional[str] = Non
         "ocr_confidence": avg_ocr_confidence,
         "image_quality_score": avg_image_quality,
         "quality_notes": notes,
+        "ocr_dependency": ocr_dependency,
+        "ocr_errors": ocr_errors,
     }
 
 # ------------------------------------------------------------

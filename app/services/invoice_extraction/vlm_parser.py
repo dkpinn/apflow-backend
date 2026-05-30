@@ -7,6 +7,13 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
 # Read at call-time (inside function) so hot-reloads and test overrides work.
 # VLM_TIMEOUT_SECONDS caps how long we wait for the Gemini network round-trip.
 VLM_TIMEOUT_SECONDS = int(os.getenv("VLM_TIMEOUT_SECONDS", "45"))
@@ -255,35 +262,85 @@ def extract_with_gemini(
     or None when GOOGLE_API_KEY is absent, google-genai is not installed, the call
     times out, or any other error occurs. Always safe to call — never raises.
     """
+    return extract_with_gemini_diagnostic(file_bytes, mime_type).get("data")
+
+
+def extract_with_gemini_diagnostic(
+    file_bytes: bytes,
+    mime_type: Optional[str] = None,
+) -> dict:
+    """
+    Extract invoice fields via Gemini and return failure diagnostics.
+
+    The legacy extract_with_gemini wrapper still returns only parsed data or
+    None, while the pipeline can use this function to write specific audit
+    reasons when VLM fallback was needed but could not complete.
+    """
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        return None
+        return {
+            "data": None,
+            "reason": "missing_google_api_key",
+            "error": "GOOGLE_API_KEY is not configured for Gemini VLM fallback.",
+        }
 
     try:
-        from google import genai  # noqa: F401 — check import before spawning thread
+        from google import genai  # noqa: F401
     except ImportError:
-        print("VLM EXTRACTION SKIPPED: install google-genai to enable Gemini fallback")
-        return None
+        return {
+            "data": None,
+            "reason": "missing_google_genai_package",
+            "error": "Install google-genai to enable Gemini VLM fallback.",
+        }
 
     effective_mime = (mime_type or "application/pdf").lower()
+    conversion_warning = None
     if "pdf" in effective_mime:
         effective_mime = "application/pdf"
     elif effective_mime not in _SUPPORTED_MIME_TYPES:
         try:
             file_bytes = _to_png_bytes(file_bytes)
             effective_mime = "image/png"
-        except Exception:
+        except Exception as conversion_exc:
+            conversion_warning = str(conversion_exc)[:500]
             effective_mime = "application/pdf"
 
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_call_gemini, file_bytes, effective_mime)
             try:
-                return future.result(timeout=VLM_TIMEOUT_SECONDS)
+                data = future.result(timeout=VLM_TIMEOUT_SECONDS)
             except FuturesTimeoutError:
-                print(f"VLM EXTRACTION TIMEOUT: Gemini did not respond within {VLM_TIMEOUT_SECONDS}s")
                 future.cancel()
-                return None
+                return {
+                    "data": None,
+                    "reason": "timeout",
+                    "error": f"Gemini did not respond within {VLM_TIMEOUT_SECONDS}s.",
+                    "mime_type": effective_mime,
+                }
     except Exception as exc:
-        print(f"VLM EXTRACTION FAILED: {exc}")
-        return None
+        return {
+            "data": None,
+            "reason": "api_error",
+            "error_type": exc.__class__.__name__,
+            "error": str(exc)[:1000],
+            "mime_type": effective_mime,
+        }
+
+    if data is None:
+        return {
+            "data": None,
+            "reason": "empty_response",
+            "error": "Gemini fallback returned no structured extraction data.",
+            "mime_type": effective_mime,
+        }
+
+    result = {
+        "data": data,
+        "reason": None,
+        "error": None,
+        "mime_type": effective_mime,
+    }
+    if conversion_warning:
+        result["conversion_warning"] = conversion_warning
+    return result

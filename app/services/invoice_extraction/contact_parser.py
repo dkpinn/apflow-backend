@@ -3,6 +3,14 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+from app.services.invoice_extraction.extraction_rules import (
+    address_contains_metadata,
+    extract_vat_candidates,
+    is_address_stop_line,
+    is_recipient_block_label,
+    is_valid_supplier_address_line,
+)
+
 
 def normalise_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
@@ -94,11 +102,14 @@ def extract_supplier_cell(text: str) -> Optional[str]:
 
 
 def extract_vat_number(text: str) -> Optional[str]:
-    patterns = [
-        r"(?:Tax\s+Registration|VAT\s+Registration|VAT\s+Reg\.?|VAT\s+Reg\s+No\.?|VAT\s+No\.?|VAT\s+Number|VAT)\s*(?:No\.?|Number)?\s*[:#\-]?\s*([0-9]{7,15})",
-    ]
+    candidates = extract_vat_candidates(normalise_lines(text))
+    if not candidates:
+        return None
 
-    return extract_first_match(text, patterns)
+    best = candidates[0]
+    if best.score < 0:
+        return None
+    return best.value
 
 
 def extract_customer_code(text: str) -> Optional[str]:
@@ -172,34 +183,6 @@ def extract_supplier_delivery_address(text: str) -> Optional[str]:
     ):
         return None
 
-    stop_terms = [
-        "p o box",
-        "po box",
-        "p.o box",
-        "postnet",
-        "tel:",
-        "tel",
-        "telephone:",
-        "telephone",
-        "fax:",
-        "fax",
-        "e-mail:",
-        "e-mail",
-        "e mail",
-        "email:",
-        "email",
-        "website:",
-        "website",
-        "tax registration:",
-        "tax registration",
-        "reg number:",
-        "reg number",
-        "tax invoice",
-        "vat:",
-        "vat",
-        "computer generated",
-    ]
-
     start_index = 1
     for index, line in enumerate(lines[:12]):
         if re.search(r"\b(build\s*it|builders|pinetown)\b", line, re.IGNORECASE):
@@ -209,24 +192,18 @@ def extract_supplier_delivery_address(text: str) -> Optional[str]:
     address_lines: list[str] = []
 
     for line in lines[start_index:start_index + 8]:
-        lower = line.lower()
-
-        if any(term in lower for term in stop_terms):
+        if is_address_stop_line(line) or is_recipient_block_label(line):
             break
 
-        if len(line) > 90:
-            continue
-
-        # Ignore obvious contact/metadata lines
-        if "@" in line or "www." in lower:
-            continue
-
-        if re.match(r"^[\W_]{2,}", line.strip()):
+        if not is_valid_supplier_address_line(line):
             continue
 
         address_lines.append(line)
 
-    return "\n".join(address_lines).strip() if address_lines else None
+    address = "\n".join(address_lines).strip()
+    if not address or address_contains_metadata(address):
+        return None
+    return address
 
 
 def extract_supplier_postal_address(text: str) -> Optional[str]:

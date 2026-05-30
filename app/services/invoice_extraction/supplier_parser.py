@@ -3,6 +3,13 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+from app.services.invoice_extraction.extraction_rules import (
+    has_supplier_evidence,
+    is_document_metadata_value,
+    is_recipient_block_label,
+    looks_like_address_value,
+)
+
 
 MONTH_NAMES = (
     "january",
@@ -39,26 +46,26 @@ def normalise_lines(text: str) -> list[str]:
 def line_has_bank_context(line: str) -> bool:
     lower = line.lower()
 
-    bank_terms = [
-        "bank",
-        "branch",
-        "sort code",
-        "routing",
-        "account number",
-        "acc no",
-        "iban",
-        "swift",
-        "bic",
-        "nedbank",
-        "standard bank",
-        "absa",
-        "fnb",
-        "first national bank",
-        "capitec",
-        "investec",
+    bank_patterns = [
+        r"\bbank\b",
+        r"\bbranch\b",
+        r"\bsort code\b",
+        r"\brouting\b",
+        r"\baccount number\b",
+        r"\bacc no\b",
+        r"\biban\b",
+        r"\bswift\b",
+        r"\bbic\b",
+        r"\bnedbank\b",
+        r"\bstandard bank\b",
+        r"\babsa\b",
+        r"\bfnb\b",
+        r"\bfirst national bank\b",
+        r"\bcapitec\b",
+        r"\binvestec\b",
     ]
 
-    return any(term in lower for term in bank_terms)
+    return any(re.search(pattern, lower) for pattern in bank_patterns)
 
 
 def is_date_like_supplier_candidate(line: str) -> bool:
@@ -168,7 +175,13 @@ def is_valid_supplier_candidate(line: str) -> bool:
     if not clean:
         return False
 
-    if is_date_like_supplier_candidate(clean) or is_metadata_supplier_candidate(clean):
+    if (
+        is_date_like_supplier_candidate(clean)
+        or is_metadata_supplier_candidate(clean)
+        or is_document_metadata_value(clean)
+        or looks_like_address_value(clean)
+        or is_recipient_block_label(clean)
+    ):
         return False
 
     if lower in {"pty", "(pty)", "ltd", "limited", "(pty) ltd", "pty ltd"}:
@@ -345,6 +358,8 @@ def extract_supplier_from_phone_header(lines: list[str]) -> Optional[str]:
     for index, line in enumerate(lines[:35]):
         if not line_has_phone_number(line):
             continue
+        if any(is_recipient_block_label(candidate) for candidate in lines[max(0, index - 8):index + 1]):
+            continue
 
         candidate_lines: list[str] = []
         for candidate in reversed(lines[max(0, index - 5):index]):
@@ -354,7 +369,10 @@ def extract_supplier_from_phone_header(lines: list[str]) -> Optional[str]:
                 continue
             if is_metadata_supplier_candidate(cleaned) or is_date_like_supplier_candidate(cleaned):
                 continue
-            if re.search(r"\b(customer|client|bill to|invoice to|banking details|cash bank|paid)\b", lower):
+            if (
+                is_recipient_block_label(cleaned)
+                or re.search(r"\b(customer|client|bill to|invoice to|deliver to|delivery to|ship to|banking details|cash bank|paid)\b", lower)
+            ):
                 break
             if is_valid_supplier_candidate(cleaned):
                 candidate_lines.insert(0, cleaned)
@@ -392,6 +410,9 @@ def extract_supplier_from_from_to_block(lines: list[str]) -> Optional[str]:
     for index, line in enumerate(lines[:80]):
         normalised = line.strip().lower()
 
+        if is_recipient_block_label(line):
+            continue
+
         if normalised == "from":
             next_lines = [candidate.strip() for candidate in lines[index + 1:index + 12] if candidate.strip()]
         elif re.fullmatch(r"from\s+to", normalised, re.IGNORECASE):
@@ -402,11 +423,12 @@ def extract_supplier_from_from_to_block(lines: list[str]) -> Optional[str]:
         if next_lines and next_lines[0].lower() == "to":
             next_lines = next_lines[1:]
 
-        valid_candidates = [
-            candidate
-            for candidate in next_lines
-            if is_valid_supplier_candidate(candidate)
-        ]
+        valid_candidates = []
+        for candidate in next_lines:
+            if is_recipient_block_label(candidate):
+                break
+            if is_valid_supplier_candidate(candidate):
+                valid_candidates.append(candidate)
 
         for candidate in valid_candidates:
             if looks_like_legal_entity(candidate):
@@ -432,6 +454,8 @@ def extract_supplier_after_label(lines: list[str]) -> Optional[str]:
 
     for index, line in enumerate(lines[:80]):
         lower = line.lower().strip()
+        if is_recipient_block_label(line):
+            continue
 
         same_line_match = re.match(
             r"^(from|supplier|vendor|seller)\s*:\s*(.+)$",
@@ -449,6 +473,8 @@ def extract_supplier_after_label(lines: list[str]) -> Optional[str]:
 
             for candidate in lines[index + 1:index + 10]:
                 candidate = candidate.strip()
+                if is_recipient_block_label(candidate):
+                    break
 
                 if is_valid_supplier_candidate(candidate):
                     lookahead_candidates.append(candidate)
@@ -475,6 +501,8 @@ def extract_supplier_from_top_header(lines: list[str]) -> Optional[str]:
         "sales rep",
         "bill to",
         "ship to",
+        "deliver to",
+        "delivery to",
         "customer",
         "client",
         "to",
@@ -485,7 +513,9 @@ def extract_supplier_from_top_header(lines: list[str]) -> Optional[str]:
 
         # If the document enters a clear customer block, do not scan below it
         # unless no supplier was found above.
-        if any(term == lower or lower.startswith(term + ":") for term in stop_customer_block_terms):
+        if is_recipient_block_label(line) or any(term == lower or lower.startswith(term + ":") for term in stop_customer_block_terms):
+            break
+        if candidates and re.search(r"\b(tax invoice|invoice number|invoice date|date|page)\b", lower):
             break
 
         if not is_valid_supplier_candidate(line):
@@ -493,6 +523,8 @@ def extract_supplier_from_top_header(lines: list[str]) -> Optional[str]:
 
         if looks_like_legal_entity(line):
             candidates.insert(0, line)
+        elif has_supplier_evidence("\n".join(lines[index:index + 5])):
+            candidates.append(line)
         else:
             candidates.append(line)
 

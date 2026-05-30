@@ -29,7 +29,10 @@ from app.services.invoice_extraction.supplier_parser import (
     extract_supplier_name,
     is_valid_supplier_candidate,
 )
-from app.services.invoice_extraction.vlm_parser import VLM_MERGE_FIELDS, extract_with_gemini
+from app.services.invoice_extraction.vlm_parser import (
+    VLM_MERGE_FIELDS,
+    extract_with_gemini_diagnostic,
+)
 from app.services.invoice_line_items import replace_invoice_line_items
 from app.services.invoice_ocr_pipeline import (
     calculate_confidence,
@@ -73,6 +76,30 @@ try:
     supabase = get_supabase_client()
 except Exception:
     supabase = None  # type: ignore[assignment]
+
+
+def _ocr_dependency_issue(text_result: dict) -> str | None:
+    dependency = text_result.get("ocr_dependency") or {}
+    if dependency.get("available") is False:
+        message = dependency.get("message") or "Tesseract OCR is unavailable."
+        command = dependency.get("command") or "tesseract"
+        return f"OCR engine unavailable ({command}): {message}"
+
+    errors = text_result.get("ocr_errors") or []
+    if errors and not (text_result.get("text") or "").strip():
+        first = errors[0]
+        message = first.get("message") or "OCR failed before any text could be extracted."
+        return f"OCR engine failed: {message}"
+
+    return None
+
+
+def _append_validation_note(existing: str | None, note: str) -> str:
+    if not existing:
+        return note
+    if note in existing:
+        return existing
+    return f"{existing} {note}"
 
 
 def run_invoice_extraction(
@@ -180,6 +207,7 @@ def run_invoice_extraction(
                         "confidence_by_region": receipt_region_ocr.get("confidence_by_region") or {},
                         "combined_text_length": receipt_region_ocr.get("text_length") or 0,
                         "selected_strategy": receipt_region_ocr.get("strategy"),
+                        "ocr_errors": receipt_region_ocr.get("ocr_errors") or [],
                     },
                     notes="Receipt OCR completed using header, middle, bottom and full processed regions.",
                 )
@@ -200,8 +228,28 @@ def run_invoice_extraction(
                 "ocr_confidence": text_result.get("ocr_confidence"),
                 "image_quality_score": text_result.get("image_quality_score"),
                 "quality_notes": text_result.get("quality_notes") or [],
+                "ocr_dependency": text_result.get("ocr_dependency"),
+                "ocr_errors": text_result.get("ocr_errors") or [],
             },
         )
+
+        ocr_dependency_issue = _ocr_dependency_issue(text_result)
+        if ocr_dependency_issue:
+            log_invoice_event(
+                supabase,
+                organisation_id=org_id,
+                invoice_raw_id=invoice_raw_id,
+                job_id=job_id,
+                event_type="ocr_dependency_unavailable",
+                stage="text_extraction",
+                actor_type="worker" if job_id else "api",
+                new_value={
+                    "ocr_dependency": text_result.get("ocr_dependency"),
+                    "ocr_errors": text_result.get("ocr_errors") or [],
+                    "text_length": len(text or ""),
+                },
+                notes=ocr_dependency_issue,
+            )
 
         if job_id:
             mark_job_stage(supabase, job_id=job_id, stage="field_extraction")
@@ -211,6 +259,12 @@ def run_invoice_extraction(
         vlm_enabled = organisation_settings.get("vlm_enabled", False)
 
         parsed_data = parse_invoice_fields(text)
+        if ocr_dependency_issue:
+            parsed_data["validation_status"] = "needs_review"
+            parsed_data["validation_notes"] = _append_validation_note(
+                parsed_data.get("validation_notes"),
+                ocr_dependency_issue,
+            )
 
         page_count = text_result.get("page_count") or 1
         page_numbers = list(range(1, page_count + 1))
@@ -241,19 +295,26 @@ def run_invoice_extraction(
         organisation = get_organisation(org_id)
 
         force_vlm = strategy == "vlm" and vlm_enabled
+        parsed_supplier_candidate = parsed_data.get("supplier_name_extracted")
+        supplier_candidate_invalid = bool(
+            parsed_supplier_candidate
+            and not is_valid_supplier_candidate(str(parsed_supplier_candidate))
+        )
         vlm_should_try = (
             force_vlm
             or parsed_data.get("confidence_score", 0) < 0.70
             or not parsed_data.get("invoice_number")
             or not parsed_data.get("total_amount")
             or not parsed_data.get("supplier_name_extracted")
+            or supplier_candidate_invalid
             # If OCR extracted the org's own name as the supplier, force VLM — Gemini
             # has image context to correctly identify the invoice issuer/vendor.
             or name_matches_org(parsed_data.get("supplier_name_extracted"), organisation)
         )
 
         if vlm_should_try:
-            vlm_data = extract_with_gemini(file_bytes, raw.get("file_type"))
+            vlm_result = extract_with_gemini_diagnostic(file_bytes, raw.get("file_type"))
+            vlm_data = vlm_result.get("data")
             if vlm_data is not None:
                 vlm_confidence = vlm_data.get("confidence_score", 0)
                 tesseract_confidence = parsed_data.get("confidence_score", 0)
@@ -302,8 +363,12 @@ def run_invoice_extraction(
                         "missing_supplier": not bool(parsed_data.get("supplier_name_extracted")),
                         "missing_invoice_number": not bool(parsed_data.get("invoice_number")),
                         "missing_total": not bool(parsed_data.get("total_amount")),
+                        "vlm_failure_reason": vlm_result.get("reason"),
+                        "vlm_error": vlm_result.get("error"),
+                        "vlm_error_type": vlm_result.get("error_type"),
+                        "mime_type": vlm_result.get("mime_type"),
                     },
-                    notes="VLM fallback was needed (low confidence or missing fields) but extract_with_gemini returned None. Check GOOGLE_API_KEY and Gemini availability.",
+                    notes=f"VLM fallback was needed but could not complete: {vlm_result.get('reason') or 'unknown_error'}.",
                 )
 
         supplier_recovery_result = {"applied": False, "fields": []}
@@ -332,6 +397,12 @@ def run_invoice_extraction(
         parsed_data["organisation_match_status"] = direction_result.organisation_match_status
         parsed_data["validation_status"] = direction_result.validation_status
         parsed_data["validation_notes"] = direction_result.validation_notes
+        if ocr_dependency_issue:
+            parsed_data["validation_status"] = "needs_review"
+            parsed_data["validation_notes"] = _append_validation_note(
+                parsed_data.get("validation_notes"),
+                ocr_dependency_issue,
+            )
 
         original_supplier_name = parsed_data.get("supplier_name_extracted")
         supplier_correction_reason = None

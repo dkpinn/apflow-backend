@@ -20,7 +20,10 @@ from app.services.invoice_extraction.supplier_parser import (
     extract_supplier_name,
     is_valid_supplier_candidate,
 )
-from app.services.invoice_extraction.vlm_parser import VLM_MERGE_FIELDS, extract_with_gemini
+from app.services.invoice_extraction.vlm_parser import (
+    VLM_MERGE_FIELDS,
+    extract_with_gemini_diagnostic,
+)
 from app.services.invoice_line_items import build_line_item_diagnostics, replace_invoice_line_items
 from app.services.invoice_ocr_pipeline import calculate_confidence
 from app.services.invoice_parse_attempts import (
@@ -55,6 +58,22 @@ try:
     supabase = get_supabase_client()
 except Exception:
     supabase = None  # type: ignore[assignment]
+
+
+def _deep_ocr_dependency_issue(deep_result: dict) -> str | None:
+    dependency = deep_result.get("ocr_dependency") or {}
+    if dependency.get("available") is False:
+        message = dependency.get("message") or "Tesseract OCR is unavailable."
+        command = dependency.get("command") or "tesseract"
+        return f"OCR engine unavailable ({command}): {message}"
+
+    errors = deep_result.get("ocr_errors") or []
+    if errors and not (deep_result.get("text") or "").strip():
+        first = errors[0]
+        message = first.get("message") or "OCR failed before any text could be extracted."
+        return f"OCR engine failed: {message}"
+
+    return None
 
 
 def run_invoice_re_extraction(
@@ -174,21 +193,46 @@ def run_invoice_re_extraction(
         if deep_error or not deep_result:
             raise HTTPException(status_code=400, detail=f"Deep re-extraction failed: {deep_error}")
 
+        deep_ocr_dependency_issue = _deep_ocr_dependency_issue(deep_result)
+        if deep_ocr_dependency_issue:
+            log_invoice_event(
+                supabase,
+                organisation_id=org_id,
+                invoice_raw_id=invoice_raw_id,
+                invoice_extracted_id=extracted_invoice_id,
+                event_type="ocr_dependency_unavailable",
+                stage="ocr",
+                actor_type="api",
+                new_value={
+                    "ocr_dependency": deep_result.get("ocr_dependency"),
+                    "ocr_errors": deep_result.get("ocr_errors") or [],
+                    "text_length": len(deep_result.get("text") or ""),
+                },
+                notes=deep_ocr_dependency_issue,
+            )
+
         if job_id:
             update_reextract_job(job_id, status="running", stage="parsing_invoice_fields")
 
         parsed_data = deep_result.get("parsed_data") or {}
         deep_text = deep_result.get("text") or ""
 
+        parsed_supplier_candidate = parsed_data.get("supplier_name_extracted")
+        supplier_candidate_invalid = bool(
+            parsed_supplier_candidate
+            and not is_valid_supplier_candidate(str(parsed_supplier_candidate))
+        )
         vlm_should_try = (
             parsed_data.get("confidence_score", 0) < 0.70
             or not parsed_data.get("invoice_number")
             or not parsed_data.get("total_amount")
             or not parsed_data.get("supplier_name_extracted")
+            or supplier_candidate_invalid
         )
 
         if vlm_should_try:
-            vlm_data = extract_with_gemini(file_bytes, raw.get("file_type"))
+            vlm_result = extract_with_gemini_diagnostic(file_bytes, raw.get("file_type"))
+            vlm_data = vlm_result.get("data")
             print("RE-EXTRACT VLM RAW RESULT:", vlm_data)
             if vlm_data is not None:
                 vlm_confidence = vlm_data.get("confidence_score", 0)
@@ -223,6 +267,27 @@ def run_invoice_re_extraction(
                     },
                     notes=f"Gemini VLM fallback merged during re-extract. VLM confidence={vlm_confidence:.2f}, deep OCR confidence={tesseract_confidence:.2f}.",
                 )
+            else:
+                log_invoice_event(
+                    supabase,
+                    organisation_id=org_id,
+                    invoice_raw_id=invoice_raw_id,
+                    invoice_extracted_id=extracted_invoice_id,
+                    event_type="vlm_skipped",
+                    stage="field_extraction",
+                    actor_type="api",
+                    new_value={
+                        "deep_ocr_confidence": parsed_data.get("confidence_score", 0),
+                        "missing_supplier": not bool(parsed_data.get("supplier_name_extracted")),
+                        "missing_invoice_number": not bool(parsed_data.get("invoice_number")),
+                        "missing_total": not bool(parsed_data.get("total_amount")),
+                        "vlm_failure_reason": vlm_result.get("reason"),
+                        "vlm_error": vlm_result.get("error"),
+                        "vlm_error_type": vlm_result.get("error_type"),
+                        "mime_type": vlm_result.get("mime_type"),
+                    },
+                    notes=f"VLM fallback was needed during re-extract but could not complete: {vlm_result.get('reason') or 'unknown_error'}.",
+                )
 
         organisation = get_organisation(org_id)
         direction_result = classify_document_direction(deep_text, organisation)
@@ -232,6 +297,13 @@ def run_invoice_re_extraction(
         parsed_data["organisation_match_status"] = direction_result.organisation_match_status
         parsed_data["validation_status"] = direction_result.validation_status
         parsed_data["validation_notes"] = direction_result.validation_notes
+        if deep_ocr_dependency_issue:
+            parsed_data["validation_status"] = "needs_review"
+            existing_notes = parsed_data.get("validation_notes")
+            if existing_notes and deep_ocr_dependency_issue not in existing_notes:
+                parsed_data["validation_notes"] = f"{existing_notes} {deep_ocr_dependency_issue}"
+            else:
+                parsed_data["validation_notes"] = existing_notes or deep_ocr_dependency_issue
 
         if (
             direction_result.document_direction == "supplier_invoice_payable"
