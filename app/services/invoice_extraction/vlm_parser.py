@@ -34,6 +34,9 @@ _EXTRACTION_PROMPT = (
     "Return all monetary amounts as plain numbers (no currency symbols, no commas). "
     "supplier_name_extracted must be the invoice issuer/vendor: the business that supplied the goods or services. "
     "Never use the invoice date, due date, VAT status, customer name, address, invoice label, or other document metadata as the supplier. "
+    "When an invoice shows a 'Deliver To', 'Bill To', 'Sold To', 'Customer', or 'Recipient' block alongside the supplier's header or logo, "
+    "the supplier is the business in the top header/logo area — NOT the entity in the delivery or billing block. "
+    "The 'Deliver To' or 'Bill To' block is always the customer (buyer) and is never the supplier. "
     "If the supplier is unclear, set supplier_name_extracted to null instead of guessing. "
     "If the document uses commas as a decimal separator (e.g. South African format '1 234,56'), "
     "convert to a decimal point. "
@@ -43,10 +46,27 @@ _EXTRACTION_PROMPT = (
     "If a discount percentage or amount is printed, put it in discount_percent or discount_amount. "
     "When discount evidence exists, line_total is the printed net/extended amount after discount, not unit_price times quantity. "
     "line_total must be the printed net/extended line amount after discount, excluding VAT when the document labels it as ex-VAT. "
+    "IMPORTANT: when a receipt or till slip shows a 'Total' column value on the line item row AND also has a separate "
+    "'Exclusive Total' or 'Ex VAT' summary row below the item table, use the value from the line item's own Total column "
+    "as line_total — do NOT use the summary subtotal row. "
+    "Extract the VAT amount from the 'Vat Total', 'Tax Total', or 'VAT' summary row and place it in tax_amount. "
+    "IMPORTANT: 'Total Items' on a receipt is the COUNT of line items purchased (e.g. 'Total Items: 1.00' means 1 item), "
+    "NOT a currency amount. Never use a 'Total Items' value as tax_amount, subtotal, or any monetary field. "
     "VAT / tax is applied at the invoice level, not per line — do not include tax in unit_price or line_total. "
+    "For till slips and POS receipts, use the receipt number, sale number, or transaction number as invoice_number. "
+    "If the only candidate for invoice_number is the date, time, or a timestamp, set invoice_number to null instead. "
     "Each line item should include the item description, quantity, unit price, discounted unit price/discount if printed, line total, "
     "and the item/product code or SKU if printed. "
-    "Even if the image is dark or low contrast, do your best to read each line. "
+    "Even if the image is dark, low contrast, or taken at an angle, do your best to read every field accurately. "
+    "For South African documents: "
+    "Phone numbers are 10 digits starting with 0 (e.g. 031 464 6175). "
+    "Never confuse digits 3 and 8, or 0 and 8 — read each digit exactly as printed. "
+    "Dates on till slips are printed day-first: DD/MM/YYYY or DD-MM-YYYY. "
+    "Do not reorder dates to YYYY/MM/DD or MM/DD/YYYY. "
+    "VAT registration numbers are exactly 10 digits starting with 4 (e.g. 4920141654). "
+    "Invoice and receipt numbers may contain letters and digits (e.g. k1T214675, INV-00123) — extract them exactly as printed. "
+    "Company names on logos may use decorative or stylized fonts — read the complete full name carefully, "
+    "including the legal entity suffix (CC, Pty Ltd, etc.) if visible. "
     "Set confidence_score to your confidence that the extraction is accurate and complete "
     "(1.0 = highly confident, 0.0 = unable to extract). "
     "Set document_type to one of: "
@@ -72,7 +92,7 @@ class _VLMLineItem(BaseModel):
     discount_percent: Optional[float] = Field(None, description="Discount percentage for this line, if printed")
     discounted_unit_price: Optional[float] = Field(None, description="Printed discounted/net unit price, such as Disc Price or Nett Price")
     pricing_basis: Optional[str] = Field(None, description="How the line total was derived: unit_price, discount_amount, discount_percent, discounted_unit_price, or extended_price")
-    pricing_notes: dict = Field(default_factory=dict, description="Small pricing evidence notes")
+    pricing_notes: Optional[str] = Field(None, description="Small pricing evidence notes")
     line_total: Optional[float] = Field(None, description="Printed net/extended line total after discount, excluding tax when labelled ex-VAT")
     code: Optional[str] = Field(None, description="Product code, SKU, or barcode printed on the line")
 

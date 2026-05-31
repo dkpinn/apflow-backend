@@ -59,6 +59,7 @@ if "app.services.invoice_extraction_service._helpers" not in sys.modules:
             "extraction_strategy": row.get("extraction_strategy") if row else "auto_group",
             "ask_per_upload": bool(row.get("ask_per_upload")) if row else False,
             "vlm_enabled": bool(row.get("vlm_enabled")) if row else False,
+            "supplier_auto_link_min_matches": int(row.get("supplier_auto_link_min_matches", 2)) if row else 2,
         }
 
     def update_organisation_extraction_settings(organisation_id: str, updates: dict):
@@ -155,6 +156,7 @@ class OrganisationSettingsAPITests(unittest.TestCase):
             "extraction_strategy": "auto_group",
             "ask_per_upload": False,
             "vlm_enabled": False,
+            "supplier_auto_link_min_matches": 2,
         })
 
     def test_get_organisation_settings_returns_existing_values(self):
@@ -164,6 +166,7 @@ class OrganisationSettingsAPITests(unittest.TestCase):
                 "extraction_strategy": "vlm",
                 "ask_per_upload": True,
                 "vlm_enabled": True,
+                "supplier_auto_link_min_matches": 3,
             }
         ]
 
@@ -173,6 +176,7 @@ class OrganisationSettingsAPITests(unittest.TestCase):
             "extraction_strategy": "vlm",
             "ask_per_upload": True,
             "vlm_enabled": True,
+            "supplier_auto_link_min_matches": 3,
         })
 
     def test_update_organisation_settings_updates_values(self):
@@ -182,12 +186,14 @@ class OrganisationSettingsAPITests(unittest.TestCase):
                 "extraction_strategy": "auto_group",
                 "ask_per_upload": False,
                 "vlm_enabled": False,
+                "supplier_auto_link_min_matches": 2,
             }
         ]
 
         payload = UpdateOrganisationSettingsRequest(
             extraction_strategy="vlm",
             ask_per_upload=True,
+            supplier_auto_link_min_matches=4,
         )
 
         result = update_organisation_settings("org-456", payload)
@@ -196,7 +202,12 @@ class OrganisationSettingsAPITests(unittest.TestCase):
             "extraction_strategy": "vlm",
             "ask_per_upload": True,
             "vlm_enabled": False,
+            "supplier_auto_link_min_matches": 4,
         })
+
+    def test_update_organisation_settings_rejects_invalid_supplier_auto_link_threshold(self):
+        with self.assertRaises(Exception):
+            UpdateOrganisationSettingsRequest(supplier_auto_link_min_matches=5)
 
     def test_update_organisation_settings_rejects_empty_payload(self):
         payload = UpdateOrganisationSettingsRequest()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -96,6 +97,19 @@ def analyse_invoice_layout(text: str) -> InvoiceLayout:
         return InvoiceLayout(
             layout_type="receipt",
             confidence=0.70,
+            reasons=reasons,
+        )
+
+    # Code/Description/Qty/Total table (PostNet, copy shops, service receipts)
+    if (
+        re.search(r"\b(?:code|item\s*code|stock\s*code)\b", lower_text)
+        and re.search(r"\bdescription\b", lower_text)
+        and re.search(r"\bqty\b", lower_text)
+    ):
+        reasons.append("Detected Code/Description/Qty table headers.")
+        return InvoiceLayout(
+            layout_type="row_table",
+            confidence=0.65,
             reasons=reasons,
         )
 

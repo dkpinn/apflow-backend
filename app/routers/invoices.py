@@ -1190,9 +1190,21 @@ def save_invoice_line_items(req: SaveLineItemsRequest):
     # 2. Subtotal from line items
     subtotal = round(sum(float(it.get("line_total") or 0) for it in req.line_items), 2)
 
-    # 3. Computed VAT and total
+    # 3. Fetch document-extracted tax_amount — this is the source-of-truth from VLM/OCR
+    # and must NOT be overwritten by a re-calculation from line items.
+    existing_inv = (
+        supabase.table("invoices_extracted")
+        .select("tax_amount")
+        .eq("id", req.invoice_extracted_id)
+        .single()
+        .execute()
+    )
+    existing_tax = round(float((existing_inv.data or {}).get("tax_amount") or 0), 2)
+
+    # computed_vat is used only for rounding/reconciliation logic below; it is
+    # never written back to invoices_extracted.tax_amount.
     computed_vat = round(subtotal * vat_rate, 2)
-    computed_total = round(subtotal + computed_vat, 2)
+    computed_total = round(subtotal + existing_tax, 2)
 
     # 4. Hybrid rounding adjustment vs original document total
     rounding_applied = None
@@ -1203,15 +1215,13 @@ def save_invoice_line_items(req: SaveLineItemsRequest):
         diff = round(req.document_total - computed_total, 2)
         abs_diff = abs(diff)
         if 0 < abs_diff <= 0.02:
-            # Absorb silently into VAT (floating-point drift)
-            computed_vat = round(computed_vat + diff, 2)
-            computed_total = round(subtotal + computed_vat, 2)
+            # Absorb silently — floating-point drift, total_amount already close enough
             rounding_applied = "vat_adjusted"
         elif abs_diff <= 0.50:
             # Named rounding line item for visible penny differences
             final_line_items.append({"description": "Rounding adjustment", "line_total": diff})
             subtotal = round(subtotal + diff, 2)
-            computed_total = round(subtotal + computed_vat, 2)
+            computed_total = round(subtotal + existing_tax, 2)
             rounding_applied = "line_item_added"
         elif abs_diff > 0.50:
             # Too large to auto-fix — flag for human review
@@ -1234,10 +1244,11 @@ def save_invoice_line_items(req: SaveLineItemsRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to save line items: {exc}")
 
-    # 6. Update invoices_extracted with derived totals
+    # 6. Update invoices_extracted with derived totals.
+    # tax_amount is intentionally excluded — it is the document-extracted value
+    # (set by VLM/OCR) and must only change on re-extraction, not on line item saves.
     patch: dict = {
         "subtotal": subtotal,
-        "tax_amount": computed_vat,
         "total_amount": computed_total,
     }
     if needs_review:
@@ -1255,7 +1266,7 @@ def save_invoice_line_items(req: SaveLineItemsRequest):
 
     return {
         "subtotal": subtotal,
-        "tax_amount": computed_vat,
+        "tax_amount": existing_tax,
         "total_amount": computed_total,
         "rounding_applied": rounding_applied,
         "needs_review": needs_review,

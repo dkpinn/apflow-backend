@@ -134,15 +134,18 @@ def test_supplier_rule_defaults_preserve_extracted_line_items():
     assert result["invoice_patch"] == {}
 
 
-def test_supplier_auto_link_uses_exact_identifiers_not_name_only():
+def test_supplier_auto_link_requires_configured_match_count():
     supabase = _SupplierClient([
         {
             "id": "supplier-1",
             "supplier_name": "Example Supplier",
+            "trading_name": "Example Trading",
             "vat_number": "411 111 1111",
             "company_registration_number": "REG-1",
             "account_number": "ACC-1",
             "bank_account_number": "123-456",
+            "phone": "031 555 0101",
+            "default_email": "accounts@example.test",
         },
     ])
 
@@ -156,6 +159,13 @@ def test_supplier_auto_link_uses_exact_identifiers_not_name_only():
         supabase,
         org_id="org-1",
         supplier_name_extracted="Different Name",
+        vat_number_extracted="4111111111",
+    ) is None
+
+    assert attempt_supplier_auto_link(
+        supabase,
+        org_id="org-1",
+        supplier_name_extracted="Example Supplier",
         vat_number_extracted="4111111111",
     ) == "supplier-1"
 

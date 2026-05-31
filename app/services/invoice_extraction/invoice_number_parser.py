@@ -125,7 +125,7 @@ def extract_invoice_number(text: str) -> Optional[str]:
 
     # Same-line labels
     label_patterns = [
-        r"(?:Invoice\s*(?:Number|No\.?|#)?|Tax\s*Invoice\s*(?:Number|No\.?|#)?|Document\s*(?:Number|No\.?)|Doc\s*(?:Number|No\.?)|Receipt\s*(?:Number|No\.?))\s*[:#\-]\s*([^\s]{2,40})",
+        r"(?:Invoice\s*(?:Number|No\.?|#)?|Tax\s*Invoice\s*(?:Number|No\.?|#)?|Document\s*(?:Number|No\.?)|Doc\s*(?:Number|No\.?)|Receipt\s*(?:Number|No\.?))\s*(?:[:#\-]\s*)?([^\s]{2,40})",
         r"\b(INV[-\s]?\d{2,}[A-Z0-9\-\/]*)\b",
         r"\b(INA\d{2,}[A-Z0-9\-\/]*)\b",
         r"\b(IN\d{2,}[A-Z0-9\-\/]*)\b",

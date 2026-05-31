@@ -36,6 +36,19 @@ BAD_ENTITY_TERMS = {
     "win a voucher",
     "terms and conditions",
     "valid for 5 days",
+    # Bank names — should never be extracted as a supplier
+    "standard bank",
+    "nedbank",
+    "absa",
+    "fnb",
+    "first national bank",
+    "capitec",
+    "capitec bank",
+    "investec",
+    "wesbank",
+    "african bank",
+    "tymebank",
+    "discovery bank",
 }
 
 SURVEY_NOISE_TERMS = [
@@ -49,6 +62,15 @@ SURVEY_NOISE_TERMS = [
 KNOWN_RECEIPT_ISSUER_PATTERNS = [
     (re.compile(r"\bbuilders\b", re.IGNORECASE), "Builders"),
     (re.compile(r"\bmassmart\b", re.IGNORECASE), "Massmart"),
+    (re.compile(r"\bpostnet\b", re.IGNORECASE), "PostNet"),
+    # Fuel/service station brands
+    (re.compile(r"\bbp\b", re.IGNORECASE), "BP"),
+    (re.compile(r"\bshell\b", re.IGNORECASE), "Shell"),
+    (re.compile(r"\bengen\b", re.IGNORECASE), "Engen"),
+    (re.compile(r"\bcaltex\b", re.IGNORECASE), "Caltex"),
+    (re.compile(r"\btotal\s+(?:energies|petroleum|garage|service\s+station)\b", re.IGNORECASE), "TotalEnergies"),
+    (re.compile(r"\bsasol\b", re.IGNORECASE), "Sasol"),
+    (re.compile(r"\bastron\b", re.IGNORECASE), "Astron Energy"),
 ]
 
 RECIPIENT_LABELS = [

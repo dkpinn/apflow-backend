@@ -398,7 +398,7 @@ def extract_narrow_receipt_line_items(text: str) -> list[dict]:
     lower_text = text.lower()
     has_receipt_shape = (
         re.search(r"item\s*(?:name|mame|nane|nan[e3])", lower_text) is not None
-        or (re.search(r"\b[qo]ty\b", lower_text) and "price" in lower_text and "total" in lower_text)
+        or (re.search(r"\b[qo]ty\b", lower_text) and ("price" in lower_text or "total" in lower_text))
         or ("receipt no" in lower_text and "cashier" in lower_text)
     )
     if not has_receipt_shape:
@@ -541,12 +541,49 @@ def extract_chimes_line_items(text: str) -> list[dict]:
 
     return items
 
+_CODE_DESC_QTY_TOTAL_RE = re.compile(
+    r"^(\d{1,6})\s+([A-Za-z].+?)\s+(\d{1,4})\s+(\d{1,5}[.,]\d{2})\s*$"
+)
+
+
+def extract_code_qty_total_rows(text: str) -> list[dict]:
+    """
+    Handles structured receipts/invoices with CODE | DESCRIPTION | QTY | TOTAL rows.
+    Example: "75 B/W COPIES 3 6.00"
+    """
+    items = []
+    for line in normalise_lines(text):
+        m = _CODE_DESC_QTY_TOTAL_RE.match(line.strip())
+        if not m:
+            continue
+        code, description, qty_str, total_str = m.group(1), m.group(2).strip(), m.group(3), m.group(4)
+        total = clean_amount(total_str)
+        qty = int(qty_str)
+        if total is None or qty <= 0:
+            continue
+        unit_price = round(total / qty, 4) if qty else None
+        items.append({
+            "code": code,
+            "description": description,
+            "quantity": float(qty),
+            "unit_price": unit_price,
+            "tax_amount": None,
+            "line_total": total,
+            "raw_line": line,
+        })
+    return items
+
+
 def extract_line_items(text: str, layout_type: str = "unknown") -> list[dict]:
     lines = normalise_lines(text)
 
     receipt_items = extract_narrow_receipt_line_items(text)
     if receipt_items:
         return receipt_items
+
+    code_qty_items = extract_code_qty_total_rows(text)
+    if code_qty_items:
+        return code_qty_items
 
     if layout_type == "chimes_column_table":
         return extract_chimes_line_items(text)

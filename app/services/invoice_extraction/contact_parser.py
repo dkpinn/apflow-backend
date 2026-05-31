@@ -221,7 +221,9 @@ def extract_supplier_postal_address(text: str) -> Optional[str]:
         if (
             "po box" in lower
             or "p o box" in lower
-            or "postnet" in lower
+            # Only match "PostNet" when used as a mailbox service (e.g. "PostNet Suite 123"),
+            # not when "PostNet" is the company/supplier name on the document header.
+            or re.search(r"\bpostnet\s+(?:suite|box|mailbox)\b", lower)
             or "private bag" in lower
         ):
             start_index = index

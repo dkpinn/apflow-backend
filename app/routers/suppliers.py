@@ -179,6 +179,18 @@ class SupplierLinkRequest(BaseModel):
     organisation_id: Optional[str] = None
 
 
+class SupplierMatchProfileRequest(BaseModel):
+    organisation_id: str
+    supplier_name: Optional[str] = None
+    vat_number: Optional[str] = None
+    company_registration_number: Optional[str] = None
+    account_number: Optional[str] = None
+    bank_account_number: Optional[str] = None
+    phone: Optional[str] = None
+    default_email: Optional[str] = None
+    accounting_email: Optional[str] = None
+
+
 class SupplierBranchCreateRequest(BaseModel):
     organisation_id: str
     supplier_id: str
@@ -349,7 +361,11 @@ def suggest_supplier_match(invoice_extracted_id: str):
     """Return best fuzzy name match suggestion for an unlinked invoice."""
     inv_res = (
         supabase.table("invoices_extracted")
-        .select("organisation_id, supplier_name_extracted, supplier_id")
+        .select(
+            "organisation_id, supplier_name_extracted, supplier_id, vat_number_extracted, "
+            "company_registration_number_extracted, cus_code_extracted, bank_account_number_extracted, "
+            "supplier_telephone_extracted, supplier_cell_extracted, supplier_email_extracted, supplier_acc_email_extracted"
+        )
         .eq("id", invoice_extracted_id)
         .limit(1)
         .execute()
@@ -360,11 +376,38 @@ def suggest_supplier_match(invoice_extracted_id: str):
     if inv.get("supplier_id"):
         return {"suggestion": None}
 
-    from app.services.supplier_matcher import find_name_match_suggestion
-    suggestion = find_name_match_suggestion(
+    from app.services.supplier_matcher import find_supplier_match_result
+    suggestion = find_supplier_match_result(
         supabase,
         org_id=inv["organisation_id"],
         supplier_name_extracted=inv.get("supplier_name_extracted"),
+        vat_number_extracted=inv.get("vat_number_extracted"),
+        company_registration_number_extracted=inv.get("company_registration_number_extracted"),
+        cus_code_extracted=inv.get("cus_code_extracted"),
+        bank_account_number_extracted=inv.get("bank_account_number_extracted"),
+        supplier_telephone_extracted=inv.get("supplier_telephone_extracted") or inv.get("supplier_cell_extracted"),
+        supplier_email_extracted=inv.get("supplier_email_extracted"),
+        supplier_acc_email_extracted=inv.get("supplier_acc_email_extracted"),
+    )
+    return {"suggestion": suggestion}
+
+
+@router.post("/match-profile")
+def match_supplier_profile(payload: SupplierMatchProfileRequest):
+    """Return the best supplier match for extracted supplier identity fields."""
+    from app.services.supplier_matcher import find_supplier_match_result
+
+    suggestion = find_supplier_match_result(
+        supabase,
+        org_id=payload.organisation_id,
+        supplier_name_extracted=payload.supplier_name,
+        vat_number_extracted=payload.vat_number,
+        company_registration_number_extracted=payload.company_registration_number,
+        cus_code_extracted=payload.account_number,
+        bank_account_number_extracted=payload.bank_account_number,
+        supplier_telephone_extracted=payload.phone,
+        supplier_email_extracted=payload.default_email,
+        supplier_acc_email_extracted=payload.accounting_email,
     )
     return {"suggestion": suggestion}
 

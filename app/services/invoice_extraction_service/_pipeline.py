@@ -293,7 +293,19 @@ def run_invoice_extraction(
         # as the supplier (a common AP error when the customer block appears before the issuer).
         organisation = get_organisation(org_id)
 
-        force_vlm = strategy == "vlm" and vlm_enabled
+        # Routing strategy:
+        #   Digital PDFs (ocr_used=False) → pdfplumber + regex pipeline; VLM only as fallback.
+        #   Scanned PDFs (ocr_used=True, PDF MIME) → VLM if org has vlm_enabled (cost control).
+        #   Images (JPEG/PNG/WEBP/HEIC) → VLM always, regardless of vlm_enabled.
+        #     Tesseract on photos is fundamentally unreliable — VLM is not optional here.
+        #     If no API key is configured, extract_with_vlm_fallback returns None gracefully.
+        is_image_file = (raw.get("file_type") or "").startswith("image/")
+        is_scanned_pdf = text_result.get("ocr_used", False) and not is_image_file
+        force_vlm = (
+            (strategy == "vlm" and vlm_enabled)
+            or is_image_file                       # always VLM for photos
+            or (is_scanned_pdf and vlm_enabled)    # VLM for scanned PDFs if org enabled
+        )
         parsed_supplier_candidate = parsed_data.get("supplier_name_extracted")
         supplier_candidate_invalid = bool(
             parsed_supplier_candidate
@@ -313,6 +325,12 @@ def run_invoice_extraction(
             # business name (e.g. "COWIES HILL EURIKA"), fall back to VLM which has
             # image context to find the real invoice issuer.
             or looks_like_location_cluster(parsed_data.get("supplier_name_extracted") or "")
+            # No line items from OCR: VLM has image context to find line items the
+            # regex pipeline missed (receipts, non-standard tables, etc.).
+            or (
+                not parsed_data.get("line_items")
+                and parsed_data.get("total_amount")
+            )
         )
 
         if vlm_should_try:
@@ -705,12 +723,13 @@ def run_invoice_extraction(
     }
 
     auto_linked_supplier_id = None
+    auto_link_match_result = None
 
-    # Auto-link supplier when not already linked and an exact identifier match exists.
+    # Auto-link supplier when the organisation's configured identity threshold is met.
     if not extracted_payload.get("supplier_id"):
         try:
-            from app.services.supplier_matcher import attempt_supplier_auto_link  # noqa: PLC0415
-            matched_id = attempt_supplier_auto_link(
+            from app.services.supplier_matcher import find_supplier_match_result  # noqa: PLC0415
+            match_result = find_supplier_match_result(
                 supabase,
                 org_id=org_id,
                 supplier_name_extracted=parsed_data.get("supplier_name_extracted"),
@@ -718,10 +737,15 @@ def run_invoice_extraction(
                 company_registration_number_extracted=parsed_data.get("company_registration_number_extracted"),
                 cus_code_extracted=parsed_data.get("cus_code_extracted"),
                 bank_account_number_extracted=parsed_data.get("bank_account_number_extracted"),
+                supplier_telephone_extracted=parsed_data.get("supplier_telephone_extracted") or parsed_data.get("supplier_cell_extracted"),
+                supplier_email_extracted=parsed_data.get("supplier_email_extracted"),
+                supplier_acc_email_extracted=parsed_data.get("supplier_acc_email_extracted"),
             )
-            if matched_id:
+            if match_result and match_result.get("auto_link"):
+                matched_id = str(match_result["supplier_id"])
                 extracted_payload["supplier_id"] = matched_id
                 auto_linked_supplier_id = matched_id
+                auto_link_match_result = match_result
                 try:
                     supabase.table("invoices_raw").update({
                         "supplier_id": matched_id,
@@ -729,7 +753,7 @@ def run_invoice_extraction(
                     }).eq("id", invoice_raw_id).execute()
                 except Exception as raw_link_exc:
                     print(f"INVOICES_RAW AUTO-LINK UPDATE FAILED (non-fatal): {raw_link_exc}")
-                print(f"AUTO-LINKED supplier {matched_id} via exact identifier match")
+                print(f"AUTO-LINKED supplier {matched_id} via supplier identity threshold")
         except Exception as exc:
             print(f"SUPPLIER AUTO-MATCH FAILED (non-fatal): {exc}")
 
@@ -811,9 +835,12 @@ def run_invoice_extraction(
             actor_type="worker" if job_id else "api",
             new_value={
                 "supplier_id": auto_linked_supplier_id,
-                "match_type": "exact_identifier",
+                "match_type": "identity_threshold",
+                "match_count": auto_link_match_result.get("match_count") if auto_link_match_result else None,
+                "threshold": auto_link_match_result.get("threshold") if auto_link_match_result else None,
+                "evidence": auto_link_match_result.get("evidence") if auto_link_match_result else [],
             },
-            notes="Supplier auto-linked from exact extracted identifier match.",
+            notes="Supplier auto-linked from extracted supplier identity evidence.",
         )
 
     if extracted_invoice_id:

@@ -1,21 +1,19 @@
 """
 _job_tracking.py
 -----------------
-In-memory re-extract job state and DB-backed extract job status helpers.
+DB-backed re-extract job state and extract job status helpers.
 
 Groups A + C from the original invoice_extraction_service.py:
-  A — REEXTRACT_JOBS dict, locks, and job lifecycle helpers
+  A — re-extract job lifecycle helpers (backed by document_processing_jobs)
   C — document_processing_jobs DB normalisation helpers
 """
 from __future__ import annotations
 
 import uuid
-from copy import deepcopy
 from threading import Lock
 from typing import Optional
 
 from app.db.supabase_client import get_supabase_client
-from app.services.invoice_data_builders import utc_now_iso
 
 try:
     supabase = get_supabase_client()
@@ -98,55 +96,55 @@ EXTRACT_STAGE_LABELS = {
 
 
 # ---------------------------------------------------------------------------
-# In-memory re-extract job state
+# Concurrency lock for the extraction worker (used by _queue.py)
 # ---------------------------------------------------------------------------
 
-REEXTRACT_JOBS: dict[str, dict] = {}
-REEXTRACT_JOBS_LOCK = Lock()
 EXTRACT_WORKER_LOCK = Lock()
 
 
 # ---------------------------------------------------------------------------
-# Group A — Re-extract job lifecycle helpers
+# Group A — Re-extract job lifecycle helpers (document_processing_jobs table)
 # ---------------------------------------------------------------------------
 
-def _reextract_status_payload(job: dict) -> dict:
-    stage = job.get("stage") or "queued"
+def _reextract_row_to_payload(row: dict) -> dict:
+    stage = row.get("current_stage") or "queued"
     return {
-        "job_id": job.get("job_id"),
-        "status": job.get("status") or "queued",
+        "job_id": row.get("id"),
+        "status": row.get("status") or "queued",
         "stage": stage,
-        "stage_label": job.get("stage_label") or REEXTRACT_STAGE_LABELS.get(stage, stage.replace("_", " ").title()),
-        "progress": int(job.get("progress") or REEXTRACT_STAGE_PROGRESS.get(stage, 0)),
-        "invoice_raw_id": job.get("invoice_raw_id"),
-        "extracted_invoice_id": job.get("extracted_invoice_id"),
-        "error": job.get("error"),
+        "stage_label": REEXTRACT_STAGE_LABELS.get(stage, stage.replace("_", " ").title()),
+        "progress": REEXTRACT_STAGE_PROGRESS.get(stage, 0),
+        "invoice_raw_id": row.get("invoice_raw_id"),
+        "extracted_invoice_id": row.get("extracted_invoice_id"),
+        "error": row.get("last_error"),
         "diagnostic": {
             **REEXTRACT_DEFAULT_DIAGNOSTIC,
-            **(job.get("diagnostic") or {}),
+            **(row.get("diagnostic") or {}),
         },
     }
 
 
 def create_reextract_job(*, invoice_raw_id: str, organisation_id: Optional[str] = None) -> dict:
     job_id = str(uuid.uuid4())
-    job = {
+    supabase.table("document_processing_jobs").insert({
+        "id": job_id,
+        "invoice_raw_id": invoice_raw_id,
+        "organisation_id": organisation_id,
+        "status": "queued",
+        "current_stage": "queued",
+        "job_type": "re_extraction",
+    }).execute()
+    return {
         "job_id": job_id,
+        "invoice_raw_id": invoice_raw_id,
         "status": "queued",
         "stage": "queued",
         "stage_label": REEXTRACT_STAGE_LABELS["queued"],
         "progress": REEXTRACT_STAGE_PROGRESS["queued"],
-        "invoice_raw_id": invoice_raw_id,
-        "organisation_id": organisation_id,
         "extracted_invoice_id": None,
         "error": None,
         "diagnostic": dict(REEXTRACT_DEFAULT_DIAGNOSTIC),
-        "created_at": utc_now_iso(),
-        "updated_at": utc_now_iso(),
     }
-    with REEXTRACT_JOBS_LOCK:
-        REEXTRACT_JOBS[job_id] = job
-    return _reextract_status_payload(job)
 
 
 def update_reextract_job(
@@ -157,43 +155,34 @@ def update_reextract_job(
     extracted_invoice_id: Optional[str] = None,
     error: Optional[str] = None,
     diagnostic: Optional[dict] = None,
-) -> dict:
-    with REEXTRACT_JOBS_LOCK:
-        job = REEXTRACT_JOBS.get(job_id)
-        if not job:
-            job = {
-                "job_id": job_id,
-                "invoice_raw_id": None,
-                "diagnostic": dict(REEXTRACT_DEFAULT_DIAGNOSTIC),
-                "created_at": utc_now_iso(),
-            }
-            REEXTRACT_JOBS[job_id] = job
-
-        if status:
-            job["status"] = status
-        if stage:
-            job["stage"] = stage
-            job["stage_label"] = REEXTRACT_STAGE_LABELS.get(stage, stage.replace("_", " ").title())
-            job["progress"] = REEXTRACT_STAGE_PROGRESS.get(stage, job.get("progress") or 0)
-        if extracted_invoice_id is not None:
-            job["extracted_invoice_id"] = extracted_invoice_id
-        if error is not None:
-            job["error"] = error
-        if diagnostic is not None:
-            job["diagnostic"] = {
-                **REEXTRACT_DEFAULT_DIAGNOSTIC,
-                **diagnostic,
-            }
-        job["updated_at"] = utc_now_iso()
-        return _reextract_status_payload(deepcopy(job))
+) -> None:
+    patch: dict = {}
+    if status is not None:
+        patch["status"] = status
+    if stage is not None:
+        patch["current_stage"] = stage
+    if extracted_invoice_id is not None:
+        patch["extracted_invoice_id"] = extracted_invoice_id
+    if error is not None:
+        patch["last_error"] = error
+    if diagnostic is not None:
+        patch["diagnostic"] = {**REEXTRACT_DEFAULT_DIAGNOSTIC, **diagnostic}
+    if patch:
+        supabase.table("document_processing_jobs").update(patch).eq("id", job_id).execute()
 
 
 def get_reextract_job_status(job_id: str) -> Optional[dict]:
-    with REEXTRACT_JOBS_LOCK:
-        job = REEXTRACT_JOBS.get(job_id)
-        if not job:
-            return None
-        return _reextract_status_payload(deepcopy(job))
+    res = (
+        supabase
+        .table("document_processing_jobs")
+        .select("*")
+        .eq("id", job_id)
+        .maybe_single()
+        .execute()
+    )
+    if not res.data:
+        return None
+    return _reextract_row_to_payload(res.data)
 
 
 # ---------------------------------------------------------------------------

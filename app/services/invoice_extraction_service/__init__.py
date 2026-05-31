@@ -8,7 +8,7 @@ Re-exports all public symbols so that external callers can continue to use:
 without any changes after the flat .py file was converted to this package.
 
 Internal submodule layout:
-  _job_tracking  — in-memory re-extract job state + DB extract job status helpers
+  _job_tracking  — DB-backed re-extract job state + DB extract job status helpers
   _helpers       — error/context helpers + DB lookups + file/storage helpers
   _pipeline      — run_invoice_extraction (primary OCR → parse → persist pipeline)
   _reextraction  — run_invoice_re_extraction + run_reextract_job_background
@@ -19,8 +19,6 @@ from ._job_tracking import (
     EXTRACT_STAGE_LABELS,
     EXTRACT_STAGE_PROGRESS,
     REEXTRACT_DEFAULT_DIAGNOSTIC,
-    REEXTRACT_JOBS,
-    REEXTRACT_JOBS_LOCK,
     REEXTRACT_STAGE_LABELS,
     REEXTRACT_STAGE_PROGRESS,
     build_extract_job_status,
@@ -53,8 +51,6 @@ __all__ = [
     "EXTRACT_STAGE_LABELS",
     "EXTRACT_STAGE_PROGRESS",
     "REEXTRACT_DEFAULT_DIAGNOSTIC",
-    "REEXTRACT_JOBS",
-    "REEXTRACT_JOBS_LOCK",
     "REEXTRACT_STAGE_LABELS",
     "REEXTRACT_STAGE_PROGRESS",
     "build_extract_job_status",

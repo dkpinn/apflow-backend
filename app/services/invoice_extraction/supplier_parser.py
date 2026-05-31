@@ -44,8 +44,19 @@ def normalise_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
+_STANDALONE_BANK_BRANDS = {
+    "standard", "nedbank", "absa", "capitec", "investec",
+    "wesbank", "tymebank", "fnb",
+}
+
+
 def line_has_bank_context(line: str) -> bool:
     lower = line.lower()
+
+    # Reject single-word lines that are a known bank brand name — handles the case
+    # where OCR splits "Standard Bank" across two lines (line 1: "Standard", line 2: "Bank").
+    if lower.strip() in _STANDALONE_BANK_BRANDS:
+        return True
 
     bank_patterns = [
         r"\bbank\b",

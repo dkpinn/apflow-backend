@@ -125,6 +125,12 @@ def is_address_stop_line(line: str) -> bool:
     return bool(ADDRESS_STOP_RE.search(line or "") or is_recipient_block_label(line or ""))
 
 
+_DATE_LINE_RE = re.compile(
+    r"^\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}$",
+    re.IGNORECASE,
+)
+
+
 def is_valid_supplier_address_line(line: str) -> bool:
     clean = compact_line(line)
     if not clean or len(clean) > 90:
@@ -134,6 +140,8 @@ def is_valid_supplier_address_line(line: str) -> bool:
     if "@" in clean or "www." in clean.lower():
         return False
     if re.match(r"^[\W_]{2,}", clean):
+        return False
+    if _DATE_LINE_RE.match(clean):
         return False
     return True
 
@@ -232,6 +240,12 @@ def score_vat_candidate(lines: list[str], value: str, line_index: int) -> int:
     digits = _digits(value)
     if len(digits) == 10:
         score += 1
+    # SA VAT numbers are exactly 10 digits and start with 4.
+    # Phone numbers are 10 digits starting with 0 — penalise heavily.
+    if digits.startswith("0"):
+        score -= 2
+    if digits.startswith("4") and len(digits) == 10:
+        score += 2
     return score
 
 

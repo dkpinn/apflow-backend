@@ -16,6 +16,7 @@ from app.routers import webhooks
 from app.routers import channels
 from app.routers import admin_integrations
 from app.routers import integrations
+from app.routers import bank
 
 
 def _sweep_log(msg: str) -> None:
@@ -316,6 +317,7 @@ app.include_router(webhooks.router)
 app.include_router(channels.router)
 app.include_router(admin_integrations.router)
 app.include_router(integrations.router)
+app.include_router(bank.router)
 
 
 @app.get("/")

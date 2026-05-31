@@ -29,6 +29,7 @@ class OrganisationSettingsResponse(BaseModel):
     extraction_strategy: ExtractionStrategy
     ask_per_upload: bool
     vlm_enabled: bool
+    supplier_auto_link_min_matches: int = Field(default=2, ge=1, le=4)
 
 
 class UpdateOrganisationSettingsRequest(BaseModel):
@@ -43,6 +44,12 @@ class UpdateOrganisationSettingsRequest(BaseModel):
     vlm_enabled: Optional[bool] = Field(
         default=None,
         description="Whether VLM-based boundary detection is enabled.",
+    )
+    supplier_auto_link_min_matches: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=4,
+        description="How many supplier identity signals must match before auto-linking.",
     )
 
 
@@ -71,6 +78,8 @@ def update_organisation_settings(
         updates["ask_per_upload"] = payload.ask_per_upload
     if payload.vlm_enabled is not None:
         updates["vlm_enabled"] = payload.vlm_enabled
+    if payload.supplier_auto_link_min_matches is not None:
+        updates["supplier_auto_link_min_matches"] = payload.supplier_auto_link_min_matches
 
     if not updates:
         raise HTTPException(status_code=400, detail="No settings were provided to update")

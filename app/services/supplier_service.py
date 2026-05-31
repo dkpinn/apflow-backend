@@ -31,6 +31,7 @@ KNOWN_SUPPLIER_COLUMNS = {
     "id",
     "organisation_id",
     "supplier_name",
+    "trading_name",
     "supplier_code",
     "account_number",
     "tax_number",
@@ -127,6 +128,7 @@ def _raise_if_duplicate(
     existing_id = attempt_supplier_auto_link(
         supabase,
         org_id=org_id,
+        supplier_name_extracted=supplier_name,
         vat_number_extracted=vat_number,
         company_registration_number_extracted=company_registration_number,
         cus_code_extracted=account_number,

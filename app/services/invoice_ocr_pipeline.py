@@ -1228,6 +1228,13 @@ def parse_invoice_fields(text: str) -> dict:
     layout = analyse_invoice_layout(text)
 
     invoice_number = extract_invoice_number(text)
+    # Discard invoice numbers that are just dates — receipts often have the date
+    # near the invoice number position and Tesseract picks it up incorrectly.
+    if invoice_number and re.fullmatch(
+        r"\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{4}[/\-]\d{1,2}[/\-]\d{1,2}",
+        invoice_number.strip(),
+    ):
+        invoice_number = None
     invoice_date = extract_invoice_date(text)
     document_time = extract_document_time(text)
     invoice_number_generated_from_datetime = False
