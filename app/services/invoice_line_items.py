@@ -77,7 +77,11 @@ def build_line_item_payload(
             "discount_percent": item.get("discount_percent"),
             "discounted_unit_price": item.get("discounted_unit_price"),
             "pricing_basis": item.get("pricing_basis"),
-            "pricing_notes": item.get("pricing_notes") or {},
+            "pricing_notes": {
+                **(item.get("pricing_notes") or {}),
+                # Store VLM-returned bounding box for document highlighting
+                **({ "source_bbox": item["source_bbox"] } if item.get("source_bbox") else {}),
+            },
             "tax_amount": item.get("tax_amount"),
             "line_total": item.get("line_total"),
             "raw_line": item.get("raw_line"),

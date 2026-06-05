@@ -539,11 +539,22 @@ def parse_vlm_statement(file_bytes: bytes, *, mime_type: str, bank_account_id: s
     for image_bytes, image_mime in page_parts:
         contents.append(types.Part.from_bytes(data=image_bytes, mime_type=image_mime))
 
+    _effective_model = os.getenv("GEMINI_VLM_MODEL") or "gemini-2.5-flash"
     response = client.models.generate_content(
-        model=os.getenv("GEMINI_VLM_MODEL") or "gemini-2.5-flash",
+        model=_effective_model,
         contents=contents,
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
+    # Capture token usage before building header
+    _input_tokens: int | None = None
+    _output_tokens: int | None = None
+    try:
+        _um = getattr(response, "usage_metadata", None)
+        if _um:
+            _input_tokens = getattr(_um, "prompt_token_count", None)
+            _output_tokens = getattr(_um, "candidates_token_count", None)
+    except Exception:
+        pass
     payload = json.loads(response.text or "{}")
     txns = payload.get("transactions") or []
     lines: list[ParsedBankLine] = []
@@ -609,6 +620,9 @@ def parse_vlm_statement(file_bytes: bytes, *, mime_type: str, bank_account_id: s
             warnings=extraction_warnings,
             extra={"line_count": len(lines)},
         ),
+        "extraction_input_tokens": _input_tokens,
+        "extraction_output_tokens": _output_tokens,
+        "extraction_model": _effective_model if (_input_tokens or _output_tokens) else None,
     }
     return header, lines
 

@@ -41,18 +41,19 @@ _EXTRACTION_PROMPT = (
     "If the document uses commas as a decimal separator (e.g. South African format '1 234,56'), "
     "convert to a decimal point. "
     "For line_items: extract EVERY individual product or service line visible in the document. "
+    "CRITICAL: Extract ALL monetary amounts EXACTLY as printed on the document. "
+    "Do NOT adjust, strip, add, or estimate VAT. If the document shows 75.99, extract 75.99. "
+    "The system will determine whether prices include VAT by comparing totals. "
     "unit_price must be the printed original/list unit price before line-level discount when both original and discounted prices are shown. "
     "If a discounted/net unit price is printed (for example Disc Price, Nett Price, Net Unit), put it in discounted_unit_price. "
     "If a discount percentage or amount is printed, put it in discount_percent or discount_amount. "
-    "When discount evidence exists, line_total is the printed net/extended amount after discount, not unit_price times quantity. "
-    "line_total must be the printed net/extended line amount after discount, excluding VAT when the document labels it as ex-VAT. "
+    "line_total must be the PRINTED total for that line as shown in the document's line total column — exactly as printed. "
     "IMPORTANT: when a receipt or till slip shows a 'Total' column value on the line item row AND also has a separate "
     "'Exclusive Total' or 'Ex VAT' summary row below the item table, use the value from the line item's own Total column "
     "as line_total — do NOT use the summary subtotal row. "
     "Extract the VAT amount from the 'Vat Total', 'Tax Total', or 'VAT' summary row and place it in tax_amount. "
     "IMPORTANT: 'Total Items' on a receipt is the COUNT of line items purchased (e.g. 'Total Items: 1.00' means 1 item), "
     "NOT a currency amount. Never use a 'Total Items' value as tax_amount, subtotal, or any monetary field. "
-    "VAT / tax is applied at the invoice level, not per line — do not include tax in unit_price or line_total. "
     "For till slips and POS receipts, use the receipt number, sale number, or transaction number as invoice_number. "
     "If the only candidate for invoice_number is the date, time, or a timestamp, set invoice_number to null instead. "
     "Each line item should include the item description, quantity, unit price, discounted unit price/discount if printed, line total, "
@@ -79,7 +80,10 @@ _EXTRACTION_PROMPT = (
     "'delivery_note' (a delivery docket without pricing), "
     "'other' (anything that does not fit the above). "
     "Set document_count to the number of physically separate documents visible on this page "
-    "(e.g. a page with 3 stapled till slips has document_count = 3; a single invoice has document_count = 1)."
+    "(e.g. a page with 3 stapled till slips has document_count = 3; a single invoice has document_count = 1). "
+    "For each line_item, set source_bbox to [x1_pct, y1_pct, x2_pct, y2_pct] where each value is the "
+    "percentage (0–100) of the page image width/height. Locate the bounding box of that actual line row "
+    "as it appears in the document image. This enables the document viewer to highlight the correct region."
 )
 DEFAULT_EXTRACTION_PROMPT = _EXTRACTION_PROMPT
 
@@ -95,6 +99,10 @@ class _VLMLineItem(BaseModel):
     pricing_notes: Optional[str] = Field(None, description="Small pricing evidence notes")
     line_total: Optional[float] = Field(None, description="Printed net/extended line total after discount, excluding tax when labelled ex-VAT")
     code: Optional[str] = Field(None, description="Product code, SKU, or barcode printed on the line")
+    source_bbox: Optional[list[float]] = Field(
+        None,
+        description="Bounding box [x1_pct, y1_pct, x2_pct, y2_pct] where each value is 0–100 percent of page width/height. Locate the actual row/line as it appears in the document image.",
+    )
 
 
 class _VLMInvoiceSchema(BaseModel):
@@ -278,8 +286,9 @@ def _call_gemini(
     ]
     contents.append(prompt or _EXTRACTION_PROMPT)
 
+    effective_model = model or os.getenv("GEMINI_VLM_MODEL") or "gemini-2.5-flash"
     response = client.models.generate_content(
-        model=model or os.getenv("GEMINI_VLM_MODEL") or "gemini-2.5-flash",
+        model=effective_model,
         contents=contents,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -289,7 +298,18 @@ def _call_gemini(
         ),
     )
 
-    return normalise_vlm_json_response(response.text)
+    usage: dict = {}
+    try:
+        um = getattr(response, "usage_metadata", None)
+        if um:
+            usage = {
+                "input_tokens": getattr(um, "prompt_token_count", None),
+                "output_tokens": getattr(um, "candidates_token_count", None),
+            }
+    except Exception:
+        pass
+
+    return {"data": normalise_vlm_json_response(response.text), "usage": usage, "model": effective_model}
 
 
 def extract_with_gemini(
@@ -360,7 +380,7 @@ def extract_with_gemini_diagnostic(
                 prompt,
             )
             try:
-                data = future.result(timeout=VLM_TIMEOUT_SECONDS)
+                raw_result = future.result(timeout=VLM_TIMEOUT_SECONDS)
             except FuturesTimeoutError:
                 future.cancel()
                 return {
@@ -378,12 +398,24 @@ def extract_with_gemini_diagnostic(
             "mime_type": effective_mime,
         }
 
+    # _call_gemini now returns {"data": ..., "usage": {...}, "model": "..."}
+    if isinstance(raw_result, dict):
+        data = raw_result.get("data")
+        usage = raw_result.get("usage") or {}
+        effective_model = raw_result.get("model") or model or os.getenv("GEMINI_VLM_MODEL") or "gemini-2.5-flash"
+    else:
+        data = raw_result  # backward compat
+        usage = {}
+        effective_model = model or os.getenv("GEMINI_VLM_MODEL") or "gemini-2.5-flash"
+
     if data is None:
         return {
             "data": None,
             "reason": "empty_response",
             "error": "Gemini fallback returned no structured extraction data.",
             "mime_type": effective_mime,
+            "usage": usage,
+            "model": effective_model,
         }
 
     result = {
@@ -391,6 +423,8 @@ def extract_with_gemini_diagnostic(
         "reason": None,
         "error": None,
         "mime_type": effective_mime,
+        "usage": usage,
+        "model": effective_model,
     }
     if conversion_warning:
         result["conversion_warning"] = conversion_warning

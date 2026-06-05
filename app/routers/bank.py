@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
@@ -27,6 +28,22 @@ from app.services.bank_statement_service import (
 )
 
 router = APIRouter(prefix="/api/bank", tags=["bank"])
+
+_BANK_COST_PER_MILLION: dict[str, dict[str, float]] = {
+    "gemini-2.5-flash": {"input": 0.15, "output": 0.60},
+    "gemini-2.5-pro":   {"input": 1.25, "output": 10.00},
+    "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
+    "gpt-4o":           {"input": 5.00, "output": 15.00},
+    "gpt-4.1-mini":     {"input": 0.40, "output": 1.60},
+}
+
+def _calc_bank_cost(model: str | None, input_tokens: int | None, output_tokens: int | None) -> float | None:
+    if not model or input_tokens is None:
+        return None
+    rates = next((r for k, r in _BANK_COST_PER_MILLION.items() if (model or "").startswith(k)), None)
+    if not rates:
+        return None
+    return round((input_tokens or 0) * rates["input"] / 1_000_000 + (output_tokens or 0) * rates.get("output", 0) / 1_000_000, 8)
 
 
 class BankAccountCreate(BaseModel):
@@ -60,6 +77,7 @@ class ReviewLineRequest(BaseModel):
     gl_account_id: Optional[UUID] = None
     tracking: dict[str, Any] = Field(default_factory=dict)
     tax_treatment: Optional[str] = None
+    supplier_id: Optional[UUID] = None
     create_rule: bool = False
     rule_name: Optional[str] = None
     rule_criteria: list[dict[str, Any]] = Field(default_factory=list)
@@ -70,6 +88,8 @@ class DraftJournalRequest(BaseModel):
     organisation_id: UUID
     gl_account_id: UUID
     tracking: dict[str, Any] = Field(default_factory=dict)
+    vat_rate: Optional[float] = None
+    vat_account_id: Optional[UUID] = None
 
 
 class PostJournalRequest(BaseModel):
@@ -149,7 +169,16 @@ def journal_preview_lines(db, organisation_id: str, rows: list[dict[str, Any]]) 
     return preview
 
 
-def build_journal_rows_for_line(db, *, organisation_id: str, line: dict[str, Any], gl_account_id: str, tracking: dict[str, Any]) -> list[dict[str, Any]]:
+def build_journal_rows_for_line(
+    db,
+    *,
+    organisation_id: str,
+    line: dict[str, Any],
+    gl_account_id: str,
+    tracking: dict[str, Any],
+    vat_rate: Optional[float] = None,
+    vat_account_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
     account = _one(
         db.table("bank_accounts").select("*").eq("id", line["bank_account_id"]).eq("organisation_id", organisation_id).limit(1).execute(),
         "Bank account not found",
@@ -157,7 +186,7 @@ def build_journal_rows_for_line(db, *, organisation_id: str, line: dict[str, Any
     bank_gl = account.get("gl_account_id")
     if not bank_gl:
         raise HTTPException(status_code=400, detail="Bank account needs a linked GL account before posting")
-    return journal_lines_for_bank_transaction(
+    rows = journal_lines_for_bank_transaction(
         organisation_id=organisation_id,
         bank_account_gl_id=str(bank_gl),
         allocation_account_id=str(gl_account_id),
@@ -165,6 +194,21 @@ def build_journal_rows_for_line(db, *, organisation_id: str, line: dict[str, Any
         description=line.get("description") or "Bank transaction",
         tracking=tracking,
     )
+    if vat_rate and vat_account_id and len(rows) >= 2:
+        # rows[0] = allocation/expense side (SPLIT into net + VAT)
+        # rows[1] = bank GL side (UNCHANGED — stays at full amount)
+        alloc = rows[0]
+        total_alloc = money(alloc.get("debit_amount") or alloc.get("credit_amount"))
+        vat_amount = (total_alloc * Decimal(str(vat_rate)) / (100 + Decimal(str(vat_rate)))).quantize(Decimal("0.01"))
+        net_amount = total_alloc - vat_amount
+        if alloc.get("debit_amount"):
+            rows[0] = {**alloc, "debit_amount": dec_to_float(net_amount), "credit_amount": 0}
+            vat_line = {**alloc, "account_id": vat_account_id, "debit_amount": dec_to_float(vat_amount), "credit_amount": 0, "sort_order": 2}
+        else:
+            rows[0] = {**alloc, "credit_amount": dec_to_float(net_amount), "debit_amount": 0}
+            vat_line = {**alloc, "account_id": vat_account_id, "credit_amount": dec_to_float(vat_amount), "debit_amount": 0, "sort_order": 2}
+        rows.append(vat_line)
+    return rows
 
 
 def is_unreconciled_bank_line(line: dict[str, Any]) -> bool:
@@ -272,6 +316,16 @@ def create_bank_account(payload: BankAccountCreate, auth: UserAuth):
     res = db.table("bank_accounts").insert(row).execute()
     account = _one(res, "Bank account create failed")
     log_bank_event(db, organisation_id=organisation_id, event_type="bank_account_created", actor_user_id=user_id, bank_account_id=account["id"])
+    try:
+        db.table("suppliers").insert({
+            "organisation_id": organisation_id,
+            "supplier_name": payload.institution_name or payload.name,
+            "bank_name": payload.institution_name,
+            "active": True,
+            "line_items_include_vat": True,
+        }).execute()
+    except Exception:
+        pass  # non-fatal
     return {"success": True, "account": account}
 
 
@@ -416,6 +470,14 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             },
             "extraction_status": "extracted",
             "extracted_at": now_iso(),
+            "extraction_input_tokens": header.get("extraction_input_tokens"),
+            "extraction_output_tokens": header.get("extraction_output_tokens"),
+            "extraction_model": header.get("extraction_model"),
+            "extraction_cost_usd": _calc_bank_cost(
+                header.get("extraction_model"),
+                header.get("extraction_input_tokens"),
+                header.get("extraction_output_tokens"),
+            ),
         }
         db.table("bank_statement_uploads").update(upload_patch).eq("id", upload_id).execute()
 
@@ -548,13 +610,17 @@ def review_bank_line(line_id: str, payload: ReviewLineRequest, auth: UserAuth):
     patch = {
         "accepted_suggestion_id": str(payload.suggestion_id) if payload.suggestion_id else None,
         "accepted_rule_id": accepted_rule_id,
+        "supplier_id": str(payload.supplier_id) if payload.supplier_id else None,
         "match_status": "matched" if suggestion and suggestion.get("matched_invoice_id") else "suggested",
         "allocation_status": "allocated" if (payload.gl_account_id or suggestion) else "unallocated",
         "review_status": "reviewed",
         "reviewed_by": user_id,
         "reviewed_at": now_iso(),
     }
-    db.table("bank_statement_lines").update(patch).eq("id", line_id).execute()
+    try:
+        db.table("bank_statement_lines").update(patch).eq("id", line_id).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save review: {exc}") from exc
     log_bank_event(
         db,
         organisation_id=organisation_id,
@@ -584,6 +650,8 @@ def preview_bank_journal(line_id: str, payload: DraftJournalRequest, auth: UserA
         line=line,
         gl_account_id=str(payload.gl_account_id),
         tracking=payload.tracking,
+        vat_rate=payload.vat_rate,
+        vat_account_id=str(payload.vat_account_id) if payload.vat_account_id else None,
     )
     return {
         "success": True,
@@ -627,6 +695,8 @@ def draft_bank_journal(line_id: str, payload: DraftJournalRequest, auth: UserAut
         line=line,
         gl_account_id=str(payload.gl_account_id),
         tracking=payload.tracking,
+        vat_rate=payload.vat_rate,
+        vat_account_id=str(payload.vat_account_id) if payload.vat_account_id else None,
     )
     total_debit = sum(money(row["debit_amount"]) for row in journal_lines)
     total_credit = sum(money(row["credit_amount"]) for row in journal_lines)

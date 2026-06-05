@@ -1245,11 +1245,12 @@ def save_invoice_line_items(req: SaveLineItemsRequest):
         raise HTTPException(status_code=500, detail=f"Failed to save line items: {exc}")
 
     # 6. Update invoices_extracted with derived totals.
-    # tax_amount is intentionally excluded — it is the document-extracted value
-    # (set by VLM/OCR) and must only change on re-extraction, not on line item saves.
+    # total_amount and tax_amount are document-extracted values (set by VLM/OCR)
+    # and must only change on re-extraction, not on line item saves.
+    # Overwriting total_amount with a computed value causes double-counting when
+    # prices include VAT (line totals are inclusive, so subtotal + existing_tax > document total).
     patch: dict = {
         "subtotal": subtotal,
-        "total_amount": computed_total,
     }
     if needs_review:
         patch["validation_status"] = "needs_review"
@@ -1814,3 +1815,562 @@ def generate_invoice_preview(req: GeneratePreviewRequest):
         }).eq("id", req.invoice_raw_id).execute()
 
     return {"generated": len(results), "pages": results}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GL Posting
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PostInvoiceToGLRequest(BaseModel):
+    organisation_id: str
+
+
+def _new_uuid() -> str:
+    import uuid
+    return str(uuid.uuid4())
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _fetch_org_role(user_id: str, organisation_id: str) -> str | None:
+    res = (
+        supabase.table("organisation_users")
+        .select("role")
+        .eq("organisation_id", organisation_id)
+        .eq("user_id", user_id)
+        .eq("status", "active")
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        return None
+    return res.data[0].get("role")
+
+
+def _approval_effective_user(organisation_id: str, workflow_type: str, approver_user_id: str | None) -> str | None:
+    if not approver_user_id:
+        return None
+    try:
+        res = supabase.rpc(
+            "approval_effective_user",
+            {
+                "p_org_id": organisation_id,
+                "p_workflow_type": workflow_type,
+                "p_approver_user_id": approver_user_id,
+            },
+        ).execute()
+        return res.data or approver_user_id
+    except Exception:
+        return approver_user_id
+
+
+def _matches_tracking_limit(line_tracking: dict, limit: dict) -> bool:
+    dimension_id = limit.get("tracking_dimension_id")
+    if not dimension_id:
+        return False
+
+    value = None
+    if isinstance(line_tracking, dict):
+        value = line_tracking.get(dimension_id)
+        if isinstance(value, dict):
+            value = value.get("id") or value.get("value_id")
+
+    limit_value = limit.get("tracking_value_id")
+    if limit_value is None:
+        return value is not None
+    return str(value or "") == str(limit_value)
+
+
+def _enforce_user_limits(
+    *,
+    user_id: str,
+    organisation_id: str,
+    journal_lines: list[dict],
+    invoice_amount: float,
+    action: str,
+) -> None:
+    account_limits_res = (
+        supabase.table("organisation_user_account_limits")
+        .select("*")
+        .eq("organisation_id", organisation_id)
+        .eq("user_id", user_id)
+        .eq("active", True)
+        .execute()
+    )
+    account_limits = account_limits_res.data or []
+
+    tracking_limits_res = (
+        supabase.table("organisation_user_tracking_limits")
+        .select("*")
+        .eq("organisation_id", organisation_id)
+        .eq("user_id", user_id)
+        .eq("active", True)
+        .execute()
+    )
+    tracking_limits = tracking_limits_res.data or []
+
+    for line in journal_lines:
+        account_id = line.get("account_id")
+        debit_amount = round(float(line.get("debit_amount") or 0), 2)
+        amount = round(float(line.get("debit_amount") or line.get("credit_amount") or 0), 2)
+        account_specific_limits = [limit for limit in account_limits if limit.get("account_id") is not None]
+        if debit_amount > 0 and account_specific_limits and not any(
+            str(limit.get("account_id")) == str(account_id) for limit in account_specific_limits
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="You are not allowed to use one of the selected invoice accounts",
+            )
+
+        matching_account_limits = [
+            limit
+            for limit in account_limits
+            if limit.get("account_id") is None or str(limit.get("account_id")) == str(account_id)
+        ]
+
+        for limit in matching_account_limits:
+            if action == "post":
+                if not limit.get("can_post", True):
+                    raise HTTPException(status_code=403, detail="You are not allowed to post to one of the selected accounts")
+                max_amount = limit.get("max_post_amount")
+                if max_amount is not None and amount > float(max_amount):
+                    raise HTTPException(status_code=403, detail="Posting amount exceeds your account limit")
+            if action == "approve":
+                if not limit.get("can_approve", True):
+                    raise HTTPException(status_code=403, detail="You are not allowed to approve one of the selected accounts")
+                max_amount = limit.get("max_approval_amount")
+                if max_amount is not None and invoice_amount > float(max_amount):
+                    raise HTTPException(status_code=403, detail="Invoice amount exceeds your approval limit")
+
+        tracking = line.get("tracking") or {}
+        limited_dimensions = {
+            str(limit.get("tracking_dimension_id"))
+            for limit in tracking_limits
+            if limit.get("tracking_dimension_id")
+        }
+        for dimension_id in limited_dimensions:
+            value = tracking.get(dimension_id) if isinstance(tracking, dict) else None
+            if isinstance(value, dict):
+                value = value.get("id") or value.get("value_id")
+            if value is None:
+                continue
+
+            dimension_limits = [
+                limit
+                for limit in tracking_limits
+                if str(limit.get("tracking_dimension_id")) == dimension_id
+            ]
+            matching_dimension_limits = [
+                limit
+                for limit in dimension_limits
+                if limit.get("tracking_value_id") is None or str(limit.get("tracking_value_id")) == str(value)
+            ]
+            if not matching_dimension_limits:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You are not allowed to use one of the selected tracking values",
+                )
+            for limit in matching_dimension_limits:
+                if action == "post" and not limit.get("can_post", True):
+                    raise HTTPException(status_code=403, detail="You are not allowed to post to one of the selected tracking values")
+                if action == "approve" and not limit.get("can_approve", True):
+                    raise HTTPException(status_code=403, detail="You are not allowed to approve one of the selected tracking values")
+
+
+def _handle_invoice_approval_workflow(
+    *,
+    user_id: str,
+    organisation_id: str,
+    invoice_id: str,
+    invoice_amount: float,
+    journal_lines: list[dict],
+) -> dict | None:
+    workflow_res = (
+        supabase.table("approval_workflows")
+        .select("id")
+        .eq("organisation_id", organisation_id)
+        .eq("workflow_type", "invoice")
+        .eq("active", True)
+        .limit(1)
+        .execute()
+    )
+    if not workflow_res.data:
+        return None
+
+    req_id = None
+    try:
+        req_res = supabase.rpc(
+            "create_invoice_approval_request",
+            {
+                "p_org_id": organisation_id,
+                "p_invoice_id": invoice_id,
+                "p_amount": invoice_amount,
+                "p_requested_by": user_id,
+            },
+        ).execute()
+        req_id = req_res.data
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Approval workflow setup failed: {exc}") from exc
+
+    if not req_id:
+        return None
+
+    try:
+        supabase.rpc("refresh_approval_request", {"p_request_id": req_id}).execute()
+    except Exception:
+        pass
+
+    req_res = (
+        supabase.table("approval_requests")
+        .select("*")
+        .eq("id", req_id)
+        .limit(1)
+        .execute()
+    )
+    request = req_res.data[0] if req_res.data else None
+    if not request or request.get("status") == "approved":
+        return None
+    if request.get("status") in {"rejected", "cancelled"}:
+        raise HTTPException(status_code=400, detail=f"Approval request is {request.get('status')}")
+
+    steps_res = (
+        supabase.table("approval_request_steps")
+        .select("*")
+        .eq("request_id", req_id)
+        .order("step_order", desc=False)
+        .execute()
+    )
+    steps = steps_res.data or []
+    active_steps = [s for s in steps if s.get("status") in {"pending", "included"}]
+    user_role = _fetch_org_role(user_id, organisation_id)
+
+    approvable_steps = []
+    for step in active_steps:
+        approver_user = step.get("approver_user_id")
+        effective_user = _approval_effective_user(organisation_id, "invoice", approver_user)
+        if effective_user == user_id:
+            approvable_steps.append(step)
+            continue
+        approver_role = step.get("approver_role")
+        if approver_role and user_role == approver_role:
+            approvable_steps.append(step)
+
+    if not approvable_steps:
+        return {
+            "success": True,
+            "status": "pending_approval",
+            "approval_request_id": req_id,
+            "message": "Invoice submitted for approval.",
+        }
+
+    _enforce_user_limits(
+        user_id=user_id,
+        organisation_id=organisation_id,
+        journal_lines=journal_lines,
+        invoice_amount=invoice_amount,
+        action="approve",
+    )
+
+    now = _now_iso()
+    current_step = approvable_steps[0]
+    supabase.table("approval_request_steps").update({
+        "status": "approved",
+        "actioned_by": user_id,
+        "actioned_at": now,
+    }).eq("id", current_step["id"]).execute()
+
+    remaining_active = [
+        s
+        for s in active_steps
+        if s["id"] != current_step["id"] and s.get("status") in {"pending", "included"}
+    ]
+    if remaining_active:
+        return {
+            "success": True,
+            "status": "pending_approval",
+            "approval_request_id": req_id,
+            "message": "Your approval was recorded. Other included approvers are still pending.",
+        }
+
+    current_is_final = False
+    workflow_step_id = current_step.get("workflow_step_id")
+    if workflow_step_id:
+        final_res = (
+            supabase.table("approval_steps")
+            .select("is_final_step")
+            .eq("id", workflow_step_id)
+            .limit(1)
+            .execute()
+        )
+        current_is_final = bool(final_res.data and final_res.data[0].get("is_final_step"))
+
+    waiting = []
+    if not current_is_final:
+        waiting = [
+            s
+            for s in steps
+            if s.get("status") == "waiting" and s.get("step_order", 0) > current_step.get("step_order", 0)
+        ]
+    if waiting:
+        from datetime import datetime, timedelta, timezone
+
+        next_step = sorted(waiting, key=lambda s: s.get("step_order", 0))[0]
+        due_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+        supabase.table("approval_request_steps").update({
+            "status": "pending",
+            "included_at": now,
+            "due_at": due_at,
+        }).eq("id", next_step["id"]).execute()
+        supabase.table("approval_requests").update({
+            "current_step_order": next_step.get("step_order"),
+        }).eq("id", req_id).execute()
+        return {
+            "success": True,
+            "status": "pending_approval",
+            "approval_request_id": req_id,
+            "message": "Your approval was recorded. The next approval step is now pending.",
+        }
+
+    supabase.table("approval_requests").update({
+        "status": "approved",
+        "completed_at": now,
+    }).eq("id", req_id).execute()
+    return None
+
+
+@router.post("/{invoice_id}/post-to-gl")
+def post_invoice_to_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: UserAuth):
+    """
+    Create and post a double-entry GL journal for an approved invoice.
+
+    Journal structure:
+      Dr  [Expense account per line item]  — net amount (ex-VAT)
+      Dr  [VAT Control 8100]               — invoice VAT amount
+      Cr  [Trade Payables 2100]            — gross total (subtotal + VAT)
+    """
+    from decimal import Decimal
+
+    user_id, _db = auth
+    org_id = payload.organisation_id
+
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    # 1. Fetch invoice
+    inv_res = (
+        supabase.table("invoices_extracted")
+        .select("*")
+        .eq("id", invoice_id)
+        .eq("organisation_id", org_id)
+        .limit(1)
+        .execute()
+    )
+    if not inv_res.data:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    invoice = inv_res.data[0]
+
+    if invoice.get("posting_status") == "posted":
+        raise HTTPException(status_code=400, detail="Invoice has already been posted to GL")
+
+    subtotal = float(invoice.get("subtotal") or 0)
+    tax_amount = float(invoice.get("tax_amount") or 0)
+    gross_total = round(subtotal + tax_amount, 2)
+
+    if gross_total <= 0:
+        raise HTTPException(status_code=400, detail="Invoice total is zero — nothing to post")
+
+    # 2. Fetch line items
+    li_res = (
+        supabase.table("invoice_line_items")
+        .select("*")
+        .eq("invoice_extracted_id", invoice_id)
+        .eq("organisation_id", org_id)
+        .execute()
+    )
+    line_items = li_res.data or []
+
+    # Fetch allocations for all line items in one query
+    line_ids = [li["id"] for li in line_items if li.get("id")]
+    allocations_by_line: dict[str, list] = {}
+    if line_ids:
+        alloc_res = (
+            supabase.table("invoice_line_item_allocations")
+            .select("*")
+            .in_("invoice_line_item_id", line_ids)
+            .eq("organisation_id", org_id)
+            .order("sort_order")
+            .execute()
+        )
+        for a in (alloc_res.data or []):
+            lid = a.get("invoice_line_item_id")
+            allocations_by_line.setdefault(lid, []).append(a)
+
+    # 3. Fetch system accounts for this org
+    sys_accts_res = (
+        supabase.table("accounts")
+        .select("id, code, name, system_key")
+        .eq("organisation_id", org_id)
+        .in_("system_key", ["trade_payables", "vat_control"])
+        .execute()
+    )
+    sys_accts = {row["system_key"]: row for row in (sys_accts_res.data or [])}
+    trade_payables = sys_accts.get("trade_payables")
+    vat_control = sys_accts.get("vat_control")
+
+    if not trade_payables:
+        raise HTTPException(
+            status_code=400,
+            detail="Trade Payables system account not found for this organisation. "
+                   "Ensure the system accounts migration has been applied.",
+        )
+
+    # 4. Build journal lines (debit side)
+    journal_lines: list[dict] = []
+    sort_order = 0
+    missing_accounts: list[str] = []
+    description_base = f"{invoice.get('supplier_name_extracted') or 'Supplier'} — {invoice.get('invoice_number') or invoice_id[:8]}"
+
+    for li in line_items:
+        line_desc = li.get("description") or "Invoice line"
+        allocations = allocations_by_line.get(li.get("id"), [])
+        tracking = li.get("tracking") or {}
+
+        if allocations:
+            # Split line — one Dr per allocation
+            for alloc in allocations:
+                acct_id = alloc.get("expense_account")
+                if not acct_id:
+                    missing_accounts.append(f"{line_desc} (split)")
+                    continue
+                amt = round(float(alloc.get("amount") or 0), 2)
+                if amt <= 0:
+                    continue
+                journal_lines.append({
+                    "organisation_id": org_id,
+                    "account_id": acct_id,
+                    "description": f"{description_base} / {line_desc}",
+                    "debit_amount": amt,
+                    "credit_amount": 0.0,
+                    "tracking": alloc.get("tracking") or tracking,
+                    "sort_order": sort_order,
+                })
+                sort_order += 1
+        else:
+            # Unsplit line
+            acct_id = li.get("expense_account")
+            if not acct_id:
+                missing_accounts.append(line_desc)
+                continue
+            net = round(float(li.get("line_total") or 0), 2)
+            if net <= 0:
+                continue
+            journal_lines.append({
+                "organisation_id": org_id,
+                "account_id": acct_id,
+                "description": f"{description_base} / {line_desc}",
+                "debit_amount": net,
+                "credit_amount": 0.0,
+                "tracking": tracking,
+                "sort_order": sort_order,
+            })
+            sort_order += 1
+
+    if missing_accounts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot post — the following lines have no expense account: {', '.join(missing_accounts[:5])}",
+        )
+
+    # VAT line
+    if vat_control and tax_amount > 0:
+        journal_lines.append({
+            "organisation_id": org_id,
+            "account_id": vat_control["id"],
+            "description": f"{description_base} — VAT",
+            "debit_amount": round(tax_amount, 2),
+            "credit_amount": 0.0,
+            "tracking": {},
+            "sort_order": sort_order,
+        })
+        sort_order += 1
+
+    # Creditors credit line
+    total_debit = round(sum(float(l["debit_amount"]) for l in journal_lines), 2)
+    journal_lines.append({
+        "organisation_id": org_id,
+        "account_id": trade_payables["id"],
+        "description": description_base,
+        "debit_amount": 0.0,
+        "credit_amount": total_debit,
+        "tracking": {},
+        "sort_order": sort_order,
+    })
+
+    workflow_result = _handle_invoice_approval_workflow(
+        user_id=user_id,
+        organisation_id=org_id,
+        invoice_id=invoice_id,
+        invoice_amount=gross_total,
+        journal_lines=journal_lines,
+    )
+    if workflow_result:
+        return workflow_result
+
+    _enforce_user_limits(
+        user_id=user_id,
+        organisation_id=org_id,
+        journal_lines=journal_lines,
+        invoice_amount=gross_total,
+        action="post",
+    )
+
+    # 5. Create the posted journal
+    journal_id = _new_uuid()
+    now = _now_iso()
+    journal_date = (invoice.get("invoice_date") or now[:10])
+
+    supabase.table("gl_journals").insert({
+        "id": journal_id,
+        "organisation_id": org_id,
+        "source_type": "invoice",
+        "source_id": invoice_id,
+        "journal_date": journal_date,
+        "description": description_base,
+        "status": "posted",
+        "total_debit": total_debit,
+        "total_credit": total_debit,
+        "created_by": user_id,
+        "posted_by": user_id,
+        "posted_at": now,
+    }).execute()
+
+    supabase.table("gl_journal_lines").insert([
+        {**line, "gl_journal_id": journal_id}
+        for line in journal_lines
+    ]).execute()
+
+    # 6. Update invoice
+    supabase.table("invoices_extracted").update({
+        "gl_journal_id": journal_id,
+        "posting_status": "posted",
+        "posted_at": now,
+        "posted_by": user_id,
+        "approval_status": "approved",
+        "review_status": "approved",
+        "approved_at": now,
+        "approved_by": user_id,
+        "updated_at": utc_now_iso(),
+    }).eq("id", invoice_id).execute()
+
+    return {
+        "success": True,
+        "journal_id": journal_id,
+        "total_debit": total_debit,
+        "total_credit": total_debit,
+        "lines": len(journal_lines),
+        "trade_payables_account": trade_payables["code"],
+        "vat_control_account": vat_control["code"] if vat_control else None,
+    }

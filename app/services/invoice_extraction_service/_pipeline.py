@@ -32,6 +32,101 @@ from app.services.invoice_extraction.supplier_parser import (
 )
 from app.services.ai_provider_fallback import extract_with_vlm_fallback
 from app.services.invoice_extraction.vlm_parser import VLM_MERGE_FIELDS
+
+# Published rates (USD per million tokens) — update when providers change pricing.
+_COST_PER_MILLION: dict[str, dict[str, float]] = {
+    "gemini-2.5-flash": {"input": 0.15, "output": 0.60},
+    "gemini-2.5-pro":   {"input": 1.25, "output": 10.00},
+    "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
+    "gemini-1.5-pro":   {"input": 3.50, "output": 10.50},
+    "gpt-4o":           {"input": 5.00, "output": 15.00},
+    "gpt-4.1-mini":     {"input": 0.40, "output": 1.60},
+    "claude-3-5-sonnet-latest": {"input": 3.00, "output": 15.00},
+}
+
+def _auto_reconcile_vat(parsed_data: dict, vat_rate: float = 0.15) -> None:
+    """
+    Detect whether extracted line item prices are VAT-inclusive or exclusive by
+    Determine VAT treatment using the canonical decision tree:
+      1. No VAT number on document → non-VAT supplier, no VAT claimed
+      2. SUM(line_totals) ≈ doc_total → prices are VAT-INCLUSIVE → strip VAT from lines
+      3. SUM × (1+rate) ≈ doc_total  → prices are EX-VAT → use as-is, derive VAT
+      4. Neither matches → cannot determine, user sees Solve button
+
+    VLM now returns prices EXACTLY as printed — this function normalises to ex-VAT.
+    """
+    from decimal import Decimal
+
+    doc_total_raw = parsed_data.get("total_amount")
+    line_items = parsed_data.get("line_items") or []
+    vat_number = parsed_data.get("vat_number_extracted")
+
+    if not doc_total_raw or not line_items:
+        return
+
+    try:
+        doc_total = float(doc_total_raw)
+    except (TypeError, ValueError):
+        return
+
+    line_sum = sum(float(it.get("line_total") or 0) for it in line_items)
+    if line_sum <= 0 or doc_total <= 0:
+        return
+
+    # Case 1: No VAT number → non-VAT supplier, use line totals as-is
+    if not vat_number:
+        parsed_data["prices_include_vat_detected"] = "no_vat"
+        parsed_data["subtotal"] = round(line_sum, 2)
+        parsed_data["tax_amount"] = 0.0
+        return
+
+    TOLERANCE = 0.03  # 3%
+
+    # Case 2: Prices inclusive (SUM ≈ doc_total)
+    diff_inclusive = abs(line_sum - doc_total) / doc_total
+
+    # Case 3: Prices exclusive (SUM × (1+rate) ≈ doc_total)
+    diff_exclusive = abs(line_sum * (1 + vat_rate) - doc_total) / doc_total
+
+    if diff_inclusive <= diff_exclusive and diff_inclusive < TOLERANCE:
+        # VAT-INCLUSIVE: strip VAT from printed prices → store ex-VAT
+        parsed_data["prices_include_vat_detected"] = "inclusive"
+        new_items = []
+        scale = Decimal(str(1 + vat_rate))
+        for it in line_items:
+            raw_total = float(it.get("line_total") or 0)
+            ex_total = round(float(Decimal(str(raw_total)) / scale), 2)
+            raw_unit = float(it.get("unit_price") or 0)
+            ex_unit = round(float(Decimal(str(raw_unit)) / scale), 4) if raw_unit else 0
+            new_items.append({**it, "unit_price": ex_unit, "line_total": ex_total})
+        parsed_data["line_items"] = new_items
+        ex_sum = round(sum(it["line_total"] for it in new_items), 2)
+        parsed_data["subtotal"] = ex_sum
+        parsed_data["tax_amount"] = round(doc_total - ex_sum, 2)
+
+    elif diff_exclusive < diff_inclusive and diff_exclusive < TOLERANCE:
+        # EX-VAT: prices already ex-VAT → derive VAT from doc_total
+        parsed_data["prices_include_vat_detected"] = "exclusive"
+        parsed_data["subtotal"] = round(line_sum, 2)
+        parsed_data["tax_amount"] = round(doc_total - line_sum, 2)
+
+    # else: cannot determine — leave as-is, user sees Solve button
+
+
+def _calc_cost_usd(model: str | None, input_tokens: int | None, output_tokens: int | None) -> float | None:
+    if not model or input_tokens is None:
+        return None
+    # Match by prefix (e.g. "gemini-2.5-flash-001" → "gemini-2.5-flash")
+    rates = None
+    for key, r in _COST_PER_MILLION.items():
+        if (model or "").startswith(key):
+            rates = r
+            break
+    if not rates:
+        return None
+    cost = (input_tokens or 0) * rates["input"] / 1_000_000
+    cost += (output_tokens or 0) * rates.get("output", 0) / 1_000_000
+    return round(cost, 8)
 from app.services.invoice_line_items import replace_invoice_line_items
 from app.services.invoice_ocr_pipeline import (
     calculate_confidence,
@@ -295,16 +390,16 @@ def run_invoice_extraction(
 
         # Routing strategy:
         #   Digital PDFs (ocr_used=False) → pdfplumber + regex pipeline; VLM only as fallback.
-        #   Scanned PDFs (ocr_used=True, PDF MIME) → VLM if org has vlm_enabled (cost control).
+        #   Scanned PDFs (ocr_used=True, PDF MIME) → VLM always (Tesseract on scans is unreliable;
+        #     the `vlm_enabled` gate previously blocked this — removed as OCR adds cost with no benefit).
         #   Images (JPEG/PNG/WEBP/HEIC) → VLM always, regardless of vlm_enabled.
-        #     Tesseract on photos is fundamentally unreliable — VLM is not optional here.
         #     If no API key is configured, extract_with_vlm_fallback returns None gracefully.
         is_image_file = (raw.get("file_type") or "").startswith("image/")
         is_scanned_pdf = text_result.get("ocr_used", False) and not is_image_file
         force_vlm = (
             (strategy == "vlm" and vlm_enabled)
-            or is_image_file                       # always VLM for photos
-            or (is_scanned_pdf and vlm_enabled)    # VLM for scanned PDFs if org enabled
+            or is_image_file   # always VLM for photos
+            or is_scanned_pdf  # always VLM for scanned PDFs — OCR results on scans are unreliable
         )
         parsed_supplier_candidate = parsed_data.get("supplier_name_extracted")
         supplier_candidate_invalid = bool(
@@ -333,12 +428,21 @@ def run_invoice_extraction(
             )
         )
 
+        _extraction_input_tokens: int | None = None
+        _extraction_output_tokens: int | None = None
+        _extraction_model: str | None = None
+
         if vlm_should_try:
             vlm_result = extract_with_vlm_fallback(
                 file_bytes,
                 raw.get("file_type"),
                 organisation_id=org_id,
             )
+            # Capture token usage from VLM response
+            _vlm_usage = vlm_result.get("usage") or {}
+            _extraction_input_tokens = _vlm_usage.get("input_tokens")
+            _extraction_output_tokens = _vlm_usage.get("output_tokens")
+            _extraction_model = vlm_result.get("model")
             vlm_data = vlm_result.get("data")
             if vlm_data is not None:
                 vlm_confidence = vlm_data.get("confidence_score", 0)
@@ -674,6 +778,12 @@ def run_invoice_extraction(
         safe_update_invoice_raw_status(supabase, invoice_raw_id=invoice_raw_id, parse_status="failed")
         raise HTTPException(status_code=400, detail=f"Invoice extraction failed: {str(e)}")
 
+    # ── Auto-reconcile VAT treatment ─────────────────────────────────────────
+    # Compare SUM(line_totals) against document total to determine whether
+    # prices are VAT-inclusive or exclusive, then correct accordingly.
+    # This prevents the "Solve" prompt for systematic VAT differences.
+    _auto_reconcile_vat(parsed_data, vat_rate=0.15)
+
     extracted_payload = {
         "organisation_id": org_id,
         "invoice_raw_id": invoice_raw_id,
@@ -720,6 +830,11 @@ def run_invoice_extraction(
         "document_type": parsed_data.get("document_type") or "tax_invoice",
         "document_count": parsed_data.get("document_count") or 1,
         "updated_at": utc_now_iso(),
+        "extraction_input_tokens": _extraction_input_tokens,
+        "extraction_output_tokens": _extraction_output_tokens,
+        "extraction_model": _extraction_model,
+        "extraction_cost_usd": _calc_cost_usd(_extraction_model, _extraction_input_tokens, _extraction_output_tokens),
+        "prices_include_vat_detected": parsed_data.get("prices_include_vat_detected"),
     }
 
     auto_linked_supplier_id = None
