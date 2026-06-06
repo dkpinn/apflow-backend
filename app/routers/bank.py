@@ -26,6 +26,10 @@ from app.services.bank_statement_service import (
     score_rule_suggestions,
     validate_balances,
 )
+from app.services.organisation_module_settings import (
+    required_tracking_dimensions,
+    validate_bank_allocation_tracking,
+)
 
 router = APIRouter(prefix="/api/bank", tags=["bank"])
 
@@ -179,6 +183,18 @@ def build_journal_rows_for_line(
     vat_rate: Optional[float] = None,
     vat_account_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
+    try:
+        validate_bank_allocation_tracking(
+            tracking=tracking,
+            required_dimensions=required_tracking_dimensions(
+                db,
+                organisation_id=organisation_id,
+                module_key="bank_cash",
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     account = _one(
         db.table("bank_accounts").select("*").eq("id", line["bank_account_id"]).eq("organisation_id", organisation_id).limit(1).execute(),
         "Bank account not found",
@@ -203,10 +219,10 @@ def build_journal_rows_for_line(
         net_amount = total_alloc - vat_amount
         if alloc.get("debit_amount"):
             rows[0] = {**alloc, "debit_amount": dec_to_float(net_amount), "credit_amount": 0}
-            vat_line = {**alloc, "account_id": vat_account_id, "debit_amount": dec_to_float(vat_amount), "credit_amount": 0, "sort_order": 2}
+            vat_line = {**alloc, "account_id": vat_account_id, "debit_amount": dec_to_float(vat_amount), "credit_amount": 0, "tracking": {}, "sort_order": 2}
         else:
             rows[0] = {**alloc, "credit_amount": dec_to_float(net_amount), "debit_amount": 0}
-            vat_line = {**alloc, "account_id": vat_account_id, "credit_amount": dec_to_float(vat_amount), "debit_amount": 0, "sort_order": 2}
+            vat_line = {**alloc, "account_id": vat_account_id, "credit_amount": dec_to_float(vat_amount), "debit_amount": 0, "tracking": {}, "sort_order": 2}
         rows.append(vat_line)
     return rows
 
@@ -739,6 +755,53 @@ def post_bank_journal(journal_id: str, payload: PostJournalRequest, auth: UserAu
     )
     if journal.get("status") != "draft":
         raise HTTPException(status_code=400, detail="Only draft journals can be posted")
+    journal_lines = (
+        db.table("gl_journal_lines")
+        .select("account_id, tracking, sort_order")
+        .eq("gl_journal_id", journal_id)
+        .order("sort_order")
+        .execute()
+        .data
+        or []
+    )
+    if journal.get("source_type") == "bank_transaction" and journal.get("source_id"):
+        source_line = _one(
+            db.table("bank_statement_lines")
+            .select("bank_account_id")
+            .eq("id", journal["source_id"])
+            .eq("organisation_id", organisation_id)
+            .limit(1)
+            .execute(),
+            "Bank statement line not found",
+        )
+        bank_account = _one(
+            db.table("bank_accounts")
+            .select("gl_account_id")
+            .eq("id", source_line["bank_account_id"])
+            .eq("organisation_id", organisation_id)
+            .limit(1)
+            .execute(),
+            "Bank account not found",
+        )
+        allocation_line = next(
+            (
+                line
+                for line in journal_lines
+                if str(line.get("account_id")) != str(bank_account.get("gl_account_id"))
+            ),
+            None,
+        )
+        try:
+            validate_bank_allocation_tracking(
+                tracking=(allocation_line or {}).get("tracking") or {},
+                required_dimensions=required_tracking_dimensions(
+                    db,
+                    organisation_id=organisation_id,
+                    module_key="bank_cash",
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     db.table("gl_journals").update({"status": "posted", "posted_by": user_id, "posted_at": now_iso()}).eq("id", journal_id).execute()
     if journal.get("source_type") == "bank_transaction" and journal.get("source_id"):
         db.table("bank_statement_lines").update({"posting_status": "posted"}).eq("id", journal["source_id"]).execute()

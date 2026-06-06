@@ -17,6 +17,7 @@ from app.routers import channels
 from app.routers import admin_integrations
 from app.routers import integrations
 from app.routers import bank
+from app.routers import reports
 
 
 def _sweep_log(msg: str) -> None:
@@ -60,7 +61,35 @@ def _rescue_pending_invoices(supabase_client) -> None:
     except Exception as exc:
         _sweep_log(f"Error resetting stale processing items: {exc}")
 
-    # Step 1b — detect 'completed' raw invoices with no extracted record and reset to 'pending'
+    # Step 1b — detect 'queued' raw invoices with no active job (orphaned after server restart/job failure)
+    try:
+        queued_raw = (
+            supabase_client.table("invoices_raw")
+            .select("id")
+            .eq("parse_status", "queued")
+            .execute()
+        ).data or []
+        if queued_raw:
+            queued_ids = [r["id"] for r in queued_raw]
+            active_job_raw_ids = {
+                row["invoice_raw_id"]
+                for row in (
+                    supabase_client.table("document_processing_jobs")
+                    .select("invoice_raw_id")
+                    .in_("invoice_raw_id", queued_ids)
+                    .in_("status", ["queued", "processing"])
+                    .execute()
+                ).data or []
+            }
+            for row in queued_raw:
+                if row["id"] not in active_job_raw_ids:
+                    _sweep_log(f"Orphaned queued invoice {row['id']} (no active job) → resetting to pending")
+                    safe_update_invoice_raw_status(supabase_client, invoice_raw_id=row["id"], parse_status="pending")
+                    stale_reset += 1
+    except Exception as exc:
+        _sweep_log(f"Error resetting orphaned queued items: {exc}")
+
+    # Step 1c — detect 'completed' raw invoices with no extracted record and reset to 'pending'
     try:
         completed_rows = (
             supabase_client.table("invoices_raw")
@@ -318,6 +347,7 @@ app.include_router(channels.router)
 app.include_router(admin_integrations.router)
 app.include_router(integrations.router)
 app.include_router(bank.router)
+app.include_router(reports.router)
 
 
 @app.get("/")

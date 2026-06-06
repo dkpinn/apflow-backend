@@ -142,26 +142,50 @@ def get_organisation(organisation_id: str) -> Optional[dict]:
 
 
 def get_organisation_extraction_settings(organisation_id: str) -> dict:
-    settings_res = (
-        supabase
-        .table("organisations")
-        .select("extraction_strategy, ask_per_upload, vlm_enabled, supplier_auto_link_min_matches")
-        .eq("id", organisation_id)
-        .limit(1)
-        .execute()
-    )
-
-    settings = settings_res.data[0] if settings_res.data else {}
+    try:
+        settings_res = (
+            supabase
+            .table("organisations")
+            .select(
+                "extraction_strategy, ask_per_upload, vlm_enabled, "
+                "supplier_auto_link_min_matches, reporting_standard, "
+                "income_statement_presentation"
+            )
+            .eq("id", organisation_id)
+            .limit(1)
+            .execute()
+        )
+        settings = settings_res.data[0] if settings_res.data else {}
+    except Exception:
+        # Fallback if newer columns (C9) not yet migrated — extraction still proceeds with defaults
+        try:
+            settings_res = (
+                supabase
+                .table("organisations")
+                .select("extraction_strategy, ask_per_upload, vlm_enabled, supplier_auto_link_min_matches")
+                .eq("id", organisation_id)
+                .limit(1)
+                .execute()
+            )
+            settings = settings_res.data[0] if settings_res.data else {}
+        except Exception:
+            settings = {}
     min_matches = settings.get("supplier_auto_link_min_matches")
     try:
         min_matches = int(min_matches)
     except (TypeError, ValueError):
         min_matches = 2
+    reporting_standard = settings.get("reporting_standard") or "ifrs"
+    presentation = settings.get("income_statement_presentation") or "function"
+    if reporting_standard == "us_gaap":
+        presentation = "function"
     return {
         "extraction_strategy": settings.get("extraction_strategy") or "auto_group",
         "ask_per_upload": bool(settings.get("ask_per_upload")),
         "vlm_enabled": bool(settings.get("vlm_enabled")),
         "supplier_auto_link_min_matches": min(4, max(1, min_matches)),
+        "reporting_standard": reporting_standard,
+        "income_statement_presentation": presentation,
     }
 
 

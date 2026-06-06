@@ -65,6 +65,7 @@ UserAuth = Annotated[tuple, Depends(authenticated_user)]
 # ── Org-scoped authorisation helpers ─────────────────────────────────────────
 
 WRITE_ROLES: frozenset[str] = frozenset({"owner", "admin", "accountant"})
+ADMIN_ROLES: frozenset[str] = frozenset({"owner", "admin"})
 
 
 def org_role_for_user(user_id: str, organisation_id: Optional[str]) -> Optional[str]:
@@ -109,6 +110,16 @@ def ensure_org_write(user_id: str, organisation_id: Optional[str]) -> None:
         raise HTTPException(
             status_code=403,
             detail="Only owners, admins, and accountants can perform this action",
+        )
+
+
+def ensure_org_admin(user_id: str, organisation_id: Optional[str]) -> None:
+    """Raise 403 unless the user is an organisation owner or admin."""
+    role = org_role_for_user(user_id, organisation_id)
+    if role not in ADMIN_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail="Only organisation owners and admins can change these settings",
         )
 
 

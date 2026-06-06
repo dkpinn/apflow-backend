@@ -5,6 +5,7 @@ from typing import Any, Optional
 from app.services.audit_log import log_invoice_event
 from app.services.invoice_data_builders import utc_now_iso
 from app.services.invoice_review_agent import generate_invoice_agent_suggestions
+from app.services.organisation_module_settings import required_tracking_dimensions
 
 
 READY_REVIEW_STATUS = "reviewed"
@@ -227,13 +228,14 @@ def _fetch_invoice_context(supabase, invoice_extracted_id: str, organisation_id:
     tracking_dimensions = []
     tracking_values = []
     if org_id:
-        tracking_dimensions = _fetch_rows(
-            supabase.table("tracking_dimensions")
-            .select("id, name, position, active")
-            .eq("organisation_id", org_id)
-            .eq("active", True)
-            .order("position", desc=False)
-        )
+        try:
+            tracking_dimensions = required_tracking_dimensions(
+                supabase,
+                organisation_id=str(org_id),
+                module_key="supplier",
+            )
+        except Exception:
+            tracking_dimensions = []
         dimension_ids = [row.get("id") for row in tracking_dimensions if row.get("id")]
         if dimension_ids:
             tracking_values = _fetch_rows(

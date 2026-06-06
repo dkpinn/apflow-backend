@@ -5,6 +5,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from app.services.organisation_module_settings import missing_tracking_dimensions
+
 
 SUGGESTION_STATUSES = {"open", "applied", "dismissed", "checked"}
 
@@ -399,7 +401,7 @@ def _coding_suggestions(
 ) -> list[AgentSuggestion]:
     suggestions: list[AgentSuggestion] = []
     default_account = (supplier or {}).get("default_expense_account") or invoice.get("expense_account")
-    has_cost_centre = bool(tracking_dimensions)
+    has_required_tracking = bool(tracking_dimensions)
 
     if not line_items:
         if not has_value(invoice.get("expense_account")) and has_value(default_account):
@@ -427,7 +429,8 @@ def _coding_suggestions(
         return suggestions
 
     missing_account_count = 0
-    missing_cost_centre_count = 0
+    missing_tracking_count = 0
+    first_missing_tracking_item: Optional[dict] = None
     for index, item in enumerate(line_items):
         allocations = item.get("allocations") or []
         description = item.get("description") or f"line {index + 1}"
@@ -449,9 +452,15 @@ def _coding_suggestions(
                 ))
 
         tracking = normalise_tracking(item.get("tracking"))
-        allocations_have_tracking = any(normalise_tracking(allocation.get("tracking")) for allocation in allocations)
-        if has_cost_centre and not tracking and not allocations_have_tracking:
-            missing_cost_centre_count += 1
+        effective_allocations = allocations or [{"tracking": tracking}]
+        for allocation in effective_allocations:
+            effective_tracking = normalise_tracking(allocation.get("tracking")) or tracking
+            if has_required_tracking and missing_tracking_dimensions(
+                effective_tracking,
+                tracking_dimensions,
+            ):
+                missing_tracking_count += 1
+                first_missing_tracking_item = first_missing_tracking_item or item
 
     if missing_account_count and not has_value(default_account):
         suggestions.append(AgentSuggestion(
@@ -463,22 +472,20 @@ def _coding_suggestions(
             target={"tab": "line_items", "field": "expense_account"},
         ))
 
-    if missing_cost_centre_count:
-        first_missing = next((
-            item for item in line_items
-            if item.get("id")
-            and not normalise_tracking(item.get("tracking"))
-            and not any(normalise_tracking(allocation.get("tracking")) for allocation in (item.get("allocations") or []))
-        ), None)
+    if missing_tracking_count:
+        required_names = ", ".join(
+            str(dimension.get("name") or dimension.get("id"))
+            for dimension in tracking_dimensions
+        )
         suggestions.append(AgentSuggestion(
             category="cost_centre",
             severity="warning",
-            message=f"{missing_cost_centre_count} line item(s) have no cost centre or tracking split.",
-            reason="Tracking dimensions exist for this organisation, so uncoded lines may be incomplete for management reporting.",
+            message=f"{missing_tracking_count} expense allocation(s) are missing required tracking.",
+            reason=f"Supplier posting requires these dimensions on every allocation: {required_names}.",
             confidence=0.78,
             target={
                 "tab": "line_items",
-                "line_item_id": first_missing.get("id") if first_missing else None,
+                "line_item_id": first_missing_tracking_item.get("id") if first_missing_tracking_item else None,
                 "field": "cost_centre",
             },
         ))

@@ -75,7 +75,7 @@ def _auto_reconcile_vat(parsed_data: dict, vat_rate: float = 0.15) -> None:
 
     # Case 1: No VAT number → non-VAT supplier, use line totals as-is
     if not vat_number:
-        parsed_data["prices_include_vat_detected"] = "no_vat"
+        parsed_data["prices_include_vat_detected"] = None  # not applicable, not a DB enum value
         parsed_data["subtotal"] = round(line_sum, 2)
         parsed_data["tax_amount"] = 0.0
         return

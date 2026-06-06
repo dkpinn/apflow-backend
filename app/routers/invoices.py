@@ -20,6 +20,11 @@ from app.services.invoice_supplier_rules import (
 )
 from app.services.invoice_parse_attempts import fetch_parse_attempts, persist_parse_attempts
 from app.services.invoice_line_items import replace_invoice_line_items
+from app.services.invoice_gl_posting import build_invoice_debit_lines
+from app.services.organisation_module_settings import (
+    required_tracking_dimensions,
+    validate_supplier_allocations_tracking,
+)
 from app.services.invoice_review_agent import (
     agent_status_after_regeneration,
     filter_safe_apply_payload,
@@ -546,16 +551,11 @@ def _fetch_agent_context(invoice_id: str) -> dict:
             accounts = []
 
         try:
-            dimensions_res = (
-                supabase
-                .table("tracking_dimensions")
-                .select("id, name, position, active")
-                .eq("organisation_id", organisation_id)
-                .eq("active", True)
-                .order("position", desc=False)
-                .execute()
+            tracking_dimensions = required_tracking_dimensions(
+                supabase,
+                organisation_id=str(organisation_id),
+                module_key="supplier",
             )
-            tracking_dimensions = dimensions_res.data or []
             dimension_ids = [row.get("id") for row in tracking_dimensions if row.get("id")]
             if dimension_ids:
                 values_res = (
@@ -1217,7 +1217,7 @@ def save_invoice_line_items(req: SaveLineItemsRequest):
         if 0 < abs_diff <= 0.02:
             # Absorb silently — floating-point drift, total_amount already close enough
             rounding_applied = "vat_adjusted"
-        elif abs_diff <= 0.50:
+        elif 0 < abs_diff <= 0.50:
             # Named rounding line item for visible penny differences
             final_line_items.append({"description": "Rounding adjustment", "line_total": diff})
             subtotal = round(subtotal + diff, 2)
@@ -1892,25 +1892,31 @@ def _enforce_user_limits(
     invoice_amount: float,
     action: str,
 ) -> None:
-    account_limits_res = (
-        supabase.table("organisation_user_account_limits")
-        .select("*")
-        .eq("organisation_id", organisation_id)
-        .eq("user_id", user_id)
-        .eq("active", True)
-        .execute()
-    )
-    account_limits = account_limits_res.data or []
+    try:
+        account_limits_res = (
+            supabase.table("organisation_user_account_limits")
+            .select("*")
+            .eq("organisation_id", organisation_id)
+            .eq("user_id", user_id)
+            .eq("active", True)
+            .execute()
+        )
+        account_limits = account_limits_res.data or []
+    except Exception:
+        account_limits = []  # table not yet migrated — no limits configured
 
-    tracking_limits_res = (
-        supabase.table("organisation_user_tracking_limits")
-        .select("*")
-        .eq("organisation_id", organisation_id)
-        .eq("user_id", user_id)
-        .eq("active", True)
-        .execute()
-    )
-    tracking_limits = tracking_limits_res.data or []
+    try:
+        tracking_limits_res = (
+            supabase.table("organisation_user_tracking_limits")
+            .select("*")
+            .eq("organisation_id", organisation_id)
+            .eq("user_id", user_id)
+            .eq("active", True)
+            .execute()
+        )
+        tracking_limits = tracking_limits_res.data or []
+    except Exception:
+        tracking_limits = []  # table not yet migrated — no limits configured
 
     for line in journal_lines:
         account_id = line.get("account_id")
@@ -1988,15 +1994,18 @@ def _handle_invoice_approval_workflow(
     invoice_amount: float,
     journal_lines: list[dict],
 ) -> dict | None:
-    workflow_res = (
-        supabase.table("approval_workflows")
-        .select("id")
-        .eq("organisation_id", organisation_id)
-        .eq("workflow_type", "invoice")
-        .eq("active", True)
-        .limit(1)
-        .execute()
-    )
+    try:
+        workflow_res = (
+            supabase.table("approval_workflows")
+            .select("id")
+            .eq("organisation_id", organisation_id)
+            .eq("workflow_type", "invoice")
+            .eq("active", True)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        return None  # approval_workflows table not present — skip workflow
     if not workflow_res.data:
         return None
 
@@ -2148,7 +2157,8 @@ def post_invoice_to_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: U
 
     Journal structure:
       Dr  [Expense account per line item]  — net amount (ex-VAT)
-      Dr  [VAT Control 8100]               — invoice VAT amount
+      Dr  [Expense account per line item]  — blocked/non-claimable VAT
+      Dr  [VAT Control 8100]               — allowable input VAT
       Cr  [Trade Payables 2100]            — gross total (subtotal + VAT)
     """
     from decimal import Decimal
@@ -2192,6 +2202,19 @@ def post_invoice_to_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: U
     )
     line_items = li_res.data or []
 
+    supplier_vat_number = invoice.get("vat_number_extracted")
+    if invoice.get("supplier_id"):
+        supplier_res = (
+            supabase.table("suppliers")
+            .select("vat_number")
+            .eq("id", invoice["supplier_id"])
+            .eq("organisation_id", org_id)
+            .limit(1)
+            .execute()
+        )
+        if supplier_res.data:
+            supplier_vat_number = supplier_res.data[0].get("vat_number") or supplier_vat_number
+
     # Fetch allocations for all line items in one query
     line_ids = [li["id"] for li in line_items if li.get("id")]
     allocations_by_line: dict[str, list] = {}
@@ -2206,17 +2229,17 @@ def post_invoice_to_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: U
         )
         for a in (alloc_res.data or []):
             lid = a.get("invoice_line_item_id")
-            allocations_by_line.setdefault(lid, []).append(a)
+            allocations_by_line.setdefault(str(lid), []).append(a)
 
-    # 3. Fetch system accounts for this org
-    sys_accts_res = (
+    # 3. Fetch all accounts for this org (used for system account lookup + code/name resolution)
+    all_accts_res = (
         supabase.table("accounts")
         .select("id, code, name, system_key")
         .eq("organisation_id", org_id)
-        .in_("system_key", ["trade_payables", "vat_control"])
         .execute()
     )
-    sys_accts = {row["system_key"]: row for row in (sys_accts_res.data or [])}
+    all_accts = all_accts_res.data or []
+    sys_accts = {row["system_key"]: row for row in all_accts if row.get("system_key")}
     trade_payables = sys_accts.get("trade_payables")
     vat_control = sys_accts.get("vat_control")
 
@@ -2227,56 +2250,56 @@ def post_invoice_to_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: U
                    "Ensure the system accounts migration has been applied.",
         )
 
+    # Resolve expense_account code/name → UUID (supports legacy line items that stored account codes)
+    _acct_by_code = {a["code"]: a["id"] for a in all_accts if a.get("code")}
+    _acct_by_name = {a["name"]: a["id"] for a in all_accts if a.get("name")}
+
+    def _resolve_acct(val: str | None) -> str | None:
+        if not val:
+            return val
+        if len(str(val)) == 36 and "-" in str(val):  # already a UUID
+            return val
+        return _acct_by_code.get(val) or _acct_by_name.get(val) or val
+
+    line_items = [
+        {**li, "expense_account": _resolve_acct(li.get("expense_account"))}
+        for li in line_items
+    ]
+    allocations_by_line = {
+        lid: [
+            {**a, "expense_account": _resolve_acct(a.get("expense_account"))}
+            for a in allocs
+        ]
+        for lid, allocs in allocations_by_line.items()
+    }
+
+    try:
+        supplier_required_dimensions = required_tracking_dimensions(
+            supabase,
+            organisation_id=org_id,
+            module_key="supplier",
+        )
+        validate_supplier_allocations_tracking(
+            line_items=line_items,
+            allocations_by_line=allocations_by_line,
+            required_dimensions=supplier_required_dimensions,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     # 4. Build journal lines (debit side)
-    journal_lines: list[dict] = []
-    sort_order = 0
-    missing_accounts: list[str] = []
-    description_base = f"{invoice.get('supplier_name_extracted') or 'Supplier'} — {invoice.get('invoice_number') or invoice_id[:8]}"
-
-    for li in line_items:
-        line_desc = li.get("description") or "Invoice line"
-        allocations = allocations_by_line.get(li.get("id"), [])
-        tracking = li.get("tracking") or {}
-
-        if allocations:
-            # Split line — one Dr per allocation
-            for alloc in allocations:
-                acct_id = alloc.get("expense_account")
-                if not acct_id:
-                    missing_accounts.append(f"{line_desc} (split)")
-                    continue
-                amt = round(float(alloc.get("amount") or 0), 2)
-                if amt <= 0:
-                    continue
-                journal_lines.append({
-                    "organisation_id": org_id,
-                    "account_id": acct_id,
-                    "description": f"{description_base} / {line_desc}",
-                    "debit_amount": amt,
-                    "credit_amount": 0.0,
-                    "tracking": alloc.get("tracking") or tracking,
-                    "sort_order": sort_order,
-                })
-                sort_order += 1
-        else:
-            # Unsplit line
-            acct_id = li.get("expense_account")
-            if not acct_id:
-                missing_accounts.append(line_desc)
-                continue
-            net = round(float(li.get("line_total") or 0), 2)
-            if net <= 0:
-                continue
-            journal_lines.append({
-                "organisation_id": org_id,
-                "account_id": acct_id,
-                "description": f"{description_base} / {line_desc}",
-                "debit_amount": net,
-                "credit_amount": 0.0,
-                "tracking": tracking,
-                "sort_order": sort_order,
-            })
-            sort_order += 1
+    posting = build_invoice_debit_lines(
+        organisation_id=org_id,
+        invoice=invoice,
+        line_items=line_items,
+        allocations_by_line=allocations_by_line,
+        supplier_has_vat_number=bool(str(supplier_vat_number or "").strip()),
+        vat_control_account_id=str(vat_control["id"]) if vat_control else None,
+    )
+    journal_lines = posting["journal_lines"]
+    missing_accounts = posting["missing_accounts"]
+    claimable_tax = posting["claimable_tax"]
+    description_base = posting["description_base"]
 
     if missing_accounts:
         raise HTTPException(
@@ -2284,21 +2307,22 @@ def post_invoice_to_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: U
             detail=f"Cannot post — the following lines have no expense account: {', '.join(missing_accounts[:5])}",
         )
 
-    # VAT line
-    if vat_control and tax_amount > 0:
-        journal_lines.append({
-            "organisation_id": org_id,
-            "account_id": vat_control["id"],
-            "description": f"{description_base} — VAT",
-            "debit_amount": round(tax_amount, 2),
-            "credit_amount": 0.0,
-            "tracking": {},
-            "sort_order": sort_order,
-        })
-        sort_order += 1
+    if claimable_tax > 0 and not vat_control:
+        raise HTTPException(
+            status_code=400,
+            detail="VAT Control system account not found for this organisation.",
+        )
 
     # Creditors credit line
     total_debit = round(sum(float(l["debit_amount"]) for l in journal_lines), 2)
+    if abs(total_debit - gross_total) > 0.02:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "VAT allocation did not reconcile to the invoice total "
+                f"({total_debit:.2f} posted vs {gross_total:.2f} invoice)."
+            ),
+        )
     journal_lines.append({
         "organisation_id": org_id,
         "account_id": trade_payables["id"],
@@ -2306,7 +2330,7 @@ def post_invoice_to_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: U
         "debit_amount": 0.0,
         "credit_amount": total_debit,
         "tracking": {},
-        "sort_order": sort_order,
+        "sort_order": len(journal_lines),
     })
 
     workflow_result = _handle_invoice_approval_workflow(
