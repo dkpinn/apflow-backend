@@ -12,7 +12,7 @@ from app.services.invoice_parse_attempts import fetch_parse_attempts
 
 SUPPLIER_PROCESSING_SELECT = (
     "parse_line_items, line_items_include_vat, default_vat_rate, "
-    "default_expense_account, track_inventory, use_uom_from_description"
+    "default_expense_account, default_tracking, track_inventory, use_uom_from_description"
 )
 
 DEFAULT_SUPPLIER_PROCESSING_SETTINGS = {
@@ -20,6 +20,7 @@ DEFAULT_SUPPLIER_PROCESSING_SETTINGS = {
     "line_items_include_vat": False,
     "default_vat_rate": None,
     "default_expense_account": None,
+    "default_tracking": {},
     "track_inventory": False,
     "use_uom_from_description": False,
     "allocation_rules": [],
@@ -184,10 +185,13 @@ def _apply_allocation_rule_to_line(item: dict, rule: dict) -> dict:
 
     updated = dict(item)
     first_split = splits[0]
+    base_tracking = _normalise_tracking(item.get("tracking"))
     if first_split.get("expense_account"):
         updated["expense_account"] = first_split.get("expense_account")
-    if first_split.get("tracking"):
-        updated["tracking"] = first_split.get("tracking")
+    updated["tracking"] = {
+        **base_tracking,
+        **_normalise_tracking(first_split.get("tracking")),
+    }
 
     line_total = _round_money(item.get("line_total") if item.get("line_total") is not None else item.get("amount"))
     if line_total is not None:
@@ -195,7 +199,10 @@ def _apply_allocation_rule_to_line(item: dict, rule: dict) -> dict:
         updated["allocations"] = [
             {
                 "expense_account": split.get("expense_account"),
-                "tracking": split.get("tracking") or {},
+                "tracking": {
+                    **base_tracking,
+                    **_normalise_tracking(split.get("tracking")),
+                },
                 "amount": amounts[index],
                 "percent": split.get("percent"),
                 "note": split.get("note") or rule.get("name"),
@@ -394,6 +401,7 @@ def apply_supplier_processing_rules(
     parse_line_items = settings.get("parse_line_items", True)
     line_items_include_vat = settings.get("line_items_include_vat", False)
     default_expense_account = settings.get("default_expense_account")
+    default_tracking = _normalise_tracking(settings.get("default_tracking"))
 
     if parse_line_items is False:
         supplier_name = parsed_data.get("supplier_name_extracted") or parsed_data.get("issuer_name_extracted") or "Supplier"
@@ -446,6 +454,30 @@ def apply_supplier_processing_rules(
         invoice_patch["expense_account"] = default_expense_account
         if line_items:
             line_items = [{**item, "expense_account": default_expense_account} for item in line_items]
+
+    if default_tracking and line_items:
+        line_items = [
+            {
+                **item,
+                "tracking": {
+                    **default_tracking,
+                    **_normalise_tracking(item.get("tracking")),
+                },
+                **({
+                    "allocations": [
+                        {
+                            **allocation,
+                            "tracking": {
+                                **default_tracking,
+                                **_normalise_tracking(allocation.get("tracking")),
+                            },
+                        }
+                        for allocation in item.get("allocations") or []
+                    ],
+                } if item.get("allocations") else {}),
+            }
+            for item in line_items
+        ]
 
     line_items = apply_supplier_allocation_rules(
         parsed_data,

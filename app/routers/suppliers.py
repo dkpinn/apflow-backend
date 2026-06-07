@@ -4,10 +4,10 @@ import re
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.db.supabase_client import get_supabase_client
-from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
+from app.dependencies import UserAuth, ensure_org_admin, ensure_org_read, ensure_org_write
 from app.services.audit_log import log_invoice_event
 from app.services.invoice_data_builders import utc_now_iso
 from app.services.invoice_supplier_rules import fetch_supplier_allocation_rules
@@ -153,6 +153,7 @@ class SupplierCreateRequest(BaseModel):
     track_inventory: Optional[bool] = None
     use_uom_from_description: Optional[bool] = None
     default_expense_account: Optional[str] = None
+    default_tracking: dict[str, str] = Field(default_factory=dict)
     default_vat_rate: Optional[float] = None
     invoice_extracted_id: Optional[str] = None
     invoice_raw_id: Optional[str] = None
@@ -168,6 +169,7 @@ class SupplierFromInvoiceRequest(BaseModel):
     track_inventory: Optional[bool] = None
     use_uom_from_description: Optional[bool] = None
     default_expense_account: Optional[str] = None
+    default_tracking: dict[str, str] = Field(default_factory=dict)
     default_vat_rate: Optional[float] = None
     link_invoice: bool = True
 
@@ -181,6 +183,7 @@ class SupplierLinkRequest(BaseModel):
 
 class SupplierMatchProfileRequest(BaseModel):
     organisation_id: str
+    invoice_total: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     supplier_name: Optional[str] = None
     vat_number: Optional[str] = None
     company_registration_number: Optional[str] = None
@@ -189,6 +192,32 @@ class SupplierMatchProfileRequest(BaseModel):
     phone: Optional[str] = None
     default_email: Optional[str] = None
     accounting_email: Optional[str] = None
+
+
+class SupplierStpSettingsRequest(BaseModel):
+    organisation_id: str
+    stp_enabled: bool
+    stp_max_amount: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+
+
+class SupplierStpSettingsResponse(BaseModel):
+    supplier_id: str
+    organisation_id: str
+    stp_enabled: bool
+    stp_max_amount: Optional[float] = None
+
+
+class SupplierAllocationSettingsRequest(BaseModel):
+    organisation_id: str
+    default_expense_account: Optional[str] = None
+    default_tracking: Optional[dict[str, str]] = None
+
+
+class SupplierAllocationSettingsResponse(BaseModel):
+    supplier_id: str
+    organisation_id: str
+    default_expense_account: Optional[str] = None
+    default_tracking: dict[str, str] = Field(default_factory=dict)
 
 
 class SupplierBranchCreateRequest(BaseModel):
@@ -364,7 +393,8 @@ def suggest_supplier_match(invoice_extracted_id: str):
         .select(
             "organisation_id, supplier_name_extracted, supplier_id, vat_number_extracted, "
             "company_registration_number_extracted, cus_code_extracted, bank_account_number_extracted, "
-            "supplier_telephone_extracted, supplier_cell_extracted, supplier_email_extracted, supplier_acc_email_extracted"
+            "supplier_telephone_extracted, supplier_cell_extracted, supplier_email_extracted, "
+            "supplier_acc_email_extracted, total_amount"
         )
         .eq("id", invoice_extracted_id)
         .limit(1)
@@ -380,6 +410,7 @@ def suggest_supplier_match(invoice_extracted_id: str):
     suggestion = find_supplier_match_result(
         supabase,
         org_id=inv["organisation_id"],
+        invoice_total=inv.get("total_amount"),
         supplier_name_extracted=inv.get("supplier_name_extracted"),
         vat_number_extracted=inv.get("vat_number_extracted"),
         company_registration_number_extracted=inv.get("company_registration_number_extracted"),
@@ -400,6 +431,7 @@ def match_supplier_profile(payload: SupplierMatchProfileRequest):
     suggestion = find_supplier_match_result(
         supabase,
         org_id=payload.organisation_id,
+        invoice_total=payload.invoice_total,
         supplier_name_extracted=payload.supplier_name,
         vat_number_extracted=payload.vat_number,
         company_registration_number_extracted=payload.company_registration_number,
@@ -410,6 +442,191 @@ def match_supplier_profile(payload: SupplierMatchProfileRequest):
         supplier_acc_email_extracted=payload.accounting_email,
     )
     return {"suggestion": suggestion}
+
+
+@router.patch(
+    "/{supplier_id}/stp-settings",
+    response_model=SupplierStpSettingsResponse,
+)
+def update_supplier_stp_settings(
+    supplier_id: str,
+    payload: SupplierStpSettingsRequest,
+    auth: UserAuth,
+):
+    user_id, db = auth
+    ensure_org_admin(user_id, payload.organisation_id)
+
+    supplier_result = (
+        db.table("suppliers")
+        .select("id, organisation_id")
+        .eq("id", supplier_id)
+        .eq("organisation_id", payload.organisation_id)
+        .limit(1)
+        .execute()
+    )
+    if not supplier_result.data:
+        raise HTTPException(status_code=404, detail="Supplier not found")
+
+    update_result = (
+        db.table("suppliers")
+        .update({
+            "stp_enabled": payload.stp_enabled,
+            "stp_max_amount": payload.stp_max_amount,
+            "updated_at": utc_now_iso(),
+        })
+        .eq("id", supplier_id)
+        .eq("organisation_id", payload.organisation_id)
+        .execute()
+    )
+    saved = update_result.data[0] if update_result.data else {
+        "id": supplier_id,
+        "organisation_id": payload.organisation_id,
+        "stp_enabled": payload.stp_enabled,
+        "stp_max_amount": payload.stp_max_amount,
+    }
+    return {
+        "supplier_id": str(saved.get("id") or supplier_id),
+        "organisation_id": str(saved.get("organisation_id") or payload.organisation_id),
+        "stp_enabled": bool(saved.get("stp_enabled")),
+        "stp_max_amount": saved.get("stp_max_amount"),
+    }
+
+
+def _validated_default_tracking(
+    db,
+    *,
+    organisation_id: str,
+    tracking: dict[str, str],
+) -> dict[str, str]:
+    normalised = {
+        str(dimension_id): str(value_id)
+        for dimension_id, value_id in (tracking or {}).items()
+        if dimension_id and value_id
+    }
+    if not normalised:
+        return {}
+
+    dimension_ids = list(normalised)
+    dimensions = (
+        db.table("tracking_dimensions")
+        .select("id")
+        .eq("organisation_id", organisation_id)
+        .eq("active", True)
+        .in_("id", dimension_ids)
+        .execute()
+        .data
+        or []
+    )
+    valid_dimension_ids = {str(row.get("id")) for row in dimensions}
+    if valid_dimension_ids != set(dimension_ids):
+        raise HTTPException(
+            status_code=422,
+            detail="Every default tracking dimension must be active and belong to this organisation",
+        )
+
+    values = (
+        db.table("tracking_values")
+        .select("id, dimension_id")
+        .eq("active", True)
+        .in_("id", list(normalised.values()))
+        .execute()
+        .data
+        or []
+    )
+    value_dimensions = {
+        str(row.get("id")): str(row.get("dimension_id"))
+        for row in values
+    }
+    if any(value_dimensions.get(value_id) != dimension_id for dimension_id, value_id in normalised.items()):
+        raise HTTPException(
+            status_code=422,
+            detail="Every default tracking value must be active and belong to its selected dimension",
+        )
+    return normalised
+
+
+@router.get(
+    "/{supplier_id}/allocation-settings",
+    response_model=SupplierAllocationSettingsResponse,
+)
+def get_supplier_allocation_settings(
+    supplier_id: str,
+    organisation_id: str = Query(...),
+    auth: UserAuth = ...,
+):
+    user_id, db = auth
+    ensure_org_read(user_id, organisation_id)
+    result = (
+        db.table("suppliers")
+        .select("id, organisation_id, default_expense_account, default_tracking")
+        .eq("id", supplier_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Supplier not found")
+    supplier = result.data[0]
+    return {
+        "supplier_id": str(supplier["id"]),
+        "organisation_id": str(supplier["organisation_id"]),
+        "default_expense_account": supplier.get("default_expense_account"),
+        "default_tracking": supplier.get("default_tracking") or {},
+    }
+
+
+@router.patch(
+    "/{supplier_id}/allocation-settings",
+    response_model=SupplierAllocationSettingsResponse,
+)
+def update_supplier_allocation_settings(
+    supplier_id: str,
+    payload: SupplierAllocationSettingsRequest,
+    auth: UserAuth,
+):
+    user_id, db = auth
+    ensure_org_write(user_id, payload.organisation_id)
+    existing = (
+        db.table("suppliers")
+        .select("id, organisation_id, default_expense_account, default_tracking")
+        .eq("id", supplier_id)
+        .eq("organisation_id", payload.organisation_id)
+        .limit(1)
+        .execute()
+    )
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Supplier not found")
+
+    current = existing.data[0]
+    updates = {"updated_at": utc_now_iso()}
+    if "default_expense_account" in payload.model_fields_set:
+        updates["default_expense_account"] = payload.default_expense_account
+    if "default_tracking" in payload.model_fields_set:
+        updates["default_tracking"] = _validated_default_tracking(
+            db,
+            organisation_id=payload.organisation_id,
+            tracking=payload.default_tracking or {},
+        )
+    if len(updates) == 1:
+        raise HTTPException(status_code=400, detail="No allocation settings were provided to update")
+
+    result = (
+        db.table("suppliers")
+        .update(updates)
+        .eq("id", supplier_id)
+        .eq("organisation_id", payload.organisation_id)
+        .execute()
+    )
+    supplier = result.data[0] if result.data else {
+        **current,
+        **updates,
+    }
+    return {
+        "supplier_id": str(supplier.get("id") or supplier_id),
+        "organisation_id": str(supplier.get("organisation_id") or payload.organisation_id),
+        "default_expense_account": supplier.get("default_expense_account"),
+        "default_tracking": supplier.get("default_tracking") or {},
+    }
 
 
 def _validate_choice(value: str, allowed: set[str], label: str) -> None:
@@ -1324,8 +1541,14 @@ def create_supplier(payload: SupplierCreateRequest, auth: UserAuth):
     user_id, _db = auth
     ensure_org_write(user_id, payload.organisation_id)
 
+    default_tracking = _validated_default_tracking(
+        supabase,
+        organisation_id=payload.organisation_id,
+        tracking=payload.default_tracking,
+    )
     insert_payload = _filter_supplier_payload({
         **payload.model_dump(exclude={"invoice_extracted_id", "invoice_raw_id", "link_invoice"}),
+        "default_tracking": default_tracking,
         "created_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
         "active": True,
@@ -1374,10 +1597,16 @@ def create_supplier_from_invoice(payload: SupplierFromInvoiceRequest, auth: User
         raise HTTPException(status_code=404, detail="Invoice not found")
     ensure_org_write(user_id, organisation_id)
 
+    default_tracking = _validated_default_tracking(
+        supabase,
+        organisation_id=organisation_id,
+        tracking=payload.default_tracking,
+    )
     insert_payload = _filter_supplier_payload(
         {
             **_build_supplier_payload_from_extracted(invoice, supplier_name_override=payload.supplier_name),
             **_supplier_processing_overrides(payload),
+            "default_tracking": default_tracking,
         }
     )
 

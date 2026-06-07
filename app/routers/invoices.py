@@ -20,11 +20,7 @@ from app.services.invoice_supplier_rules import (
 )
 from app.services.invoice_parse_attempts import fetch_parse_attempts, persist_parse_attempts
 from app.services.invoice_line_items import replace_invoice_line_items
-from app.services.invoice_gl_posting import build_invoice_debit_lines
-from app.services.organisation_module_settings import (
-    required_tracking_dimensions,
-    validate_supplier_allocations_tracking,
-)
+from app.services.organisation_module_settings import required_tracking_dimensions
 from app.services.invoice_review_agent import (
     agent_status_after_regeneration,
     filter_safe_apply_payload,
@@ -1825,11 +1821,6 @@ class PostInvoiceToGLRequest(BaseModel):
     organisation_id: str
 
 
-def _new_uuid() -> str:
-    import uuid
-    return str(uuid.uuid4())
-
-
 def _now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
@@ -2161,184 +2152,32 @@ def post_invoice_to_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: U
       Dr  [VAT Control 8100]               — allowable input VAT
       Cr  [Trade Payables 2100]            — gross total (subtotal + VAT)
     """
-    from decimal import Decimal
+    from app.services.invoice_gl_posting import (
+        post_invoice_to_gl_service,
+        prepare_invoice_gl_posting,
+    )
 
-    user_id, _db = auth
+    user_id, db = auth
     org_id = payload.organisation_id
 
     if supabase is None:
         raise HTTPException(status_code=500, detail="Database not configured")
 
-    # 1. Fetch invoice
-    inv_res = (
-        supabase.table("invoices_extracted")
-        .select("*")
-        .eq("id", invoice_id)
-        .eq("organisation_id", org_id)
-        .limit(1)
-        .execute()
-    )
-    if not inv_res.data:
-        raise HTTPException(status_code=404, detail="Invoice not found")
-    invoice = inv_res.data[0]
-
-    if invoice.get("posting_status") == "posted":
-        raise HTTPException(status_code=400, detail="Invoice has already been posted to GL")
-
-    subtotal = float(invoice.get("subtotal") or 0)
-    tax_amount = float(invoice.get("tax_amount") or 0)
-    gross_total = round(subtotal + tax_amount, 2)
-
-    if gross_total <= 0:
-        raise HTTPException(status_code=400, detail="Invoice total is zero — nothing to post")
-
-    # 2. Fetch line items
-    li_res = (
-        supabase.table("invoice_line_items")
-        .select("*")
-        .eq("invoice_extracted_id", invoice_id)
-        .eq("organisation_id", org_id)
-        .execute()
-    )
-    line_items = li_res.data or []
-
-    supplier_vat_number = invoice.get("vat_number_extracted")
-    if invoice.get("supplier_id"):
-        supplier_res = (
-            supabase.table("suppliers")
-            .select("vat_number")
-            .eq("id", invoice["supplier_id"])
-            .eq("organisation_id", org_id)
-            .limit(1)
-            .execute()
-        )
-        if supplier_res.data:
-            supplier_vat_number = supplier_res.data[0].get("vat_number") or supplier_vat_number
-
-    # Fetch allocations for all line items in one query
-    line_ids = [li["id"] for li in line_items if li.get("id")]
-    allocations_by_line: dict[str, list] = {}
-    if line_ids:
-        alloc_res = (
-            supabase.table("invoice_line_item_allocations")
-            .select("*")
-            .in_("invoice_line_item_id", line_ids)
-            .eq("organisation_id", org_id)
-            .order("sort_order")
-            .execute()
-        )
-        for a in (alloc_res.data or []):
-            lid = a.get("invoice_line_item_id")
-            allocations_by_line.setdefault(str(lid), []).append(a)
-
-    # 3. Fetch all accounts for this org (used for system account lookup + code/name resolution)
-    all_accts_res = (
-        supabase.table("accounts")
-        .select("id, code, name, system_key")
-        .eq("organisation_id", org_id)
-        .execute()
-    )
-    all_accts = all_accts_res.data or []
-    sys_accts = {row["system_key"]: row for row in all_accts if row.get("system_key")}
-    trade_payables = sys_accts.get("trade_payables")
-    vat_control = sys_accts.get("vat_control")
-
-    if not trade_payables:
-        raise HTTPException(
-            status_code=400,
-            detail="Trade Payables system account not found for this organisation. "
-                   "Ensure the system accounts migration has been applied.",
-        )
-
-    # Resolve expense_account code/name → UUID (supports legacy line items that stored account codes)
-    _acct_by_code = {a["code"]: a["id"] for a in all_accts if a.get("code")}
-    _acct_by_name = {a["name"]: a["id"] for a in all_accts if a.get("name")}
-
-    def _resolve_acct(val: str | None) -> str | None:
-        if not val:
-            return val
-        if len(str(val)) == 36 and "-" in str(val):  # already a UUID
-            return val
-        return _acct_by_code.get(val) or _acct_by_name.get(val) or val
-
-    line_items = [
-        {**li, "expense_account": _resolve_acct(li.get("expense_account"))}
-        for li in line_items
-    ]
-    allocations_by_line = {
-        lid: [
-            {**a, "expense_account": _resolve_acct(a.get("expense_account"))}
-            for a in allocs
-        ]
-        for lid, allocs in allocations_by_line.items()
-    }
-
     try:
-        supplier_required_dimensions = required_tracking_dimensions(
-            supabase,
-            organisation_id=org_id,
-            module_key="supplier",
-        )
-        validate_supplier_allocations_tracking(
-            line_items=line_items,
-            allocations_by_line=allocations_by_line,
-            required_dimensions=supplier_required_dimensions,
+        prepared = prepare_invoice_gl_posting(
+            db,
+            invoice_id=invoice_id,
+            org_id=org_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    # 4. Build journal lines (debit side)
-    posting = build_invoice_debit_lines(
-        organisation_id=org_id,
-        invoice=invoice,
-        line_items=line_items,
-        allocations_by_line=allocations_by_line,
-        supplier_has_vat_number=bool(str(supplier_vat_number or "").strip()),
-        vat_control_account_id=str(vat_control["id"]) if vat_control else None,
-    )
-    journal_lines = posting["journal_lines"]
-    missing_accounts = posting["missing_accounts"]
-    claimable_tax = posting["claimable_tax"]
-    description_base = posting["description_base"]
-
-    if missing_accounts:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot post — the following lines have no expense account: {', '.join(missing_accounts[:5])}",
-        )
-
-    if claimable_tax > 0 and not vat_control:
-        raise HTTPException(
-            status_code=400,
-            detail="VAT Control system account not found for this organisation.",
-        )
-
-    # Creditors credit line
-    total_debit = round(sum(float(l["debit_amount"]) for l in journal_lines), 2)
-    if abs(total_debit - gross_total) > 0.02:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "VAT allocation did not reconcile to the invoice total "
-                f"({total_debit:.2f} posted vs {gross_total:.2f} invoice)."
-            ),
-        )
-    journal_lines.append({
-        "organisation_id": org_id,
-        "account_id": trade_payables["id"],
-        "description": description_base,
-        "debit_amount": 0.0,
-        "credit_amount": total_debit,
-        "tracking": {},
-        "sort_order": len(journal_lines),
-    })
 
     workflow_result = _handle_invoice_approval_workflow(
         user_id=user_id,
         organisation_id=org_id,
         invoice_id=invoice_id,
-        invoice_amount=gross_total,
-        journal_lines=journal_lines,
+        invoice_amount=prepared["gross_total"],
+        journal_lines=prepared["journal_lines"],
     )
     if workflow_result:
         return workflow_result
@@ -2346,55 +2185,18 @@ def post_invoice_to_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: U
     _enforce_user_limits(
         user_id=user_id,
         organisation_id=org_id,
-        journal_lines=journal_lines,
-        invoice_amount=gross_total,
+        journal_lines=prepared["journal_lines"],
+        invoice_amount=prepared["gross_total"],
         action="post",
     )
 
-    # 5. Create the posted journal
-    journal_id = _new_uuid()
-    now = _now_iso()
-    journal_date = (invoice.get("invoice_date") or now[:10])
-
-    supabase.table("gl_journals").insert({
-        "id": journal_id,
-        "organisation_id": org_id,
-        "source_type": "invoice",
-        "source_id": invoice_id,
-        "journal_date": journal_date,
-        "description": description_base,
-        "status": "posted",
-        "total_debit": total_debit,
-        "total_credit": total_debit,
-        "created_by": user_id,
-        "posted_by": user_id,
-        "posted_at": now,
-    }).execute()
-
-    supabase.table("gl_journal_lines").insert([
-        {**line, "gl_journal_id": journal_id}
-        for line in journal_lines
-    ]).execute()
-
-    # 6. Update invoice
-    supabase.table("invoices_extracted").update({
-        "gl_journal_id": journal_id,
-        "posting_status": "posted",
-        "posted_at": now,
-        "posted_by": user_id,
-        "approval_status": "approved",
-        "review_status": "approved",
-        "approved_at": now,
-        "approved_by": user_id,
-        "updated_at": utc_now_iso(),
-    }).eq("id", invoice_id).execute()
-
-    return {
-        "success": True,
-        "journal_id": journal_id,
-        "total_debit": total_debit,
-        "total_credit": total_debit,
-        "lines": len(journal_lines),
-        "trade_payables_account": trade_payables["code"],
-        "vat_control_account": vat_control["code"] if vat_control else None,
-    }
+    try:
+        return post_invoice_to_gl_service(
+            db,
+            invoice_id=invoice_id,
+            org_id=org_id,
+            user_id=user_id,
+            prepared=prepared,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -142,69 +142,21 @@ def get_organisation(organisation_id: str) -> Optional[dict]:
 
 
 def get_organisation_extraction_settings(organisation_id: str) -> dict:
-    try:
-        settings_res = (
-            supabase
-            .table("organisations")
-            .select(
-                "extraction_strategy, ask_per_upload, vlm_enabled, "
-                "supplier_auto_link_min_matches, reporting_standard, "
-                "income_statement_presentation"
-            )
-            .eq("id", organisation_id)
-            .limit(1)
-            .execute()
-        )
-        settings = settings_res.data[0] if settings_res.data else {}
-    except Exception:
-        # Fallback if newer columns (C9) not yet migrated — extraction still proceeds with defaults
-        try:
-            settings_res = (
-                supabase
-                .table("organisations")
-                .select("extraction_strategy, ask_per_upload, vlm_enabled, supplier_auto_link_min_matches")
-                .eq("id", organisation_id)
-                .limit(1)
-                .execute()
-            )
-            settings = settings_res.data[0] if settings_res.data else {}
-        except Exception:
-            settings = {}
-    min_matches = settings.get("supplier_auto_link_min_matches")
-    try:
-        min_matches = int(min_matches)
-    except (TypeError, ValueError):
-        min_matches = 2
-    reporting_standard = settings.get("reporting_standard") or "ifrs"
-    presentation = settings.get("income_statement_presentation") or "function"
-    if reporting_standard == "us_gaap":
-        presentation = "function"
-    return {
-        "extraction_strategy": settings.get("extraction_strategy") or "auto_group",
-        "ask_per_upload": bool(settings.get("ask_per_upload")),
-        "vlm_enabled": bool(settings.get("vlm_enabled")),
-        "supplier_auto_link_min_matches": min(4, max(1, min_matches)),
-        "reporting_standard": reporting_standard,
-        "income_statement_presentation": presentation,
-    }
+    """Compatibility facade for callers that still import extraction settings here."""
+    from app.services.organisation_extraction_settings import (  # noqa: PLC0415
+        get_organisation_extraction_settings as get_settings,
+    )
+
+    return get_settings(organisation_id, db=supabase)
 
 
 def update_organisation_extraction_settings(organisation_id: str, updates: dict) -> dict:
-    if not updates:
-        raise ValueError("No settings provided to update")
-
-    update_res = (
-        supabase
-        .table("organisations")
-        .update(updates)
-        .eq("id", organisation_id)
-        .execute()
+    """Compatibility facade for the isolated organisation settings service."""
+    from app.services.organisation_extraction_settings import (  # noqa: PLC0415
+        update_organisation_extraction_settings as update_settings,
     )
 
-    if not update_res.data:
-        raise HTTPException(status_code=404, detail="Organisation not found")
-
-    return get_organisation_extraction_settings(organisation_id)
+    return update_settings(organisation_id, updates, db=supabase)
 
 
 def persist_invoice_page_group(

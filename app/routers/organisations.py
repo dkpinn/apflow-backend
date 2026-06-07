@@ -4,7 +4,7 @@ from enum import Enum
 from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.db.supabase_client import get_supabase_client
 from app.dependencies import UserAuth, ensure_org_admin, ensure_org_read
@@ -16,6 +16,10 @@ from app.services.organisation_module_settings import (
     MODULE_KEYS,
     get_module_settings,
     validate_required_dimensions,
+)
+from app.services.supplier_matching_config import (
+    AutoLinkAmountTier,
+    normalise_amount_tiers,
 )
 
 router = APIRouter(prefix="/api/organisations", tags=["organisations"])
@@ -48,6 +52,7 @@ class OrganisationSettingsResponse(BaseModel):
     ask_per_upload: bool
     vlm_enabled: bool
     supplier_auto_link_min_matches: int = Field(default=2, ge=1, le=4)
+    auto_link_amount_tiers: list[AutoLinkAmountTier] = Field(default_factory=list)
     reporting_standard: ReportingStandard = ReportingStandard.ifrs
     income_statement_presentation: IncomeStatementPresentation = IncomeStatementPresentation.function
 
@@ -71,6 +76,10 @@ class UpdateOrganisationSettingsRequest(BaseModel):
         le=4,
         description="How many supplier identity signals must match before auto-linking.",
     )
+    auto_link_amount_tiers: Optional[list[AutoLinkAmountTier]] = Field(
+        default=None,
+        description="Per-amount-tier auto-link thresholds. Each entry: {max_amount: number|null, required_matches: 1-4}.",
+    )
     reporting_standard: Optional[ReportingStandard] = Field(
         default=None,
         description="Default financial reporting framework for generated reports.",
@@ -79,6 +88,13 @@ class UpdateOrganisationSettingsRequest(BaseModel):
         default=None,
         description="Default Income Statement expense presentation.",
     )
+
+    @field_validator("auto_link_amount_tiers")
+    @classmethod
+    def validate_auto_link_amount_tiers(cls, value):
+        if value is None:
+            return None
+        return normalise_amount_tiers(value)
 
 
 ModuleKey = Literal[
@@ -162,6 +178,10 @@ def update_organisation_settings(
         updates["vlm_enabled"] = payload.vlm_enabled
     if payload.supplier_auto_link_min_matches is not None:
         updates["supplier_auto_link_min_matches"] = payload.supplier_auto_link_min_matches
+    if payload.auto_link_amount_tiers is not None:
+        updates["auto_link_amount_tiers"] = [
+            tier.model_dump(mode="json") for tier in payload.auto_link_amount_tiers
+        ]
     if payload.reporting_standard is not None:
         updates["reporting_standard"] = payload.reporting_standard
     if payload.income_statement_presentation is not None:

@@ -73,6 +73,7 @@ if "app.services.invoice_extraction_service._helpers" not in sys.modules:
             "ask_per_upload": bool(row.get("ask_per_upload")) if row else False,
             "vlm_enabled": bool(row.get("vlm_enabled")) if row else False,
             "supplier_auto_link_min_matches": int(row.get("supplier_auto_link_min_matches", 2)) if row else 2,
+            "auto_link_amount_tiers": row.get("auto_link_amount_tiers", []) if row else [],
             "reporting_standard": row.get("reporting_standard") if row else "ifrs",
             "income_statement_presentation": (
                 "function"
@@ -179,6 +180,7 @@ class OrganisationSettingsAPITests(unittest.TestCase):
             "ask_per_upload": False,
             "vlm_enabled": False,
             "supplier_auto_link_min_matches": 2,
+            "auto_link_amount_tiers": [],
             "reporting_standard": "ifrs",
             "income_statement_presentation": "function",
         })
@@ -191,6 +193,7 @@ class OrganisationSettingsAPITests(unittest.TestCase):
                 "ask_per_upload": True,
                 "vlm_enabled": True,
                 "supplier_auto_link_min_matches": 3,
+                "auto_link_amount_tiers": [{"max_amount": 1000, "required_matches": 2}],
                 "reporting_standard": "uk_gaap_frs_102",
                 "income_statement_presentation": "nature",
             }
@@ -203,6 +206,7 @@ class OrganisationSettingsAPITests(unittest.TestCase):
             "ask_per_upload": True,
             "vlm_enabled": True,
             "supplier_auto_link_min_matches": 3,
+            "auto_link_amount_tiers": [{"max_amount": 1000, "required_matches": 2}],
             "reporting_standard": "uk_gaap_frs_102",
             "income_statement_presentation": "nature",
         })
@@ -215,6 +219,7 @@ class OrganisationSettingsAPITests(unittest.TestCase):
                 "ask_per_upload": False,
                 "vlm_enabled": False,
                 "supplier_auto_link_min_matches": 2,
+                "auto_link_amount_tiers": [],
                 "reporting_standard": "ifrs",
                 "income_statement_presentation": "function",
             }
@@ -224,6 +229,7 @@ class OrganisationSettingsAPITests(unittest.TestCase):
             extraction_strategy="vlm",
             ask_per_upload=True,
             supplier_auto_link_min_matches=4,
+            auto_link_amount_tiers=[{"max_amount": 5000, "required_matches": 3}],
             reporting_standard="ifrs",
             income_statement_presentation="nature",
         )
@@ -235,6 +241,7 @@ class OrganisationSettingsAPITests(unittest.TestCase):
             "ask_per_upload": True,
             "vlm_enabled": False,
             "supplier_auto_link_min_matches": 4,
+            "auto_link_amount_tiers": [{"max_amount": 5000.0, "required_matches": 3}],
             "reporting_standard": "ifrs",
             "income_statement_presentation": "nature",
         })
@@ -247,6 +254,7 @@ class OrganisationSettingsAPITests(unittest.TestCase):
                 "ask_per_upload": False,
                 "vlm_enabled": False,
                 "supplier_auto_link_min_matches": 2,
+                "auto_link_amount_tiers": [],
                 "reporting_standard": "ifrs",
                 "income_statement_presentation": "nature",
             }

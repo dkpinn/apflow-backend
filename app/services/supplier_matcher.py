@@ -5,10 +5,14 @@ from difflib import SequenceMatcher
 from typing import Optional
 
 from app.services.invoice_extraction.entity_detection import normalise_name
+from app.services.supplier_matching_config import (
+    fetch_org_matching_config,
+    resolve_match_threshold,
+    safe_match_count,
+)
 
 NAME_FUZZY_THRESHOLD = 0.85
 NAME_PART_MIN_LENGTH = 6
-DEFAULT_AUTO_LINK_MIN_MATCHES = 2
 
 
 def _norm_id(v: Optional[str]) -> str:
@@ -28,30 +32,6 @@ def _norm_email(v: Optional[str]) -> str:
     if not v:
         return ""
     return v.strip().lower()
-
-
-def _safe_int(value: object, default: int = DEFAULT_AUTO_LINK_MIN_MATCHES) -> int:
-    try:
-        parsed = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        parsed = default
-    return min(4, max(1, parsed))
-
-
-def _fetch_min_matches(supabase, org_id: str) -> int:
-    try:
-        res = (
-            supabase
-            .table("organisations")
-            .select("supplier_auto_link_min_matches")
-            .eq("id", org_id)
-            .limit(1)
-            .execute()
-        )
-        row = res.data[0] if res.data else {}
-        return _safe_int(row.get("supplier_auto_link_min_matches"))
-    except Exception:
-        return DEFAULT_AUTO_LINK_MIN_MATCHES
 
 
 def _fetch_suppliers(supabase, org_id: str) -> list[dict]:
@@ -271,9 +251,17 @@ def find_supplier_match_result(
     *,
     org_id: str,
     min_matches: Optional[int] = None,
+    invoice_total: Optional[float] = None,
     **kwargs,
 ) -> Optional[dict]:
-    threshold = _safe_int(min_matches) if min_matches is not None else _fetch_min_matches(supabase, org_id)
+    if min_matches is not None:
+        threshold = safe_match_count(min_matches)
+    else:
+        config = fetch_org_matching_config(supabase, org_id)
+        threshold = resolve_match_threshold(
+            config["amount_tiers"], invoice_total, config["min_matches"]
+        )
+
     matches = score_supplier_matches(supabase, org_id=org_id, **kwargs)
     if not matches:
         return None
@@ -301,6 +289,7 @@ def attempt_supplier_auto_link(
     supplier_email_extracted: Optional[str] = None,
     supplier_acc_email_extracted: Optional[str] = None,
     min_matches: Optional[int] = None,
+    invoice_total: Optional[float] = None,
 ) -> Optional[str]:
     """
     Return a supplier_id only when the organisation's configured number of
@@ -310,6 +299,7 @@ def attempt_supplier_auto_link(
         supabase,
         org_id=org_id,
         min_matches=min_matches,
+        invoice_total=invoice_total,
         supplier_name_extracted=supplier_name_extracted,
         vat_number_extracted=vat_number_extracted,
         company_registration_number_extracted=company_registration_number_extracted,

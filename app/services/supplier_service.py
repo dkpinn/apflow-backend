@@ -71,6 +71,7 @@ KNOWN_SUPPLIER_COLUMNS = {
     "track_inventory",
     "use_uom_from_description",
     "default_expense_account",
+    "default_tracking",
     "default_vat_rate",
     "kyc_status",
     "kyc_verified_at",
@@ -107,6 +108,7 @@ def _supplier_processing_overrides(payload: BaseModel) -> dict:
         "track_inventory",
         "use_uom_from_description",
         "default_expense_account",
+        "default_tracking",
         "default_vat_rate",
     }
     return {key: values.get(key) for key in keys if values.get(key) is not None}

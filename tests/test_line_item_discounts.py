@@ -32,6 +32,23 @@ def test_infers_discount_when_extended_price_differs_from_unit_times_quantity():
     assert items[0]["pricing_basis"] == "extended_price_inferred_discount"
 
 
+def test_unknown_layout_keeps_narrow_receipt_parser_precedence():
+    text = """
+    ITEMNAME QTY PRICE TOTAL
+    MORTAR MODIFIER
+    0900005 2.00 504,00 1 008,00
+    TOTAL 1 008,00
+    """
+
+    items = extract_line_items(text, layout_type="unknown")
+
+    assert len(items) == 1
+    assert items[0]["description"] == "MORTAR MODIFIER"
+    assert items[0]["quantity"] == 2.0
+    assert items[0]["unit_price"] == 504.0
+    assert items[0]["line_total"] == 1008.0
+
+
 def test_vat_rule_keeps_discounted_lines_that_already_match_subtotal():
     parsed = {
         "subtotal": 1008.0,

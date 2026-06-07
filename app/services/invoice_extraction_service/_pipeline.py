@@ -155,8 +155,8 @@ from app.services.invoice_data_builders import (
     merge_supplier_recovery_fields,
     utc_now_iso,
 )
+from app.services.organisation_extraction_settings import get_organisation_extraction_settings
 from ._helpers import (
-    get_organisation_extraction_settings,
     get_raw_invoice,
     get_organisation,
     persist_invoice_page_group,
@@ -186,6 +186,26 @@ def _ocr_dependency_issue(text_result: dict) -> str | None:
         return f"OCR engine failed: {message}"
 
     return None
+
+
+_IMAGE_MAGIC: list[bytes] = [
+    b"\xff\xd8\xff",            # JPEG
+    b"\x89PNG\r\n\x1a\n",      # PNG
+    b"GIF87a", b"GIF89a",       # GIF
+    b"II\x2a\x00", b"MM\x00\x2a",  # TIFF (little/big endian)
+]
+
+
+def _is_image_bytes(data: bytes) -> bool:
+    """Detect common image formats by magic bytes — independent of the stored MIME type."""
+    head = data[:12]
+    if any(head.startswith(sig) for sig in _IMAGE_MAGIC):
+        return True
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":  # WEBP
+        return True
+    if head[4:8] == b"ftyp":  # HEIC / HEIF / AVIF
+        return True
+    return False
 
 
 def _append_validation_note(existing: str | None, note: str) -> str:
@@ -394,7 +414,10 @@ def run_invoice_extraction(
         #     the `vlm_enabled` gate previously blocked this — removed as OCR adds cost with no benefit).
         #   Images (JPEG/PNG/WEBP/HEIC) → VLM always, regardless of vlm_enabled.
         #     If no API key is configured, extract_with_vlm_fallback returns None gracefully.
-        is_image_file = (raw.get("file_type") or "").startswith("image/")
+        is_image_file = (
+            (raw.get("file_type") or "").startswith("image/")
+            or _is_image_bytes(file_bytes)
+        )
         is_scanned_pdf = text_result.get("ocr_used", False) and not is_image_file
         force_vlm = (
             (strategy == "vlm" and vlm_enabled)
@@ -505,6 +528,15 @@ def run_invoice_extraction(
                     },
                     notes=f"VLM fallback was needed but could not complete: {vlm_result.get('reason') or 'unknown_error'}.",
                 )
+
+                # Image files have no text layer — Tesseract produces no usable data.
+                # VLM is the only viable extractor for photos; fail hard instead of saving garbage.
+                if is_image_file:
+                    reason = vlm_result.get("reason") or "unknown_error"
+                    raise ValueError(
+                        f"Image files require VLM extraction, but VLM could not complete "
+                        f"({reason}). Please check your VLM integration settings."
+                    )
 
         supplier_recovery_result = {"applied": False, "fields": []}
         if not parsed_data.get("supplier_name_extracted"):
@@ -847,6 +879,7 @@ def run_invoice_extraction(
             match_result = find_supplier_match_result(
                 supabase,
                 org_id=org_id,
+                invoice_total=parsed_data.get("total_amount"),
                 supplier_name_extracted=parsed_data.get("supplier_name_extracted"),
                 vat_number_extracted=parsed_data.get("vat_number_extracted"),
                 company_registration_number_extracted=parsed_data.get("company_registration_number_extracted"),
@@ -1065,6 +1098,47 @@ def run_invoice_extraction(
             actor_type="worker" if job_id else "api",
             job_id=job_id,
         )
+
+        # STP accepts any trusted supplier link and still requires full readiness.
+        if (
+            extracted_payload.get("supplier_id")
+            and readiness_result
+            and (parsed_data.get("document_count") or 1) == 1
+        ):
+            from app.services.invoice_stp import attempt_invoice_stp  # noqa: PLC0415
+
+            stp_result = attempt_invoice_stp(
+                supabase=supabase,
+                org_id=org_id,
+                invoice_id=extracted_invoice_id,
+                readiness_result=readiness_result,
+            )
+            _stp_status = stp_result.get("status")
+            if _stp_status in {"posted", "failed", "not_eligible"}:
+                try:
+                    _stp_event_map = {
+                        "posted": "stp_auto_posted",
+                        "failed": "stp_auto_post_failed",
+                        "not_eligible": "stp_not_eligible",
+                    }
+                    log_invoice_event(
+                        supabase,
+                        organisation_id=org_id,
+                        invoice_raw_id=invoice_raw_id,
+                        invoice_extracted_id=extracted_invoice_id,
+                        job_id=job_id,
+                        event_type=_stp_event_map[_stp_status],
+                        stage="stp_auto_post",
+                        actor_type="system",
+                        new_value=stp_result if _stp_status == "posted" else None,
+                        notes=(
+                            "Invoice auto-posted via Straight-Through Processing (STP)."
+                            if _stp_status == "posted"
+                            else f"STP skipped: {stp_result.get('reason')}"
+                        ),
+                    )
+                except Exception as audit_exc:
+                    print(f"STP AUDIT LOG FAILED (non-fatal): {audit_exc}")
 
     _doc_count = parsed_data.get("document_count") or 1
     _final_status = "needs_split" if _doc_count > 1 else "completed"

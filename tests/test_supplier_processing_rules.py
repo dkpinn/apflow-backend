@@ -225,6 +225,35 @@ def test_supplier_rule_applies_default_expense_account_to_invoice_and_lines():
     assert result["line_items"][0]["expense_account"] == "6000/Office"
 
 
+def test_supplier_rule_applies_default_tracking_without_overwriting_line_tracking():
+    parsed = {
+        "supplier_name_extracted": "Example Supplier",
+        "total_amount": 100.0,
+        "line_items": [
+            {
+                "description": "Item A",
+                "line_total": 100.0,
+                "tracking": {"dim-branch": "branch-cpt"},
+            },
+        ],
+    }
+
+    result = apply_supplier_processing_rules(
+        parsed,
+        {
+            "default_tracking": {
+                "dim-department": "department-maintenance",
+                "dim-branch": "branch-jhb",
+            },
+        },
+    )
+
+    assert result["line_items"][0]["tracking"] == {
+        "dim-department": "department-maintenance",
+        "dim-branch": "branch-cpt",
+    }
+
+
 def test_supplier_allocation_rule_overrides_default_account_and_balances_split():
     parsed = {
         "supplier_name_extracted": "Example Supplier",
@@ -261,6 +290,43 @@ def test_supplier_allocation_rule_overrides_default_account_and_balances_split()
     assert item["tracking"] == {"dim-1": "top-gate"}
     assert [split["amount"] for split in item["allocations"]] == [60.0, 40.0]
     assert sum(split["amount"] for split in item["allocations"]) == 100.0
+
+
+def test_supplier_allocation_rule_inherits_default_tracking_and_overrides_selected_dimension():
+    parsed = {
+        "document_type": "tax_invoice",
+        "total_amount": 100.0,
+        "line_items": [{"description": "Gate repair", "line_total": 100.0}],
+    }
+
+    result = apply_supplier_processing_rules(
+        parsed,
+        {
+            "default_tracking": {
+                "dim-department": "department-maintenance",
+                "dim-branch": "branch-jhb",
+            },
+            "allocation_rules": [{
+                "id": "rule-1",
+                "name": "Gate repairs",
+                "active": True,
+                "match_type": "contains",
+                "pattern": "gate",
+                "splits": [{
+                    "expense_account": "7100/Repairs",
+                    "tracking": {"dim-branch": "branch-cpt"},
+                    "percent": 100,
+                }],
+            }],
+        },
+    )
+
+    item = result["line_items"][0]
+    assert item["tracking"] == {
+        "dim-department": "department-maintenance",
+        "dim-branch": "branch-cpt",
+    }
+    assert item["allocations"][0]["tracking"] == item["tracking"]
 
 
 def test_supplier_allocation_rule_respects_document_scope_and_priority():

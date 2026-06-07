@@ -370,13 +370,19 @@ def _receipt_table_bounds(lines: list[str]) -> tuple[int, int]:
 
 def _extract_receipt_amounts(value: str) -> list[float]:
     value = _normalise_receipt_ocr_text(value)
-    matches = re.findall(r"\b\d{1,5}[,.]\d{2}\b", value)
+    matches = re.findall(
+        r"\b(?:\d{1,3}(?:[ \u00a0]\d{3})+|\d{1,5})[,.]\d{2}\b",
+        value,
+    )
     amounts = [clean_amount(match) for match in matches]
     return [amount for amount in amounts if amount is not None]
 
 
 def _description_before_first_amount(value: str) -> str:
-    match = re.search(r"\b\d{1,5}[,.]\d{2}\b", _normalise_receipt_ocr_text(value))
+    match = re.search(
+        r"\b(?:\d{1,3}(?:[ \u00a0]\d{3})+|\d{1,5})[,.]\d{2}\b",
+        _normalise_receipt_ocr_text(value),
+    )
     head = value[:match.start()] if match else value
     head = re.sub(r"\b\d{6,}\b", "", head)
     head = re.sub(r"\s+", " ", head)
@@ -577,6 +583,11 @@ def extract_code_qty_total_rows(text: str) -> list[dict]:
 def extract_line_items(text: str, layout_type: str = "unknown") -> list[dict]:
     lines = normalise_lines(text)
 
+    if layout_type == "row_table":
+        row_items = extract_line_items_from_single_rows(lines)
+        if row_items:
+            return row_items
+
     receipt_items = extract_narrow_receipt_line_items(text)
     if receipt_items:
         return receipt_items
@@ -587,9 +598,6 @@ def extract_line_items(text: str, layout_type: str = "unknown") -> list[dict]:
 
     if layout_type == "chimes_column_table":
         return extract_chimes_line_items(text)
-
-    if layout_type == "row_table":
-        return extract_line_items_from_single_rows(lines)
 
     if layout_type == "vertical_column_table":
         return extract_line_items_from_vertical_block(lines)

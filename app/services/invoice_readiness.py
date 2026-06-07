@@ -8,7 +8,7 @@ from app.services.invoice_review_agent import generate_invoice_agent_suggestions
 from app.services.organisation_module_settings import required_tracking_dimensions
 
 
-READY_REVIEW_STATUS = "reviewed"
+READY_REVIEW_STATUS = "in_review"
 BLOCKED_REVIEW_STATUS = "needs_info"
 MIN_READY_CONFIDENCE = 0.70
 

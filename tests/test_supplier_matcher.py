@@ -30,9 +30,13 @@ class _Query:
 
 
 class _Client:
-    def __init__(self, *, threshold=2, suppliers=None):
+    def __init__(self, *, threshold=2, amount_tiers=None, suppliers=None):
         self.tables = {
-            "organisations": [{"id": "org-1", "supplier_auto_link_min_matches": threshold}],
+            "organisations": [{
+                "id": "org-1",
+                "supplier_auto_link_min_matches": threshold,
+                "auto_link_amount_tiers": amount_tiers or [],
+            }],
             "suppliers": suppliers or [],
         }
 
@@ -141,3 +145,34 @@ def test_threshold_three_requires_three_signals():
         supplier_telephone_extracted="0315550101",
         supplier_email_extracted="accounts@example.test",
     ) == "supplier-1"
+
+
+def test_amount_tier_boundary_uses_inclusive_maximum():
+    client = _Client(
+        threshold=2,
+        amount_tiers=[
+            {"max_amount": 1000, "required_matches": 2},
+            {"max_amount": None, "required_matches": 4},
+        ],
+        suppliers=[_supplier()],
+    )
+
+    result = find_supplier_match_result(
+        client,
+        org_id="org-1",
+        invoice_total=1000,
+        vat_number_extracted="4111111111",
+        supplier_telephone_extracted="0315550101",
+    )
+    assert result["threshold"] == 2
+    assert result["auto_link"] is True
+
+    result = find_supplier_match_result(
+        client,
+        org_id="org-1",
+        invoice_total=1000.01,
+        vat_number_extracted="4111111111",
+        supplier_telephone_extracted="0315550101",
+    )
+    assert result["threshold"] == 4
+    assert result["auto_link"] is False

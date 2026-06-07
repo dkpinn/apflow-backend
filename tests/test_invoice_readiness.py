@@ -49,7 +49,7 @@ def test_readiness_promotes_clean_repeat_supplier_invoice():
     )
 
     assert decision["ready"] is True
-    assert decision["review_status"] == "reviewed"
+    assert decision["review_status"] == "in_review"
     assert decision["blockers"] == []
 
 
