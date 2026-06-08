@@ -1,0 +1,12 @@
+# Supabase
+.branches
+.temp
+
+# dotenvx
+.env.keys
+.env.local
+.env.*.local
+
+# Production schema dumps can contain internal object names and must be
+# reviewed before any selected baseline is committed.
+backups/

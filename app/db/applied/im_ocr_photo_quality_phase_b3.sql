@@ -1,0 +1,11 @@
+-- ============================================================
+-- APPayPal OCR / Photo Quality Phase B3
+-- No schema changes required if document_pages already includes:
+--   image_quality_score numeric
+--   ocr_confidence numeric
+-- and invoice_audit_events exists.
+--
+-- This file is intentionally a no-op marker migration.
+-- Apply not required.
+-- ============================================================
+select 'B3 OCR/photo quality uses existing document_pages + invoice_audit_events columns' as note;

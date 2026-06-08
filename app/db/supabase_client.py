@@ -1,14 +1,34 @@
 import os
-from supabase import create_client, Client
+
+from dotenv import load_dotenv
+from supabase import Client, create_client
+
+load_dotenv()
 
 
 def get_supabase_client() -> Client:
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
 
-    if not supabase_url or not supabase_key:
-        raise ValueError(
-            "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment variables."
-        )
+    if not url or not key:
+        raise Exception("Supabase credentials missing")
 
-    return create_client(supabase_url, supabase_key)
+    return create_client(url, key)
+
+
+def get_user_supabase_client(token: str) -> Client:
+    """
+    Return a Supabase client scoped to the given user JWT.
+
+    Uses SUPABASE_ANON_KEY as the API key (Kong auth) and overrides the
+    PostgREST Authorization header to the user's JWT so RLS policies apply.
+    """
+    url = os.getenv("SUPABASE_URL")
+    anon_key = os.getenv("SUPABASE_ANON_KEY")
+    if not url:
+        raise Exception("SUPABASE_URL is missing")
+    if not anon_key:
+        raise Exception("SUPABASE_ANON_KEY is missing — service-role fallback is not permitted to prevent RLS bypass")
+    client = create_client(url, anon_key)
+    client.postgrest.auth(token)
+    return client
