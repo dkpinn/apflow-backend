@@ -18,6 +18,7 @@ from app.routers import admin_integrations
 from app.routers import integrations
 from app.routers import bank
 from app.routers import reports
+from app.routers import asset_types
 
 
 def _sweep_log(msg: str) -> None:
@@ -348,6 +349,7 @@ app.include_router(admin_integrations.router)
 app.include_router(integrations.router)
 app.include_router(bank.router)
 app.include_router(reports.router)
+app.include_router(asset_types.router)
 
 
 @app.get("/")

@@ -251,7 +251,7 @@ def prepare_invoice_gl_posting(
 
     all_accts_res = (
         supabase.table("accounts")
-        .select("id, code, name, system_key")
+        .select("id, code, name, system_key, is_system")
         .eq("organisation_id", org_id)
         .execute()
     )
@@ -266,9 +266,10 @@ def prepare_invoice_gl_posting(
             "Ensure the system accounts migration has been applied."
         )
 
-    _by_code = {a["code"]: a["id"] for a in all_accts if a.get("code")}
-    _by_name = {a["name"]: a["id"] for a in all_accts if a.get("name")}
-    _account_ids = {str(a["id"]) for a in all_accts if a.get("id")}
+    postable_accts = [account for account in all_accts if not account.get("is_system")]
+    _by_code = {a["code"]: a["id"] for a in postable_accts if a.get("code")}
+    _by_name = {a["name"]: a["id"] for a in postable_accts if a.get("name")}
+    _account_ids = {str(a["id"]) for a in postable_accts if a.get("id")}
 
     def _resolve(val: Optional[str]) -> Optional[str]:
         if not val:

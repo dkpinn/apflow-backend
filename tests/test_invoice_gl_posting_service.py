@@ -177,6 +177,26 @@ def test_preparation_enforces_tracking_and_balanced_allocations():
         )
 
 
+def test_preparation_rejects_system_accounts_as_invoice_expenses():
+    tables = _tables()
+    tables["accounts"].append({
+        "id": "asset-expense-id",
+        "organisation_id": "org-1",
+        "code": None,
+        "name": "Depreciation on Computer Equipment",
+        "system_key": "asset_type:type-1:expense",
+        "is_system": True,
+    })
+    tables["invoice_line_items"][0]["expense_account"] = "asset-expense-id"
+
+    with pytest.raises(ValueError, match="no expense account"):
+        prepare_invoice_gl_posting(
+            _DB(tables),
+            invoice_id="invoice-1",
+            org_id="org-1",
+        )
+
+
 def test_persistence_uses_the_atomic_rpc_and_preserves_response_shape():
     prepared = prepare_invoice_gl_posting(
         _DB(_tables()),

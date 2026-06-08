@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
@@ -26,6 +27,7 @@ from app.services.bank_statement_service import (
     score_rule_suggestions,
     validate_balances,
 )
+from app.services.bank_account_summary import build_bank_balance_summary
 from app.services.organisation_module_settings import (
     required_tracking_dimensions,
     validate_bank_allocation_tracking,
@@ -100,6 +102,44 @@ class PostJournalRequest(BaseModel):
     organisation_id: UUID
 
 
+class BulkDeleteLinesRequest(BaseModel):
+    organisation_id: UUID
+    line_ids: list[UUID]
+
+
+class BulkDeleteUploadsRequest(BaseModel):
+    organisation_id: UUID
+    upload_ids: list[UUID]
+
+
+class BankBalanceSummary(BaseModel):
+    bank_statement_balance: Optional[float] = None
+    calculated_imported_balance: Optional[float] = None
+    current_tb_balance: Optional[float] = None
+    latest_statement_upload_id: Optional[str] = None
+    statement_period_to: Optional[str] = None
+    latest_transaction_date: Optional[str] = None
+    bank_balance_status: Literal["available", "unavailable"]
+    imported_balance_status: Literal["available", "unavailable"]
+    tb_balance_status: Literal["available", "gl_account_not_linked"]
+
+
+class ParsingRuleCreate(BaseModel):
+    organisation_id: UUID
+    institution_name: Optional[str] = None
+    account_type: Optional[str] = None
+    parsing_hint: str
+    active: bool = True
+
+
+class ParsingRuleUpdate(BaseModel):
+    organisation_id: UUID
+    institution_name: Optional[str] = None
+    account_type: Optional[str] = None
+    parsing_hint: Optional[str] = None
+    active: Optional[bool] = None
+
+
 def svc():
     try:
         return get_supabase_client()
@@ -134,6 +174,102 @@ def log_bank_event(db, *, organisation_id: str, event_type: str, actor_user_id: 
         db.table("bank_audit_events").insert(payload).execute()
     except Exception as exc:  # pragma: no cover
         print("BANK AUDIT INSERT FAILED:", str(exc), payload)
+
+
+def _rpc_data(result: Any) -> dict[str, Any]:
+    data = getattr(result, "data", result)
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    return data if isinstance(data, dict) else {}
+
+
+def _database_error_parts(exc: Exception) -> tuple[str, Any]:
+    message = str(exc)
+    details: Any = None
+    candidates = [getattr(exc, "message", None), getattr(exc, "details", None)]
+    if exc.args and isinstance(exc.args[0], dict):
+        payload = exc.args[0]
+        candidates.extend([payload.get("message"), payload.get("details")])
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if isinstance(candidate, str) and candidate.startswith("["):
+            try:
+                details = json.loads(candidate)
+                continue
+            except json.JSONDecodeError:
+                pass
+        if isinstance(candidate, str) and "blocked" in candidate.lower():
+            message = candidate
+        elif not isinstance(candidate, str):
+            details = candidate
+    return message, details
+
+
+def _bank_delete_error(exc: Exception) -> HTTPException:
+    message, blocked = _database_error_parts(exc)
+    lowered = message.lower()
+    if "blocked" in lowered or "posted or reversed" in lowered:
+        return HTTPException(
+            status_code=409,
+            detail={
+                "message": "Deletion blocked because selected bank data has posted or reversed journal history.",
+                "blocked": blocked or [],
+            },
+        )
+    if "not found" in lowered:
+        return HTTPException(status_code=404, detail=message)
+    return HTTPException(status_code=400, detail=message)
+
+
+def _delete_bank_lines_rpc(
+    db,
+    *,
+    organisation_id: str,
+    line_ids: list[str],
+    actor_user_id: str,
+) -> dict[str, Any]:
+    result = db.rpc(
+        "delete_bank_statement_lines_atomic",
+        {
+            "p_org_id": organisation_id,
+            "p_line_ids": line_ids,
+            "p_actor_user_id": actor_user_id,
+        },
+    ).execute()
+    return _rpc_data(result)
+
+
+def _delete_bank_uploads_rpc(
+    db,
+    *,
+    organisation_id: str,
+    upload_ids: list[str],
+    actor_user_id: str,
+) -> dict[str, Any]:
+    result = db.rpc(
+        "delete_bank_statement_uploads_atomic",
+        {
+            "p_org_id": organisation_id,
+            "p_upload_ids": upload_ids,
+            "p_actor_user_id": actor_user_id,
+        },
+    ).execute()
+    return _rpc_data(result)
+
+
+def _remove_bank_upload_files(db, files: list[dict[str, Any]]) -> list[dict[str, str]]:
+    failures: list[dict[str, str]] = []
+    for file in files:
+        bucket = str(file.get("storage_bucket") or "statement-files")
+        path = str(file.get("storage_path") or "")
+        if not path:
+            continue
+        try:
+            db.storage.from_(bucket).remove([path])
+        except Exception as exc:
+            failures.append({"storage_bucket": bucket, "storage_path": path, "error": str(exc)})
+    return failures
 
 
 def now_iso() -> str:
@@ -227,6 +363,47 @@ def build_journal_rows_for_line(
     return rows
 
 
+def lookup_parsing_hint(db, *, organisation_id: str, institution_name: Optional[str], account_type: Optional[str]) -> Optional[str]:
+    try:
+        rules = (
+            db.table("bank_parsing_rules")
+            .select("institution_name, account_type, parsing_hint")
+            .eq("organisation_id", organisation_id)
+            .eq("active", True)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return None
+
+    institution = (institution_name or "").strip().lower()
+    acct_type = (account_type or "").strip().lower()
+
+    def specificity(rule: dict[str, Any]) -> int:
+        rule_institution = (rule.get("institution_name") or "").strip().lower()
+        rule_account_type = (rule.get("account_type") or "").strip().lower()
+        institution_match = bool(rule_institution) and rule_institution == institution
+        account_type_match = bool(rule_account_type) and rule_account_type == acct_type
+        if institution_match and account_type_match:
+            return 3
+        if institution_match and not rule_account_type:
+            return 2
+        if account_type_match and not rule_institution:
+            return 1
+        if not rule_institution and not rule_account_type:
+            return 0
+        return -1
+
+    candidates = [(specificity(rule), rule) for rule in rules]
+    candidates = [(score, rule) for score, rule in candidates if score >= 0]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _, best_rule = candidates[0]
+    return best_rule.get("parsing_hint") or None
+
+
 def is_unreconciled_bank_line(line: dict[str, Any]) -> bool:
     posting_status = str(line.get("posting_status") or "unposted").lower()
     allocation_status = str(line.get("allocation_status") or "unallocated").lower()
@@ -277,26 +454,19 @@ def list_bank_account_unreconciled_lines(account_id: str, organisation_id: str, 
     )
     lines = sorted((row for row in rows if is_unreconciled_bank_line(row)), key=bank_line_sort_key)
 
-    upload_ids = [
-        str(line.get("bank_statement_upload_id"))
-        for line in lines
-        if line.get("bank_statement_upload_id")
-    ]
-    uploads_by_id: dict[str, dict[str, Any]] = {}
-    if upload_ids:
-        try:
-            upload_rows = (
-                db.table("bank_statement_uploads")
-                .select("id, original_filename, uploaded_at")
-                .eq("organisation_id", organisation_id)
-                .in_("id", list(dict.fromkeys(upload_ids)))
-                .execute()
-                .data
-                or []
-            )
-            uploads_by_id = {str(row.get("id")): row for row in upload_rows if row.get("id")}
-        except Exception:
-            uploads_by_id = {}
+    try:
+        upload_rows = (
+            db.table("bank_statement_uploads")
+            .select("*")
+            .eq("organisation_id", organisation_id)
+            .eq("bank_account_id", account_id)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        upload_rows = []
+    uploads_by_id = {str(row.get("id")): row for row in upload_rows if row.get("id")}
 
     enriched = []
     for line in lines:
@@ -307,7 +477,21 @@ def list_bank_account_unreconciled_lines(account_id: str, organisation_id: str, 
             "upload_uploaded_at": upload.get("uploaded_at"),
         })
 
-    return {"success": True, "account": account, "lines": enriched}
+    balances = BankBalanceSummary.model_validate(
+        build_bank_balance_summary(
+            db,
+            organisation_id=organisation_id,
+            account=account,
+            lines=rows,
+            uploads=upload_rows,
+        )
+    )
+    return {
+        "success": True,
+        "account": account,
+        "lines": enriched,
+        "balances": balances.model_dump(),
+    }
 
 
 @router.post("/accounts")
@@ -343,6 +527,73 @@ def create_bank_account(payload: BankAccountCreate, auth: UserAuth):
     except Exception:
         pass  # non-fatal
     return {"success": True, "account": account}
+
+
+@router.get("/parsing-rules")
+def list_parsing_rules(organisation_id: str, auth: UserAuth):
+    user_id, db = _auth(auth)
+    ensure_org_read(user_id, organisation_id)
+    res = (
+        db.table("bank_parsing_rules")
+        .select("*")
+        .eq("organisation_id", organisation_id)
+        .order("institution_name")
+        .execute()
+    )
+    return {"success": True, "rules": res.data or []}
+
+
+@router.post("/parsing-rules")
+def create_parsing_rule(payload: ParsingRuleCreate, auth: UserAuth):
+    user_id, db = _auth(auth)
+    organisation_id = str(payload.organisation_id)
+    ensure_org_write(user_id, organisation_id)
+    row = {
+        "organisation_id": organisation_id,
+        "institution_name": payload.institution_name,
+        "account_type": payload.account_type,
+        "parsing_hint": payload.parsing_hint,
+        "active": payload.active,
+        "created_by": user_id,
+    }
+    res = db.table("bank_parsing_rules").insert(row).execute()
+    rule = _one(res, "Parsing rule create failed")
+    return {"success": True, "rule": rule}
+
+
+@router.put("/parsing-rules/{rule_id}")
+def update_parsing_rule(rule_id: str, payload: ParsingRuleUpdate, auth: UserAuth):
+    user_id, db = _auth(auth)
+    organisation_id = str(payload.organisation_id)
+    ensure_org_write(user_id, organisation_id)
+    _one(
+        db.table("bank_parsing_rules").select("id").eq("id", rule_id).eq("organisation_id", organisation_id).limit(1).execute(),
+        "Parsing rule not found",
+    )
+    patch: dict[str, Any] = {"updated_at": now_iso()}
+    if payload.institution_name is not None:
+        patch["institution_name"] = payload.institution_name
+    if payload.account_type is not None:
+        patch["account_type"] = payload.account_type
+    if payload.parsing_hint is not None:
+        patch["parsing_hint"] = payload.parsing_hint
+    if payload.active is not None:
+        patch["active"] = payload.active
+    res = db.table("bank_parsing_rules").update(patch).eq("id", rule_id).eq("organisation_id", organisation_id).execute()
+    rule = _one(res, "Parsing rule update failed")
+    return {"success": True, "rule": rule}
+
+
+@router.delete("/parsing-rules/{rule_id}")
+def delete_parsing_rule(rule_id: str, organisation_id: str, auth: UserAuth):
+    user_id, db = _auth(auth)
+    ensure_org_write(user_id, organisation_id)
+    _one(
+        db.table("bank_parsing_rules").select("id").eq("id", rule_id).eq("organisation_id", organisation_id).limit(1).execute(),
+        "Parsing rule not found",
+    )
+    db.table("bank_parsing_rules").delete().eq("id", rule_id).eq("organisation_id", organisation_id).execute()
+    return {"success": True}
 
 
 @router.get("/uploads")
@@ -421,6 +672,12 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             or []
         )
 
+        parsing_hint = lookup_parsing_hint(
+            db,
+            organisation_id=organisation_id,
+            institution_name=account.get("institution_name"),
+            account_type=account.get("account_type"),
+        )
         header, lines = extract_statement(
             file_bytes,
             filename=upload["original_filename"],
@@ -428,6 +685,7 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             bank_account_id=account["id"],
             currency=account.get("currency"),
             account_type=account.get("account_type"),
+            parsing_hint=parsing_hint,
         )
         line_wrappers, duplicate_summary = detect_line_duplicates(
             db=db,
@@ -526,6 +784,56 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.delete("/uploads/{upload_id}")
+def delete_bank_upload(upload_id: str, organisation_id: str, auth: UserAuth):
+    user_id, db = _auth(auth)
+    ensure_org_write(user_id, organisation_id)
+    try:
+        result = _delete_bank_uploads_rpc(
+            db,
+            organisation_id=organisation_id,
+            upload_ids=[upload_id],
+            actor_user_id=user_id,
+        )
+    except Exception as exc:
+        raise _bank_delete_error(exc) from exc
+    storage_failures = _remove_bank_upload_files(
+        db,
+        result.get("files") if isinstance(result.get("files"), list) else [],
+    )
+    return {
+        "success": True,
+        "deleted_count": int(result.get("deleted_count") or 0),
+        "storage_cleanup_failures": storage_failures,
+    }
+
+
+@router.post("/uploads/bulk-delete")
+def bulk_delete_bank_uploads(payload: BulkDeleteUploadsRequest, auth: UserAuth):
+    user_id, db = _auth(auth)
+    organisation_id = str(payload.organisation_id)
+    ensure_org_write(user_id, organisation_id)
+    upload_ids = [str(upload_id) for upload_id in payload.upload_ids]
+    try:
+        result = _delete_bank_uploads_rpc(
+            db,
+            organisation_id=organisation_id,
+            upload_ids=upload_ids,
+            actor_user_id=user_id,
+        )
+    except Exception as exc:
+        raise _bank_delete_error(exc) from exc
+    storage_failures = _remove_bank_upload_files(
+        db,
+        result.get("files") if isinstance(result.get("files"), list) else [],
+    )
+    return {
+        "success": True,
+        "deleted_count": int(result.get("deleted_count") or 0),
+        "storage_cleanup_failures": storage_failures,
+    }
+
+
 @router.get("/uploads/{upload_id}/lines")
 def list_bank_lines(upload_id: str, organisation_id: str, auth: UserAuth):
     user_id, db = _auth(auth)
@@ -540,6 +848,32 @@ def list_bank_lines(upload_id: str, organisation_id: str, auth: UserAuth):
         .execute()
     )
     return {"success": True, "lines": res.data or []}
+
+
+@router.delete("/lines")
+def delete_bank_lines(payload: BulkDeleteLinesRequest, auth: UserAuth):
+    return bulk_delete_bank_lines(payload, auth)
+
+
+@router.post("/lines/bulk-delete")
+def bulk_delete_bank_lines(payload: BulkDeleteLinesRequest, auth: UserAuth):
+    user_id, db = _auth(auth)
+    organisation_id = str(payload.organisation_id)
+    ensure_org_write(user_id, organisation_id)
+    line_ids = [str(line_id) for line_id in payload.line_ids]
+    try:
+        result = _delete_bank_lines_rpc(
+            db,
+            organisation_id=organisation_id,
+            line_ids=line_ids,
+            actor_user_id=user_id,
+        )
+    except Exception as exc:
+        raise _bank_delete_error(exc) from exc
+    return {
+        "success": True,
+        "deleted_count": int(result.get("deleted_count") or 0),
+    }
 
 
 @router.post("/lines/{line_id}/suggest")

@@ -56,6 +56,10 @@ def select_bank_cash_extractor(*, account_type: Optional[str], filename: str, mi
     source_format = detect_source_format(filename, mime_type)
     if source_format == "csv":
         parser_strategy = "deterministic_csv"
+    elif source_format == "xlsx":
+        parser_strategy = "deterministic_xlsx"
+    elif source_format == "xls":
+        parser_strategy = "unsupported_legacy_xls"
     elif source_format == "pdf":
         parser_strategy = "pdf_text_blocks_then_vlm"
     elif source_format == "image":

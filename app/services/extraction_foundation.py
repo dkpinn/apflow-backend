@@ -30,8 +30,18 @@ def file_sha256(file_bytes: bytes) -> str:
 def detect_source_format(filename: str, mime_type: Optional[str]) -> str:
     lower = (filename or "").lower()
     effective_mime = (mime_type or "").lower()
-    if lower.endswith(".csv") or "csv" in effective_mime or effective_mime == "application/vnd.ms-excel":
+    if lower.endswith(".xlsx"):
+        return "xlsx"
+    if lower.endswith(".xls"):
+        return "xls"
+    if lower.endswith(".csv"):
         return "csv"
+    if effective_mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+        return "xlsx"
+    if "csv" in effective_mime:
+        return "csv"
+    if effective_mime == "application/vnd.ms-excel":
+        return "xls"
     if lower.endswith(".pdf") or effective_mime == "application/pdf":
         return "pdf"
     if effective_mime.startswith("image/") or lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
