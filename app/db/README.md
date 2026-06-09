@@ -24,6 +24,25 @@ Production pushes are manual. Review `db push --dry-run` before every push.
 Dashboard SQL Editor changes bypass migration history and are reserved for
 emergency repairs that are immediately captured with `db pull`.
 
+## Development Project
+
+Development must use a separate Supabase project and untracked credentials in
+`.env.development.local`, based on `.env.development.example`. Never point the
+development bootstrap at the production project ref. The development project
+ref is `ykhfrekhxdrsalwmalgt`.
+
+After applying migrations to the development project, grant the demo account
+Platform Owner access with:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\seed_dev_test_data.py
+.\.venv\Scripts\python.exe scripts\bootstrap_dev_platform_owner.py
+```
+
+Both scripts require `APFLOW_ENV=development`, verify
+`DEV_SUPABASE_PROJECT_REF` against `SUPABASE_URL`, and refuses the production
+project.
+
 The production project ref is `arueantocclxnziipwdf`. CLI access tokens and the
 database password must remain in the operating system credential store or
 untracked environment variables.

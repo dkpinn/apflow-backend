@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 .env
+.env.*
+!.env.example
+!.env.development.example
 apflow-backend.zip
 *.zip
 

@@ -67,6 +67,17 @@ UserAuth = Annotated[tuple, Depends(authenticated_user)]
 WRITE_ROLES: frozenset[str] = frozenset({"owner", "admin", "accountant"})
 ADMIN_ROLES: frozenset[str] = frozenset({"owner", "admin"})
 
+CAPABILITY_KEYS: tuple[str, ...] = (
+    "manage_org",
+    "manage_users",
+    "edit_data",
+    "review",
+    "run_reconciliation",
+    "view_reports",
+    "approve",
+    "submit_for_approval",
+)
+
 
 def org_role_for_user(user_id: str, organisation_id: Optional[str]) -> Optional[str]:
     """
@@ -121,6 +132,28 @@ def ensure_org_admin(user_id: str, organisation_id: Optional[str]) -> None:
             status_code=403,
             detail="Only organisation owners and admins can change these settings",
         )
+
+
+def effective_capabilities(
+    role: Optional[str],
+    permissions: Optional[dict] = None,
+    *,
+    platform_owner: bool = False,
+) -> dict[str, bool]:
+    permissions = permissions if isinstance(permissions, dict) else {}
+    if platform_owner:
+        return {key: True for key in CAPABILITY_KEYS}
+
+    return {
+        "manage_org": role in ADMIN_ROLES,
+        "manage_users": role in ADMIN_ROLES,
+        "edit_data": role in WRITE_ROLES,
+        "review": role in {"owner", "admin", "reviewer"},
+        "run_reconciliation": role in WRITE_ROLES,
+        "view_reports": role in WRITE_ROLES or bool(permissions.get("reports_view")),
+        "approve": role in ADMIN_ROLES,
+        "submit_for_approval": role in WRITE_ROLES,
+    }
 
 
 def _bootstrap_platform_owner_ids() -> set[str]:

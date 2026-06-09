@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
 from app.db.supabase_client import get_supabase_client
-from app.dependencies import UserAuth, ensure_platform_owner
+from app.dependencies import (
+    UserAuth,
+    effective_capabilities,
+    ensure_platform_owner,
+    is_platform_owner,
+)
 from app.services.integration_service import (
     create_system_integration,
     delete_system_integration,
@@ -61,6 +66,47 @@ def _platform_db(auth: UserAuth):
     user_id, _user_db = auth
     ensure_platform_owner(user_id)
     return user_id, get_supabase_client()
+
+
+@router.get("/me")
+def get_admin_identity(
+    auth: UserAuth,
+    organisation_id: Optional[str] = Query(default=None),
+) -> dict:
+    user_id, _user_db = auth
+    db = get_supabase_client()
+    platform_owner = is_platform_owner(user_id)
+    membership = None
+    if organisation_id:
+        rows = (
+            db.table("organisation_users")
+            .select("role, status, permissions, platform_managed")
+            .eq("user_id", user_id)
+            .eq("organisation_id", organisation_id)
+            .eq("status", "active")
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        membership = rows[0] if rows else None
+
+    role = membership.get("role") if membership else None
+    permissions = membership.get("permissions") if membership else {}
+    return {
+        "user_id": user_id,
+        "platform_owner": platform_owner,
+        "organisation_id": organisation_id,
+        "organisation_role": role,
+        "platform_managed_membership": bool(
+            membership and membership.get("platform_managed")
+        ),
+        "effective_capabilities": effective_capabilities(
+            role,
+            permissions,
+            platform_owner=platform_owner,
+        ),
+    }
 
 
 @router.get("/system-integrations")

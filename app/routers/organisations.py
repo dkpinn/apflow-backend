@@ -12,6 +12,7 @@ from app.services.invoice_extraction_service._helpers import (
     get_organisation_extraction_settings,
     update_organisation_extraction_settings,
 )
+from app.services.organisation_profile import get_organisation_profile
 from app.services.organisation_module_settings import (
     MODULE_KEYS,
     get_module_settings,
@@ -341,3 +342,26 @@ def update_invoice_branding(
         return {key: saved.get(key, value) for key, value in _default_invoice_branding().items()}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Unable to save invoice branding: {exc}") from exc
+
+
+class OrganisationProfileResponse(BaseModel):
+    legal_name: str = ""
+    registration_number: str = ""
+    vat_number: str = ""
+    address_line1: str = ""
+    address_line2: str = ""
+    city: str = ""
+    postal_code: str = ""
+    country: str = ""
+    phone: str = ""
+    email: str = ""
+
+
+@router.get("/{organisation_id}/profile", response_model=OrganisationProfileResponse)
+def get_org_profile(organisation_id: str, auth: UserAuth):
+    user_id, _db = auth
+    ensure_org_read(str(user_id), organisation_id)
+    try:
+        return get_organisation_profile(organisation_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to load organisation profile: {exc}") from exc

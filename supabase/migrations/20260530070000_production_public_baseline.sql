@@ -1,4 +1,3 @@
-﻿
 -- Production public-schema baseline captured from project
 -- arueantocclxnziipwdf on 2026-06-08.
 --
