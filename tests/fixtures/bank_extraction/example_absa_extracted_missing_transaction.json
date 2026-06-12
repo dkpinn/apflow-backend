@@ -1,0 +1,39 @@
+{
+  "document_id": "example_absa_current_2024_02",
+  "bank": "ABSA",
+  "account_type": "current_account",
+  "document_variant": "extracted_output",
+  "statement_start_date": "2024-02-01",
+  "statement_end_date": "2024-02-29",
+  "opening_balance": 10000.00,
+  "closing_balance": 13050.00,
+  "transactions": [
+    {
+      "transaction_index": 1,
+      "date": "2024-02-01",
+      "description": "CARD PURCHASE CHECKERS DURBAN 31 JAN",
+      "amount": -250.00,
+      "running_balance": 9750.00,
+      "page_number": 1,
+      "source_reference": "p1-row-14"
+    },
+    {
+      "transaction_index": 2,
+      "date": "2024-02-03",
+      "description": "SALARY ACME CORP",
+      "amount": 5000.00,
+      "running_balance": 14750.00,
+      "page_number": 1,
+      "source_reference": "p1-row-15"
+    },
+    {
+      "transaction_index": 4,
+      "date": "2024-02-10",
+      "description": "ATM WITHDRAWAL SANDTON",
+      "amount": -500.00,
+      "running_balance": 13050.00,
+      "page_number": 2,
+      "source_reference": "p2-row-3"
+    }
+  ]
+}

@@ -21,7 +21,7 @@ BEGIN
   -- Trade Receivables (Debtors)
   INSERT INTO public.accounts
     (organisation_id, code, name, type, group_name, vat_treatment, is_system, system_key)
-  SELECT p_org_id, '1200', 'Trade Receivables (Debtors)', 'asset', 'Current Assets', 'full', true, 'trade_receivables'
+  SELECT p_org_id, '6500', 'Trade Receivables (Debtors)', 'asset', 'Current Assets', 'full', true, 'trade_receivables'
   WHERE NOT EXISTS (
     SELECT 1 FROM public.accounts WHERE organisation_id = p_org_id AND system_key = 'trade_receivables'
   );

@@ -9,9 +9,10 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.db.supabase_client import get_supabase_client
+from app.db.supabase_client import get_fresh_supabase_client, get_supabase_client
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
 from app.services.extraction_foundation import file_sha256
+from app.services.bank_extraction_validation import validate_extracted_statement_quality
 from app.services.bank_statement_service import (
     default_rule_criteria_from_line,
     dec_to_float,
@@ -32,6 +33,7 @@ from app.services.organisation_module_settings import (
     required_tracking_dimensions,
     validate_bank_allocation_tracking,
 )
+from app.services.sales_invoices import post_customer_receipt
 
 router = APIRouter(prefix="/api/bank", tags=["bank"])
 
@@ -678,6 +680,12 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             institution_name=account.get("institution_name"),
             account_type=account.get("account_type"),
         )
+        print(
+            f"[EXTRACT] upload_id={upload_id} "
+            f"institution={account.get('institution_name')!r} "
+            f"account_type={account.get('account_type')!r} "
+            f"parsing_hint={'FOUND (' + str(len(parsing_hint)) + ' chars)' if parsing_hint else 'NONE'}"
+        )
         header, lines = extract_statement(
             file_bytes,
             filename=upload["original_filename"],
@@ -687,6 +695,9 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             account_type=account.get("account_type"),
             parsing_hint=parsing_hint,
         )
+        # Refresh the DB connection after the long extraction call (Gemini VLM can take
+        # 30-60s) — the persistent HTTP/2 connection may have gone stale while waiting.
+        db = get_fresh_supabase_client()
         line_wrappers, duplicate_summary = detect_line_duplicates(
             db=db,
             organisation_id=organisation_id,
@@ -699,6 +710,12 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             account_current_balance=money(account.get("current_reconciled_balance")),
             header=header,
             lines=lines,
+        )
+        validation_result = validate_extracted_statement_quality(
+            extracted_lines=lines,
+            header=header,
+            duplicate_summary=duplicate_summary,
+            balance_summary=balance_summary,
         )
 
         db.table("bank_statement_lines").delete().eq("bank_statement_upload_id", upload_id).execute()
@@ -741,6 +758,12 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
                 "parser_strategy": header.get("parser_strategy"),
                 "line_count": len(inserts),
                 "warnings": header.get("extraction_warnings") or [],
+                # Observational quality result — not yet used to gate allocation.
+                # TODO: once validation should become blocking, check
+                # validation_result["can_allocate"] here and, if False, set
+                # extraction_status="needs_review" instead of "extracted" and
+                # skip the bank_accounts.current_reconciled_balance update below.
+                "validation": validation_result,
             },
             "extraction_status": "extracted",
             "extracted_at": now_iso(),
@@ -780,8 +803,14 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             "balance_summary": balance_summary,
         }
     except Exception as exc:
-        db.table("bank_statement_uploads").update({"extraction_status": "failed"}).eq("id", upload_id).execute()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        import traceback
+        print(f"[EXTRACT ERROR] upload_id={upload_id}: {exc}")
+        traceback.print_exc()
+        db.table("bank_statement_uploads").update({
+            "extraction_status": "failed",
+            "extraction_warnings": [str(exc)],
+        }).eq("id", upload_id).execute()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.delete("/uploads/{upload_id}")
@@ -850,6 +879,32 @@ def list_bank_lines(upload_id: str, organisation_id: str, auth: UserAuth):
     return {"success": True, "lines": res.data or []}
 
 
+@router.get("/uploads/{upload_id}/audit-trail")
+def get_bank_upload_audit_trail(upload_id: str, organisation_id: str, auth: UserAuth):
+    user_id, db = _auth(auth)
+    ensure_org_read(user_id, organisation_id)
+    upload = _one(
+        db.table("bank_statement_uploads")
+        .select("*")
+        .eq("id", upload_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Bank statement upload not found",
+    )
+    events = (
+        db.table("bank_audit_events")
+        .select("*")
+        .eq("organisation_id", organisation_id)
+        .eq("bank_statement_upload_id", upload_id)
+        .order("created_at")
+        .execute()
+        .data
+        or []
+    )
+    return {"success": True, "upload": upload, "events": events}
+
+
 @router.delete("/lines")
 def delete_bank_lines(payload: BulkDeleteLinesRequest, auth: UserAuth):
     return bulk_delete_bank_lines(payload, auth)
@@ -915,6 +970,51 @@ def review_bank_line(line_id: str, payload: ReviewLineRequest, auth: UserAuth):
             db.table("bank_transaction_suggestions").select("*").eq("id", str(payload.suggestion_id)).eq("organisation_id", organisation_id).limit(1).execute(),
             "Suggestion not found",
         )
+    receipt_result = None
+    if suggestion and suggestion.get("matched_sales_invoice_id"):
+        evidence = suggestion.get("evidence") or {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        customer_id = evidence.get("customer_id")
+        receipt_amount = money(line.get("signed_amount"))
+        outstanding = money(evidence.get("invoice_outstanding"))
+        if receipt_amount <= 0 or not customer_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Receivable suggestions require an incoming amount and customer",
+            )
+        allocation_amount = min(receipt_amount, outstanding)
+        try:
+            receipt_result = post_customer_receipt(
+                db,
+                organisation_id=organisation_id,
+                customer_id=str(customer_id),
+                bank_account_id=str(line["bank_account_id"]),
+                receipt_date=str(line.get("line_date") or datetime.now(timezone.utc).date()),
+                amount=float(receipt_amount),
+                currency=str(line.get("currency") or "ZAR").upper(),
+                reference=(
+                    line.get("reference")
+                    or line.get("description")
+                    or suggestion.get("matched_invoice_number")
+                ),
+                notes="Posted from an accepted bank receipt suggestion",
+                allocations=[
+                    {
+                        "sales_invoice_id": suggestion["matched_sales_invoice_id"],
+                        "amount": float(allocation_amount),
+                    }
+                ],
+                actor_user_id=user_id,
+                bank_statement_line_id=line_id,
+                idempotency_key=f"bank-statement-line:{line_id}",
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to post matched customer receipt: {exc}",
+            ) from exc
+    if suggestion:
         db.table("bank_transaction_suggestions").update({"status": "accepted"}).eq("id", suggestion["id"]).execute()
     accepted_rule_id = None
     if payload.create_rule:
@@ -961,7 +1061,18 @@ def review_bank_line(line_id: str, payload: ReviewLineRequest, auth: UserAuth):
         "accepted_suggestion_id": str(payload.suggestion_id) if payload.suggestion_id else None,
         "accepted_rule_id": accepted_rule_id,
         "supplier_id": str(payload.supplier_id) if payload.supplier_id else None,
-        "match_status": "matched" if suggestion and suggestion.get("matched_invoice_id") else "suggested",
+        "matched_sales_invoice_id": (
+            suggestion.get("matched_sales_invoice_id") if suggestion else None
+        ),
+        "match_status": (
+            "matched"
+            if suggestion
+            and (
+                suggestion.get("matched_invoice_id")
+                or suggestion.get("matched_sales_invoice_id")
+            )
+            else "suggested"
+        ),
         "allocation_status": "allocated" if (payload.gl_account_id or suggestion) else "unallocated",
         "review_status": "reviewed",
         "reviewed_by": user_id,
@@ -982,7 +1093,7 @@ def review_bank_line(line_id: str, payload: ReviewLineRequest, auth: UserAuth):
         suggestion_id=str(payload.suggestion_id) if payload.suggestion_id else None,
         created_rule_id=accepted_rule_id,
     )
-    return {"success": True}
+    return {"success": True, "customer_receipt": receipt_result}
 
 
 @router.post("/lines/{line_id}/journal-preview")

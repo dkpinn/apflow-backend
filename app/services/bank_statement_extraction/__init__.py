@@ -14,6 +14,8 @@ from .csv_parser import parse_csv_statement
 from .models import ParsedBankLine
 from .pdf_parser import (
     extract_pdf_text,
+    extract_pdf_words_by_page,
+    parse_columnar_transaction_blocks,
     parse_text_statement,
     parse_text_statement_from_text,
     parse_transaction_blocks,
@@ -29,11 +31,13 @@ __all__ = [
     "dec_to_float",
     "extract_bank_reference",
     "extract_pdf_text",
+    "extract_pdf_words_by_page",
     "extract_statement",
     "infer_column",
     "infer_signed_amount",
     "money",
     "normalize_text",
+    "parse_columnar_transaction_blocks",
     "parse_csv_statement",
     "parse_date",
     "parse_text_statement",

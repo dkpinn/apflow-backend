@@ -134,6 +134,99 @@ async def email_inbound(
     }
 
 
+@router.post("/mailgun-events")
+async def mailgun_events(request: Request) -> dict[str, Any]:
+    """Record outbound customer-invoice delivery and failure events."""
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        payload = await request.json()
+        signature_block = payload.get("signature") or {}
+        event_data = payload.get("event-data") or {}
+        token = str(signature_block.get("token") or "")
+        timestamp = str(signature_block.get("timestamp") or "")
+        signature = str(signature_block.get("signature") or "")
+        event_name = str(event_data.get("event") or "")
+        message = event_data.get("message") or {}
+        headers = message.get("headers") or {}
+        provider_message_id = str(headers.get("message-id") or message.get("id") or "")
+        recipient = str(event_data.get("recipient") or "")
+        details = event_data
+    else:
+        form = await request.form()
+        token = str(form.get("token") or "")
+        timestamp = str(form.get("timestamp") or "")
+        signature = str(form.get("signature") or "")
+        event_name = str(form.get("event") or "")
+        provider_message_id = str(
+            form.get("Message-Id") or form.get("message-id") or form.get("id") or ""
+        )
+        recipient = str(form.get("recipient") or "")
+        details = {key: str(value) for key, value in form.items()}
+
+    signing_key = os.environ.get("MAILGUN_WEBHOOK_SIGNING_KEY")
+    if not signing_key:
+        raise HTTPException(status_code=500, detail="MAILGUN_WEBHOOK_SIGNING_KEY not configured")
+    if not verify_mailgun_signature(signing_key, token, timestamp, signature):
+        raise HTTPException(status_code=401, detail="Invalid Mailgun webhook signature")
+
+    normalized = {
+        "delivered": "delivered",
+        "failed": "failed",
+        "permanent_fail": "failed",
+        "temporary_fail": "failed",
+    }.get(event_name)
+    if not normalized or not provider_message_id:
+        return {"status": "ignored", "event": event_name}
+
+    db = get_supabase_client()
+    sent = (
+        db.table("sales_invoice_delivery_events")
+        .select("organisation_id, sales_invoice_id")
+        .eq("provider_message_id", provider_message_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if not sent:
+        return {"status": "ignored", "reason": "unknown message id"}
+    row = sent[0]
+
+    # Mailgun retries webhook delivery on any non-2xx response and may also
+    # redeliver the same event after a 2xx, so guard against duplicate rows
+    # for the same (provider_message_id, event_type) pair.
+    duplicate = (
+        db.table("sales_invoice_delivery_events")
+        .select("id")
+        .eq("provider_message_id", provider_message_id)
+        .eq("event_type", normalized)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if duplicate:
+        return {"status": "ok", "event": normalized, "duplicate": True}
+
+    try:
+        db.table("sales_invoice_delivery_events").insert(
+            {
+                "organisation_id": row["organisation_id"],
+                "sales_invoice_id": row["sales_invoice_id"],
+                "event_type": normalized,
+                "recipient_email": recipient or None,
+                "provider": "mailgun",
+                "provider_message_id": provider_message_id,
+                "details": details,
+            }
+        ).execute()
+    except Exception as exc:  # noqa: BLE001
+        if "23505" in str(exc):
+            return {"status": "ok", "event": normalized, "duplicate": True}
+        raise
+    return {"status": "ok", "event": normalized}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # WhatsApp — Meta WhatsApp Cloud API
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -17,9 +17,14 @@ from app.routers import channels
 from app.routers import admin_integrations
 from app.routers import integrations
 from app.routers import bank
+from app.routers import bank_extraction_benchmark
+from app.routers import bank_extraction_admin
 from app.routers import reports
 from app.routers import asset_types
 from app.routers import document_autofill
+from app.routers import customers
+from app.routers import sales_invoices
+from app.routers import customer_receipts
 
 
 def _sweep_log(msg: str) -> None:
@@ -349,9 +354,14 @@ app.include_router(channels.router)
 app.include_router(admin_integrations.router)
 app.include_router(integrations.router)
 app.include_router(bank.router)
+app.include_router(bank_extraction_benchmark.router)
+app.include_router(bank_extraction_admin.router)
 app.include_router(reports.router)
 app.include_router(asset_types.router)
 app.include_router(document_autofill.router)
+app.include_router(customers.router)
+app.include_router(sales_invoices.router)
+app.include_router(customer_receipts.router)
 
 
 @app.get("/")

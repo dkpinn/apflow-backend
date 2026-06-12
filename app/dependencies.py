@@ -6,17 +6,28 @@ from __future__ import annotations
 import os
 from typing import Annotated, Optional, Tuple
 
+import jwt
+from cachetools import TTLCache
 from fastapi import Depends, Header, HTTPException
+from jwt import PyJWKClient
 from supabase import Client
 
 from app.db.supabase_client import get_supabase_client, get_user_supabase_client
 
-# Service-role singleton — used only for JWT validation (auth.get_user).
-# Never used for user-facing DB queries.
-try:
-    _svc = get_supabase_client()
-except Exception:
-    _svc = None  # type: ignore[assignment]
+_org_role_cache: TTLCache = TTLCache(maxsize=1024, ttl=60)
+_jwks_client: PyJWKClient | None = None
+
+
+def _get_jwks_client() -> PyJWKClient:
+    global _jwks_client
+    if _jwks_client is None:
+        supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+        if not supabase_url:
+            raise HTTPException(status_code=500, detail="Supabase credentials missing")
+        # Fetches Supabase's public JWKS once and caches it — works with any key type
+        # (current ECC P-256 / ES256 and legacy HS256 shared secret).
+        _jwks_client = PyJWKClient(f"{supabase_url}/auth/v1/.well-known/jwks.json", cache_keys=True)
+    return _jwks_client
 
 
 def authenticated_user(
@@ -35,19 +46,25 @@ def authenticated_user(
     if not token:
         raise HTTPException(status_code=401, detail="Missing bearer token")
 
-    if _svc is None:
-        raise HTTPException(status_code=500, detail="Supabase credentials missing")
-
-    # Validate token against Supabase Auth (service-role client, Auth API only — not a DB query)
+    # Verify JWT locally using Supabase's JWKS public keys — no network call per request
+    # after the initial JWKS fetch (keys are cached in _jwks_client).
+    # Only asymmetric algorithms are accepted: JWKS exposes public keys, and
+    # allowing HS256 here would let a token signed with that public key (as an
+    # HMAC secret) pass verification — a classic algorithm-confusion attack.
     try:
-        response = _svc.auth.get_user(token)
-    except Exception as exc:
+        signing_key = _get_jwks_client().get_signing_key_from_jwt(token)
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["ES256", "RS256"],
+            audience="authenticated",
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail="Invalid bearer token") from exc
 
-    user = response.get("user") if isinstance(response, dict) else getattr(response, "user", None)
-    user_id = getattr(user, "id", None)
-    if user_id is None and isinstance(user, dict):
-        user_id = user.get("id")
+    user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid bearer token")
 
@@ -88,6 +105,9 @@ def org_role_for_user(user_id: str, organisation_id: Optional[str]) -> Optional[
     """
     if not user_id or not organisation_id:
         return None
+    cache_key = (user_id, organisation_id)
+    if cache_key in _org_role_cache:
+        return _org_role_cache[cache_key]
     try:
         res = (
             get_supabase_client()
@@ -100,9 +120,11 @@ def org_role_for_user(user_id: str, organisation_id: Optional[str]) -> Optional[
             .execute()
         )
         row = res.data[0] if res.data else None
-        return row.get("role") if row else None
+        role = row.get("role") if row else None
     except Exception:
         return None
+    _org_role_cache[cache_key] = role
+    return role
 
 
 def ensure_org_read(user_id: str, organisation_id: Optional[str]) -> None:

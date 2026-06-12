@@ -1,0 +1,82 @@
+diff --git a/src/components/app/AppTopNav.tsx b/src/components/app/AppTopNav.tsx
+--- a/src/components/app/AppTopNav.tsx
++++ b/src/components/app/AppTopNav.tsx
+@@ -111,7 +111,7 @@ const CUSTOMER_NAV = {
+     { label: "Quotes",    icon: ReceiptText },
+   ],
+   activity: [
+-    { label: "Sales Invoices / Receipts", icon: FileText },
++    { to: "/sales-invoices", label: "Sales Invoices / Receipts", icon: FileText },
+     { label: "To Be Billed",              icon: ClipboardList },
+     { label: "Statements",                icon: FileSpreadsheet },
+     { label: "Reconciliations",           icon: GitCompareArrows },
+@@ -122,7 +122,7 @@ const CUSTOMER_NAV = {
+     { label: "Approvals",                 icon: ShieldCheck },
+   ],
+   management: [
+-    { label: "Customer Edit / Add", icon: Users },
++    { to: "/customers", label: "Customer Edit / Add", icon: Users },
+     { label: "Customers Audit",     icon: SearchCheck },
+   ],
+ } as const;
+@@ -300,6 +300,8 @@ export function AppTopNav() {
+   const initial = (user?.email ?? "?").charAt(0).toUpperCase();
+   const isDashboardActive = pathname.startsWith("/dashboard");
+   const isSupplierActive  = SUPPLIER_PATHS.some((p) => pathname.startsWith(p));
++  const isCustomerActive =
++    pathname.startsWith("/customers") || pathname.startsWith("/sales-invoices");
+   const isReportsActive = pathname.startsWith("/reports");
+ 
+   const handleSignOut = async () => {
+@@ -419,7 +421,7 @@ export function AppTopNav() {
+           {/* Customer */}
+           <DropdownMenu>
+             <DropdownMenuTrigger asChild>
+-              <button type="button" className={navTriggerClass(false)}>
++              <button type="button" className={navTriggerClass(isCustomerActive)}>
+                 <Users className="mr-1.5 h-4 w-4" />
+                 Customer
+                 <ChevronDown className="ml-1 h-3 w-3 opacity-50" />
+@@ -434,14 +436,30 @@ export function AppTopNav() {
+                 ))}
+ 
+                 <SectionLabel className="mt-3">Activity</SectionLabel>
+-                {CUSTOMER_NAV.activity.map(({ label, icon: Icon }) => (
+-                  <DisabledNavItem key={label} label={label} icon={<Icon className="h-4 w-4" />} />
+-                ))}
++                {CUSTOMER_NAV.activity.map((item) => {
++                  const Icon = item.icon;
++                  return "to" in item ? (
++                    <SupplierNavLink
++                      key={item.label}
++                      to={item.to}
++                      label={item.label}
++                      icon={<Icon className="h-4 w-4" />}
++                      active={pathname.startsWith(item.to)}
++                    />
++                  ) : (
++                    <DisabledNavItem key={item.label} label={item.label} icon={<Icon className="h-4 w-4" />} />
++                  );
++                })}
+ 
+                 <SectionLabel className="mt-3">Management</SectionLabel>
+-                {CUSTOMER_NAV.management.map(({ label, icon: Icon }) => (
+-                  <DisabledNavItem key={label} label={label} icon={<Icon className="h-4 w-4" />} />
+-                ))}
++                {CUSTOMER_NAV.management.map((item) => {
++                  const Icon = item.icon;
++                  return "to" in item ? (
++                    <SupplierNavLink
++                      key={item.label}
++                      to={item.to}
++                      label={item.label}
++                      icon={<Icon className="h-4 w-4" />}
++                      active={pathname.startsWith(item.to)}
++                    />
++                  ) : (
++                    <DisabledNavItem key={item.label} label={item.label} icon={<Icon className="h-4 w-4" />} />
++                  );
++                })}
+ 
+               </div>
+             </DropdownMenuContent>

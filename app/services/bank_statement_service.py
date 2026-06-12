@@ -144,11 +144,91 @@ def score_invoice_suggestions(
     line: dict[str, Any],
     limit: int = 5,
 ) -> list[dict[str, Any]]:
-    amount = abs(money(line.get("signed_amount")))
+    signed_amount = money(line.get("signed_amount"))
+    amount = abs(signed_amount)
     text = " ".join(
         normalize_text(line.get(key))
         for key in ["reference", "bank_reference", "counterparty", "description", "raw_text"]
     ).lower()
+    if signed_amount >= 0:
+        try:
+            invoices = (
+                db.table("sales_invoices")
+                .select(
+                    "id, invoice_number, customer_id, total_amount, amount_outstanding, "
+                    "issue_date, due_date, status, payment_status, customer_snapshot"
+                )
+                .eq("organisation_id", organisation_id)
+                .eq("document_type", "invoice")
+                .eq("status", "issued")
+                .limit(500)
+                .execute()
+                .data
+                or []
+            )
+            receivables = (
+                db.table("accounts")
+                .select("id")
+                .eq("organisation_id", organisation_id)
+                .eq("system_key", "trade_receivables")
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            receivables_id = receivables[0].get("id") if receivables else None
+        except Exception:
+            return []
+
+        suggestions: list[dict[str, Any]] = []
+        for invoice in invoices:
+            outstanding = money(invoice.get("amount_outstanding") or invoice.get("total_amount"))
+            if outstanding <= 0:
+                continue
+            difference = abs(outstanding - amount)
+            reference = normalize_text(invoice.get("invoice_number")).lower()
+            customer_snapshot = invoice.get("customer_snapshot") or {}
+            customer_name = normalize_text(
+                customer_snapshot.get("legal_name") or customer_snapshot.get("trading_name")
+            ).lower()
+            confidence = Decimal("0.00")
+            reasons: list[str] = []
+            if reference and reference in text:
+                confidence += Decimal("0.60")
+                reasons.append("reference matches sales invoice number")
+            if difference <= Decimal("0.01"):
+                confidence += Decimal("0.30")
+                reasons.append("amount matches outstanding balance")
+            elif amount < outstanding:
+                confidence += Decimal("0.15")
+                reasons.append("amount is a possible partial receipt")
+            elif difference <= Decimal("1.00"):
+                confidence += Decimal("0.15")
+                reasons.append("amount is within tolerance")
+            if customer_name and customer_name in text:
+                confidence += Decimal("0.10")
+                reasons.append("counterparty resembles customer")
+            if confidence <= Decimal("0.20"):
+                continue
+            suggestions.append(
+                {
+                    "suggestion_type": "receivable_invoice",
+                    "confidence_score": float(min(confidence, Decimal("0.99"))),
+                    "rationale": "; ".join(reasons),
+                    "matched_sales_invoice_id": invoice.get("id"),
+                    "matched_invoice_number": invoice.get("invoice_number"),
+                    "suggested_account_id": receivables_id,
+                    "evidence": {
+                        "amount_difference": float(difference),
+                        "invoice_outstanding": float(outstanding),
+                        "line_amount": float(amount),
+                        "customer_id": invoice.get("customer_id"),
+                    },
+                }
+            )
+        suggestions.sort(key=lambda suggestion: suggestion["confidence_score"], reverse=True)
+        return suggestions[:limit]
+
     try:
         invoices = (
             db.table("invoices_extracted")

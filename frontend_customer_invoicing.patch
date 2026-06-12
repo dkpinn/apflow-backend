@@ -1,0 +1,657 @@
+diff --git a/src/lib/customerInvoicing.ts b/src/lib/customerInvoicing.ts
+new file mode 100644
+--- /dev/null
++++ b/src/lib/customerInvoicing.ts
+@@
++import { supabase } from "@/integrations/supabase/client";
++import { fetchFastApi } from "@/lib/ingestion";
++
++export type CustomerContact = {
++  id?: string;
++  contact_name: string;
++  email?: string | null;
++  phone?: string | null;
++  role_title?: string | null;
++  is_primary: boolean;
++};
++
++export type Customer = {
++  id: string;
++  organisation_id: string;
++  customer_code: string | null;
++  legal_name: string;
++  trading_name: string | null;
++  vat_number: string | null;
++  registration_number: string | null;
++  billing_address: string | null;
++  delivery_address: string | null;
++  default_email: string | null;
++  phone: string | null;
++  payment_terms_days: number;
++  currency: string;
++  default_revenue_account_id: string | null;
++  default_vat_treatment: "standard" | "zero_rated" | "exempt";
++  default_tracking: Record<string, string>;
++  active: boolean;
++  contacts?: CustomerContact[];
++};
++
++export type SalesInvoiceLine = {
++  id?: string;
++  description: string;
++  item_code?: string | null;
++  quantity: number;
++  unit_price: number;
++  prices_include_vat: boolean;
++  discount_percent: number;
++  discount_amount: number;
++  vat_treatment: "standard" | "zero_rated" | "exempt";
++  vat_rate: number;
++  revenue_account_id: string;
++  tracking: Record<string, string>;
++  net_amount?: number;
++  tax_amount?: number;
++  gross_amount?: number;
++  source_invoice_extracted_id?: string | null;
++  source_invoice_line_id?: string | null;
++  source_unit_cost?: number | null;
++  markup_percent?: number | null;
++  sort_order: number;
++};
++
++export type SalesInvoice = {
++  id: string;
++  organisation_id: string;
++  customer_id: string;
++  document_type: "invoice" | "credit_note";
++  original_invoice_id: string | null;
++  original_invoice_number?: string | null;
++  credit_reason: string | null;
++  invoice_number: string | null;
++  status: "draft" | "pending_approval" | "approved" | "issued" | "voided";
++  payment_status: "unpaid" | "partial" | "paid" | "overdue";
++  issue_date: string | null;
++  due_date: string | null;
++  currency: string;
++  customer_reference: string | null;
++  purchase_order_number: string | null;
++  notes: string | null;
++  subtotal: number;
++  discount_total: number;
++  tax_total: number;
++  total_amount: number;
++  amount_paid: number;
++  amount_credited: number;
++  amount_outstanding: number;
++  pdf_storage_path: string | null;
++  customer?: Customer;
++  customers?: Pick<Customer, "legal_name" | "trading_name" | "customer_code">;
++  lines?: SalesInvoiceLine[];
++  delivery_events?: Array<Record<string, unknown>>;
++  audit_events?: Array<Record<string, unknown>>;
++  receipt_allocations?: Array<Record<string, unknown>>;
++  credit_notes?: Array<Record<string, unknown>>;
++};
++
++async function arFetch<T>(path: string, init?: RequestInit): Promise<T> {
++  const { data } = await supabase.auth.getSession();
++  const token = data.session?.access_token;
++  if (!token) throw new Error("You must be signed in");
++  const response = await fetchFastApi(path, {
++    ...init,
++    headers: {
++      "Content-Type": "application/json",
++      "ngrok-skip-browser-warning": "true",
++      Authorization: `Bearer ${token}`,
++      ...(init?.headers ?? {}),
++    },
++  });
++  const text = await response.text();
++  const payload = text ? JSON.parse(text) : {};
++  if (!response.ok) {
++    throw new Error(typeof payload?.detail === "string" ? payload.detail : text || `Request failed (${response.status})`);
++  }
++  return payload as T;
++}
++
++export const customerApi = {
++  list: (organisationId: string, includeArchived = false, search = "") =>
++    arFetch<Customer[]>(`/api/customers?${new URLSearchParams({
++      organisation_id: organisationId,
++      include_archived: String(includeArchived),
++      ...(search ? { search } : {}),
++    })}`),
++  get: (organisationId: string, customerId: string) =>
++    arFetch<Customer>(`/api/customers/${customerId}?organisation_id=${organisationId}`),
++  create: (payload: Omit<Customer, "id">) =>
++    arFetch<Customer>("/api/customers", { method: "POST", body: JSON.stringify(payload) }),
++  update: (customerId: string, payload: Omit<Customer, "id">) =>
++    arFetch<Customer>(`/api/customers/${customerId}`, { method: "PUT", body: JSON.stringify(payload) }),
++  archive: (organisationId: string, customerId: string) =>
++    arFetch<Customer>(`/api/customers/${customerId}/archive?organisation_id=${organisationId}`, { method: "POST" }),
++  restore: (organisationId: string, customerId: string) =>
++    arFetch<Customer>(`/api/customers/${customerId}/restore?organisation_id=${organisationId}`, { method: "POST" }),
++};
++
++export const salesInvoiceApi = {
++  list: (organisationId: string, search = "") =>
++    arFetch<SalesInvoice[]>(`/api/sales-invoices?${new URLSearchParams({
++      organisation_id: organisationId,
++      ...(search ? { search } : {}),
++    })}`),
++  get: (organisationId: string, invoiceId: string) =>
++    arFetch<SalesInvoice>(`/api/sales-invoices/${invoiceId}?organisation_id=${organisationId}`),
++  create: (payload: Record<string, unknown>) =>
++    arFetch<SalesInvoice>("/api/sales-invoices", { method: "POST", body: JSON.stringify(payload) }),
++  update: (invoiceId: string, payload: Record<string, unknown>) =>
++    arFetch<SalesInvoice>(`/api/sales-invoices/${invoiceId}`, { method: "PUT", body: JSON.stringify(payload) }),
++  rebill: (invoiceId: string, payload: Record<string, unknown>) =>
++    arFetch(`/api/sales-invoices/${invoiceId}/rebill-lines`, { method: "POST", body: JSON.stringify(payload) }),
++  submit: (invoiceId: string, organisationId: string) =>
++    arFetch(`/api/sales-invoices/${invoiceId}/submit`, { method: "POST", body: JSON.stringify({ organisation_id: organisationId }) }),
++  approve: (invoiceId: string, organisationId: string) =>
++    arFetch(`/api/sales-invoices/${invoiceId}/approve`, { method: "POST", body: JSON.stringify({ organisation_id: organisationId }) }),
++  issue: (invoiceId: string, organisationId: string) =>
++    arFetch(`/api/sales-invoices/${invoiceId}/issue`, { method: "POST", body: JSON.stringify({ organisation_id: organisationId }) }),
++  send: (invoiceId: string, organisationId: string, recipientEmail?: string) =>
++    arFetch(`/api/sales-invoices/${invoiceId}/send`, {
++      method: "POST",
++      body: JSON.stringify({ organisation_id: organisationId, recipient_email: recipientEmail || null }),
++    }),
++  credit: (invoiceId: string, organisationId: string, reason: string) =>
++    arFetch<SalesInvoice>(`/api/sales-invoices/${invoiceId}/credit-notes`, {
++      method: "POST",
++      body: JSON.stringify({ organisation_id: organisationId, reason, lines: [] }),
++    }),
++  pdf: async (invoiceId: string, organisationId: string) => {
++    const { data } = await supabase.auth.getSession();
++    const response = await fetchFastApi(`/api/sales-invoices/${invoiceId}/pdf?organisation_id=${organisationId}`, {
++      headers: { Authorization: `Bearer ${data.session?.access_token ?? ""}`, "ngrok-skip-browser-warning": "true" },
++    });
++    if (!response.ok) throw new Error(await response.text());
++    return response.blob();
++  },
++};
++
++export const customerReceiptApi = {
++  create: (payload: Record<string, unknown>) =>
++    arFetch("/api/customer-receipts", { method: "POST", body: JSON.stringify(payload) }),
++};
+diff --git a/src/routes/_app.customers.tsx b/src/routes/_app.customers.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/routes/_app.customers.tsx
+@@
++import { createFileRoute, Outlet } from "@tanstack/react-router";
++
++export const Route = createFileRoute("/_app/customers")({ component: () => <Outlet /> });
+diff --git a/src/routes/_app.customers.index.tsx b/src/routes/_app.customers.index.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/routes/_app.customers.index.tsx
+@@
++import { createFileRoute, useNavigate } from "@tanstack/react-router";
++import { useQuery } from "@tanstack/react-query";
++import { useState } from "react";
++import { Plus, Users } from "lucide-react";
++import { Button } from "@/components/ui/button";
++import { Card, CardContent } from "@/components/ui/card";
++import { Switch } from "@/components/ui/switch";
++import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
++import { DataToolbar } from "@/components/app/DataToolbar";
++import { EmptyState } from "@/components/app/EmptyState";
++import { PageHeader } from "@/components/app/PageHeader";
++import { StatusBadge } from "@/components/app/StatusBadge";
++import { useOrg } from "@/lib/org";
++import { usePermissions } from "@/lib/permissions";
++import { customerApi } from "@/lib/customerInvoicing";
++
++export const Route = createFileRoute("/_app/customers/")({ component: CustomersList });
++
++function CustomersList() {
++  const { currentOrgId } = useOrg();
++  const { canEditData } = usePermissions();
++  const navigate = useNavigate();
++  const [search, setSearch] = useState("");
++  const [archived, setArchived] = useState(false);
++  const query = useQuery({
++    queryKey: ["customers", currentOrgId, archived, search],
++    enabled: Boolean(currentOrgId),
++    queryFn: () => customerApi.list(currentOrgId!, archived, search),
++  });
++
++  return (
++    <>
++      <PageHeader
++        title="Customers"
++        description="Customer master records used for sales invoices and accounts receivable."
++        actions={
++          <Button disabled={!canEditData || !currentOrgId} onClick={() => void navigate({ to: "/customers/$customerId", params: { customerId: "new" } })}>
++            <Plus className="mr-2 h-4 w-4" /> Add customer
++          </Button>
++        }
++      />
++      <Card className="card-elevated overflow-hidden">
++        <DataToolbar
++          search={search}
++          onSearchChange={setSearch}
++          placeholder="Search customers..."
++          count={query.data?.length ?? 0}
++          right={
++            <label className="flex items-center gap-2 text-xs text-muted-foreground">
++              <Switch checked={archived} onCheckedChange={setArchived} className="scale-75" />
++              Include archived
++            </label>
++          }
++        />
++        <CardContent className="p-0">
++          {query.isLoading ? <div className="p-8 text-sm text-muted-foreground">Loading customers...</div> :
++          query.error ? <div className="p-8 text-sm text-destructive">{(query.error as Error).message}</div> :
++          !query.data?.length ? <EmptyState icon={Users} title="No customers" description="Add the first customer to create a sales invoice." /> :
++          <Table>
++            <TableHeader><TableRow><TableHead>Customer</TableHead><TableHead>VAT / Registration</TableHead><TableHead>Contact</TableHead><TableHead>Terms</TableHead><TableHead>Status</TableHead></TableRow></TableHeader>
++            <TableBody>
++              {query.data.map((customer) => (
++                <TableRow key={customer.id} className="cursor-pointer hover:bg-muted/50" onClick={() => void navigate({ to: "/customers/$customerId", params: { customerId: customer.id } })}>
++                  <TableCell><div className="font-medium">{customer.legal_name}</div><div className="text-xs text-muted-foreground">{customer.customer_code || customer.trading_name || "-"}</div></TableCell>
++                  <TableCell><div className="text-xs">VAT: {customer.vat_number || "-"}</div><div className="text-xs text-muted-foreground">Reg: {customer.registration_number || "-"}</div></TableCell>
++                  <TableCell><div className="text-sm">{customer.default_email || "-"}</div><div className="text-xs text-muted-foreground">{customer.phone || ""}</div></TableCell>
++                  <TableCell>{customer.payment_terms_days} days · {customer.currency}</TableCell>
++                  <TableCell><StatusBadge status={customer.active ? "active" : "archived"} /></TableCell>
++                </TableRow>
++              ))}
++            </TableBody>
++          </Table>}
++        </CardContent>
++      </Card>
++    </>
++  );
++}
+diff --git a/src/routes/_app.customers.$customerId.tsx b/src/routes/_app.customers.$customerId.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/routes/_app.customers.$customerId.tsx
+@@
++import { createFileRoute, useNavigate } from "@tanstack/react-router";
++import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
++import { useEffect, useState, type ReactNode } from "react";
++import { ArrowLeft, Archive, Loader2, Save } from "lucide-react";
++import { toast } from "sonner";
++import { Button } from "@/components/ui/button";
++import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
++import { Input } from "@/components/ui/input";
++import { Label } from "@/components/ui/label";
++import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
++import { Textarea } from "@/components/ui/textarea";
++import { PageHeader } from "@/components/app/PageHeader";
++import { useOrg } from "@/lib/org";
++import { usePermissions } from "@/lib/permissions";
++import { customerApi, type Customer } from "@/lib/customerInvoicing";
++
++export const Route = createFileRoute("/_app/customers/$customerId")({ component: CustomerEditor });
++
++const empty = (organisationId = ""): Omit<Customer, "id"> => ({
++  organisation_id: organisationId, customer_code: "", legal_name: "", trading_name: "", vat_number: "",
++  registration_number: "", billing_address: "", delivery_address: "", default_email: "", phone: "",
++  payment_terms_days: 30, currency: "ZAR", default_revenue_account_id: null,
++  default_vat_treatment: "standard", default_tracking: {}, active: true, contacts: [],
++});
++
++function CustomerEditor() {
++  const { customerId } = Route.useParams();
++  const isNew = customerId === "new";
++  const { currentOrgId } = useOrg();
++  const { canEditData } = usePermissions();
++  const navigate = useNavigate();
++  const qc = useQueryClient();
++  const [form, setForm] = useState<Omit<Customer, "id">>(empty(currentOrgId ?? ""));
++  const query = useQuery({
++    queryKey: ["customer", currentOrgId, customerId],
++    enabled: Boolean(currentOrgId && !isNew),
++    queryFn: () => customerApi.get(currentOrgId!, customerId),
++  });
++  useEffect(() => {
++    if (query.data) {
++      const { id: _id, ...rest } = query.data;
++      setForm(rest);
++    } else if (isNew && currentOrgId) setForm(empty(currentOrgId));
++  }, [query.data, isNew, currentOrgId]);
++
++  const save = useMutation({
++    mutationFn: () => isNew ? customerApi.create(form) : customerApi.update(customerId, form),
++    onSuccess: async (customer) => {
++      toast.success(isNew ? "Customer created" : "Customer saved");
++      await qc.invalidateQueries({ queryKey: ["customers", currentOrgId] });
++      if (isNew) void navigate({ to: "/customers/$customerId", params: { customerId: customer.id }, replace: true });
++    },
++    onError: (error) => toast.error((error as Error).message),
++  });
++  const archive = useMutation({
++    mutationFn: () => form.active ? customerApi.archive(currentOrgId!, customerId) : customerApi.restore(currentOrgId!, customerId),
++    onSuccess: (customer) => { setForm((old) => ({ ...old, active: customer.active })); toast.success(customer.active ? "Customer restored" : "Customer archived"); },
++    onError: (error) => toast.error((error as Error).message),
++  });
++  const set = <K extends keyof typeof form>(key: K, value: (typeof form)[K]) => setForm((old) => ({ ...old, [key]: value }));
++
++  return (
++    <>
++      <PageHeader
++        title={isNew ? "New Customer" : form.legal_name || "Customer"}
++        actions={<>
++          <Button variant="outline" onClick={() => void navigate({ to: "/customers" })}><ArrowLeft className="mr-2 h-4 w-4" /> Back</Button>
++          {!isNew && <Button variant="outline" disabled={!canEditData || archive.isPending} onClick={() => archive.mutate()}><Archive className="mr-2 h-4 w-4" />{form.active ? "Archive" : "Restore"}</Button>}
++          <Button disabled={!canEditData || save.isPending || !form.legal_name.trim()} onClick={() => save.mutate()}>{save.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />} Save</Button>
++        </>}
++      />
++      <div className="grid gap-4 lg:grid-cols-2">
++        <Card><CardHeader><CardTitle className="text-base">Identity</CardTitle></CardHeader><CardContent className="grid gap-4 sm:grid-cols-2">
++          <Field label="Legal name"><Input value={form.legal_name} onChange={(e) => set("legal_name", e.target.value)} /></Field>
++          <Field label="Trading name"><Input value={form.trading_name ?? ""} onChange={(e) => set("trading_name", e.target.value)} /></Field>
++          <Field label="Customer code"><Input value={form.customer_code ?? ""} onChange={(e) => set("customer_code", e.target.value)} /></Field>
++          <Field label="VAT number"><Input value={form.vat_number ?? ""} onChange={(e) => set("vat_number", e.target.value)} /></Field>
++          <Field label="Registration number"><Input value={form.registration_number ?? ""} onChange={(e) => set("registration_number", e.target.value)} /></Field>
++          <Field label="Currency"><Input maxLength={3} value={form.currency} onChange={(e) => set("currency", e.target.value.toUpperCase())} /></Field>
++        </CardContent></Card>
++        <Card><CardHeader><CardTitle className="text-base">Billing defaults</CardTitle></CardHeader><CardContent className="grid gap-4 sm:grid-cols-2">
++          <Field label="Invoice email"><Input type="email" value={form.default_email ?? ""} onChange={(e) => set("default_email", e.target.value)} /></Field>
++          <Field label="Phone"><Input value={form.phone ?? ""} onChange={(e) => set("phone", e.target.value)} /></Field>
++          <Field label="Payment terms days"><Input type="number" min={0} value={form.payment_terms_days} onChange={(e) => set("payment_terms_days", Number(e.target.value || 0))} /></Field>
++          <Field label="Default VAT treatment"><Select value={form.default_vat_treatment} onValueChange={(v) => set("default_vat_treatment", v as typeof form.default_vat_treatment)}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="standard">Standard 15%</SelectItem><SelectItem value="zero_rated">Zero rated</SelectItem><SelectItem value="exempt">Exempt</SelectItem></SelectContent></Select></Field>
++        </CardContent></Card>
++        <Card><CardHeader><CardTitle className="text-base">Billing address</CardTitle></CardHeader><CardContent><Textarea rows={7} value={form.billing_address ?? ""} onChange={(e) => set("billing_address", e.target.value)} /></CardContent></Card>
++        <Card><CardHeader><CardTitle className="text-base">Delivery address</CardTitle></CardHeader><CardContent><Textarea rows={7} value={form.delivery_address ?? ""} onChange={(e) => set("delivery_address", e.target.value)} /></CardContent></Card>
++      </div>
++    </>
++  );
++}
++
++function Field({ label, children }: { label: string; children: ReactNode }) {
++  return <div className="space-y-1.5"><Label>{label}</Label>{children}</div>;
++}
+diff --git a/src/routes/_app.sales-invoices.tsx b/src/routes/_app.sales-invoices.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/routes/_app.sales-invoices.tsx
+@@
++import { createFileRoute, Outlet } from "@tanstack/react-router";
++
++export const Route = createFileRoute("/_app/sales-invoices")({ component: () => <Outlet /> });
+diff --git a/src/routes/_app.sales-invoices.index.tsx b/src/routes/_app.sales-invoices.index.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/routes/_app.sales-invoices.index.tsx
+@@
++import { createFileRoute, useNavigate } from "@tanstack/react-router";
++import { useQuery } from "@tanstack/react-query";
++import { useState } from "react";
++import { FileText, Plus } from "lucide-react";
++import { Button } from "@/components/ui/button";
++import { Card, CardContent } from "@/components/ui/card";
++import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
++import { DataToolbar } from "@/components/app/DataToolbar";
++import { EmptyState } from "@/components/app/EmptyState";
++import { PageHeader } from "@/components/app/PageHeader";
++import { StatusBadge } from "@/components/app/StatusBadge";
++import { useOrg } from "@/lib/org";
++import { usePermissions } from "@/lib/permissions";
++import { salesInvoiceApi } from "@/lib/customerInvoicing";
++
++export const Route = createFileRoute("/_app/sales-invoices/")({ component: SalesInvoiceList });
++
++function SalesInvoiceList() {
++  const { currentOrgId } = useOrg();
++  const { canEditData } = usePermissions();
++  const navigate = useNavigate();
++  const [search, setSearch] = useState("");
++  const query = useQuery({
++    queryKey: ["sales-invoices", currentOrgId, search],
++    enabled: Boolean(currentOrgId),
++    queryFn: () => salesInvoiceApi.list(currentOrgId!, search),
++  });
++  const money = (value: number, currency: string) => new Intl.NumberFormat("en-ZA", { style: "currency", currency }).format(value || 0);
++  return (
++    <>
++      <PageHeader title="Sales Invoices / Receipts" description="Customer billing, accounts receivable, credit notes, and receipt status." actions={<Button disabled={!canEditData || !currentOrgId} onClick={() => void navigate({ to: "/sales-invoices/new" })}><Plus className="mr-2 h-4 w-4" /> New invoice</Button>} />
++      <Card className="card-elevated overflow-hidden">
++        <DataToolbar search={search} onSearchChange={setSearch} placeholder="Search invoice, customer, reference..." count={query.data?.length ?? 0} />
++        <CardContent className="p-0">
++          {query.isLoading ? <div className="p-8 text-sm text-muted-foreground">Loading sales invoices...</div> :
++          query.error ? <div className="p-8 text-sm text-destructive">{(query.error as Error).message}</div> :
++          !query.data?.length ? <EmptyState icon={FileText} title="No sales invoices" description="Create a draft invoice or rebill supplier costs to a customer." /> :
++          <Table><TableHeader><TableRow><TableHead>Number</TableHead><TableHead>Customer</TableHead><TableHead>Issue / Due</TableHead><TableHead>Total</TableHead><TableHead>Workflow</TableHead><TableHead>Payment</TableHead></TableRow></TableHeader>
++          <TableBody>{query.data.map((invoice) => <TableRow key={invoice.id} className="cursor-pointer hover:bg-muted/50" onClick={() => void navigate({ to: "/sales-invoices/$invoiceId", params: { invoiceId: invoice.id } })}>
++            <TableCell className="font-mono text-xs">{invoice.invoice_number || "Draft"}</TableCell>
++            <TableCell><div className="font-medium">{invoice.customers?.legal_name || "Customer"}</div><div className="text-xs text-muted-foreground">{invoice.customer_reference || invoice.purchase_order_number || "-"}</div></TableCell>
++            <TableCell><div>{invoice.issue_date || "-"}</div><div className="text-xs text-muted-foreground">Due {invoice.due_date || "-"}</div></TableCell>
++            <TableCell className="font-medium">{money(invoice.total_amount, invoice.currency)}</TableCell>
++            <TableCell><StatusBadge status={invoice.status.replace("_", " ")} /></TableCell>
++            <TableCell><StatusBadge status={invoice.payment_status} /></TableCell>
++          </TableRow>)}</TableBody></Table>}
++        </CardContent>
++      </Card>
++    </>
++  );
++}
+diff --git a/src/routes/_app.sales-invoices.new.tsx b/src/routes/_app.sales-invoices.new.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/routes/_app.sales-invoices.new.tsx
+@@
++import { createFileRoute, useNavigate } from "@tanstack/react-router";
++import { useMutation, useQuery } from "@tanstack/react-query";
++import { useMemo, useState, type ReactNode } from "react";
++import { ArrowLeft, Loader2, Plus, Save, Trash2 } from "lucide-react";
++import { toast } from "sonner";
++import { supabase } from "@/integrations/supabase/client";
++import { Button } from "@/components/ui/button";
++import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
++import { Input } from "@/components/ui/input";
++import { Label } from "@/components/ui/label";
++import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
++import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
++import { Textarea } from "@/components/ui/textarea";
++import { PageHeader } from "@/components/app/PageHeader";
++import { useOrg } from "@/lib/org";
++import { customerApi, salesInvoiceApi, type SalesInvoiceLine } from "@/lib/customerInvoicing";
++
++export const Route = createFileRoute("/_app/sales-invoices/new")({ component: SalesInvoiceComposer });
++
++const blankLine = (sortOrder: number): SalesInvoiceLine => ({
++  description: "", quantity: 1, unit_price: 0, prices_include_vat: false, discount_percent: 0,
++  discount_amount: 0, vat_treatment: "standard", vat_rate: 15, revenue_account_id: "", tracking: {}, sort_order: sortOrder,
++});
++
++function calculate(line: SalesInvoiceLine) {
++  const extended = Number(line.quantity || 0) * Number(line.unit_price || 0);
++  const discount = line.discount_amount > 0 ? line.discount_amount : extended * Number(line.discount_percent || 0) / 100;
++  const discounted = Math.max(extended - Math.min(discount, extended), 0);
++  const rate = line.vat_treatment === "standard" ? Number(line.vat_rate || 0) : 0;
++  const gross = line.prices_include_vat && rate ? discounted : discounted * (1 + rate / 100);
++  const net = line.prices_include_vat && rate ? gross / (1 + rate / 100) : discounted;
++  return { net: Math.round(net * 100) / 100, tax: Math.round((gross - net) * 100) / 100, gross: Math.round(gross * 100) / 100 };
++}
++
++function SalesInvoiceComposer() {
++  const { currentOrgId, currentOrg } = useOrg();
++  const navigate = useNavigate();
++  const [customerId, setCustomerId] = useState("");
++  const [reference, setReference] = useState("");
++  const [po, setPo] = useState("");
++  const [notes, setNotes] = useState("");
++  const [lines, setLines] = useState<SalesInvoiceLine[]>([blankLine(0)]);
++  const [sourceLineIds, setSourceLineIds] = useState("");
++  const [markup, setMarkup] = useState("0");
++  const [rebillRevenue, setRebillRevenue] = useState("");
++  const customers = useQuery({ queryKey: ["customers", currentOrgId], enabled: Boolean(currentOrgId), queryFn: () => customerApi.list(currentOrgId!) });
++  const accounts = useQuery({
++    queryKey: ["income-accounts", currentOrgId],
++    enabled: Boolean(currentOrgId),
++    queryFn: async () => {
++      const { data, error } = await supabase.from("accounts").select("id, code, name").eq("organisation_id", currentOrgId!).eq("type", "income").eq("active", true).order("code");
++      if (error) throw error;
++      return data ?? [];
++    },
++  });
++  const totals = useMemo(() => lines.map(calculate).reduce((sum, line) => ({ net: sum.net + line.net, tax: sum.tax + line.tax, gross: sum.gross + line.gross }), { net: 0, tax: 0, gross: 0 }), [lines]);
++  const setLine = (index: number, patch: Partial<SalesInvoiceLine>) => setLines((current) => current.map((line, i) => i === index ? { ...line, ...patch } : line));
++  const save = useMutation({
++    mutationFn: async () => {
++      if (!currentOrgId || !customerId) throw new Error("Select a customer");
++      const validLines = lines.filter((line) => line.description.trim() && line.revenue_account_id);
++      const created = await salesInvoiceApi.create({
++        organisation_id: currentOrgId, customer_id: customerId,
++        currency: String(currentOrg?.base_currency || "ZAR"), customer_reference: reference || null,
++        purchase_order_number: po || null, notes: notes || null, lines: validLines,
++      });
++      const ids = sourceLineIds.split(",").map((value) => value.trim()).filter(Boolean);
++      if (ids.length) {
++        if (!rebillRevenue) throw new Error("Select a revenue account for rebilled costs");
++        await salesInvoiceApi.rebill(created.id, {
++          organisation_id: currentOrgId, source_invoice_line_ids: ids,
++          revenue_account_id: rebillRevenue, markup_percent: Number(markup || 0),
++        });
++      }
++      return created;
++    },
++    onSuccess: (invoice) => { toast.success("Sales invoice draft created"); void navigate({ to: "/sales-invoices/$invoiceId", params: { invoiceId: invoice.id } }); },
++    onError: (error) => toast.error((error as Error).message),
++  });
++  const currency = String(currentOrg?.base_currency || "ZAR");
++  const format = (value: number) => new Intl.NumberFormat("en-ZA", { style: "currency", currency }).format(value || 0);
++
++  return (
++    <>
++      <PageHeader title="New Sales Invoice" actions={<><Button variant="outline" onClick={() => void navigate({ to: "/sales-invoices" })}><ArrowLeft className="mr-2 h-4 w-4" /> Back</Button><Button disabled={save.isPending || !customerId} onClick={() => save.mutate()}>{save.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />} Save draft</Button></>} />
++      <div className="space-y-4">
++        <Card><CardContent className="grid gap-4 p-5 md:grid-cols-3">
++          <Field label="Customer"><Select value={customerId} onValueChange={setCustomerId}><SelectTrigger><SelectValue placeholder="Select customer" /></SelectTrigger><SelectContent>{customers.data?.map((customer) => <SelectItem key={customer.id} value={customer.id}>{customer.legal_name}</SelectItem>)}</SelectContent></Select></Field>
++          <Field label="Customer reference"><Input value={reference} onChange={(e) => setReference(e.target.value)} /></Field>
++          <Field label="Purchase order"><Input value={po} onChange={(e) => setPo(e.target.value)} /></Field>
++          <div className="md:col-span-3"><Field label="Notes"><Textarea rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} /></Field></div>
++        </CardContent></Card>
++        <Card><CardHeader className="flex-row items-center justify-between"><CardTitle className="text-base">Invoice lines</CardTitle><Button size="sm" variant="outline" onClick={() => setLines((current) => [...current, blankLine(current.length)])}><Plus className="mr-2 h-4 w-4" /> Add line</Button></CardHeader>
++          <CardContent className="p-0"><Table><TableHeader><TableRow><TableHead>Description</TableHead><TableHead className="w-24">Qty</TableHead><TableHead className="w-32">Unit price</TableHead><TableHead className="w-36">VAT</TableHead><TableHead className="w-56">Revenue account</TableHead><TableHead className="w-28 text-right">Gross</TableHead><TableHead className="w-12" /></TableRow></TableHeader>
++          <TableBody>{lines.map((line, index) => { const amount = calculate(line); return <TableRow key={index}>
++            <TableCell><Input value={line.description} onChange={(e) => setLine(index, { description: e.target.value })} /></TableCell>
++            <TableCell><Input type="number" min="0.0001" step="0.01" value={line.quantity} onChange={(e) => setLine(index, { quantity: Number(e.target.value) })} /></TableCell>
++            <TableCell><Input type="number" min="0" step="0.01" value={line.unit_price} onChange={(e) => setLine(index, { unit_price: Number(e.target.value) })} /></TableCell>
++            <TableCell><Select value={line.vat_treatment} onValueChange={(value) => setLine(index, { vat_treatment: value as SalesInvoiceLine["vat_treatment"], vat_rate: value === "standard" ? 15 : 0 })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="standard">15% standard</SelectItem><SelectItem value="zero_rated">0% zero</SelectItem><SelectItem value="exempt">Exempt</SelectItem></SelectContent></Select></TableCell>
++            <TableCell><Select value={line.revenue_account_id || undefined} onValueChange={(value) => setLine(index, { revenue_account_id: value })}><SelectTrigger><SelectValue placeholder="Income account" /></SelectTrigger><SelectContent>{accounts.data?.map((account) => <SelectItem key={account.id} value={account.id}>{account.code ? `[${account.code}] ` : ""}{account.name}</SelectItem>)}</SelectContent></Select></TableCell>
++            <TableCell className="text-right font-medium">{format(amount.gross)}</TableCell>
++            <TableCell><Button size="icon" variant="ghost" disabled={lines.length === 1} onClick={() => setLines((current) => current.filter((_, i) => i !== index))}><Trash2 className="h-4 w-4" /></Button></TableCell>
++          </TableRow>; })}</TableBody></Table>
++          <div className="ml-auto w-72 space-y-2 border-t p-5 text-sm"><Total label="Subtotal" value={format(totals.net)} /><Total label="VAT" value={format(totals.tax)} /><Total label="Total" value={format(totals.gross)} strong /></div>
++          </CardContent>
++        </Card>
++        <Card><CardHeader><CardTitle className="text-base">Optional supplier-cost rebilling</CardTitle></CardHeader><CardContent className="grid gap-4 md:grid-cols-3">
++          <Field label="Supplier line IDs (comma separated)"><Input value={sourceLineIds} onChange={(e) => setSourceLineIds(e.target.value)} placeholder="UUID, UUID" /></Field>
++          <Field label="Markup %"><Input type="number" step="0.01" value={markup} onChange={(e) => setMarkup(e.target.value)} /></Field>
++          <Field label="Revenue account"><Select value={rebillRevenue || undefined} onValueChange={setRebillRevenue}><SelectTrigger><SelectValue placeholder="Income account" /></SelectTrigger><SelectContent>{accounts.data?.map((account) => <SelectItem key={account.id} value={account.id}>{account.code ? `[${account.code}] ` : ""}{account.name}</SelectItem>)}</SelectContent></Select></Field>
++        </CardContent></Card>
++      </div>
++    </>
++  );
++}
++
++function Field({ label, children }: { label: string; children: ReactNode }) { return <div className="space-y-1.5"><Label>{label}</Label>{children}</div>; }
++function Total({ label, value, strong = false }: { label: string; value: string; strong?: boolean }) { return <div className={`flex justify-between ${strong ? "border-t pt-2 text-base font-semibold" : ""}`}><span>{label}</span><span>{value}</span></div>; }
+diff --git a/src/routes/_app.sales-invoices.$invoiceId.tsx b/src/routes/_app.sales-invoices.$invoiceId.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/routes/_app.sales-invoices.$invoiceId.tsx
+@@
++import { createFileRoute, useNavigate } from "@tanstack/react-router";
++import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
++import { useState, type ReactNode } from "react";
++import { ArrowLeft, Check, Download, FileCheck2, Loader2, Mail, Receipt, Send } from "lucide-react";
++import { toast } from "sonner";
++import { Button } from "@/components/ui/button";
++import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
++import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
++import { Input } from "@/components/ui/input";
++import { Label } from "@/components/ui/label";
++import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
++import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
++import { Textarea } from "@/components/ui/textarea";
++import { PageHeader } from "@/components/app/PageHeader";
++import { StatusBadge } from "@/components/app/StatusBadge";
++import { useOrg } from "@/lib/org";
++import { usePermissions } from "@/lib/permissions";
++import { customerReceiptApi, salesInvoiceApi } from "@/lib/customerInvoicing";
++import { bankApi, type BankRow } from "@/lib/bank";
++
++export const Route = createFileRoute("/_app/sales-invoices/$invoiceId")({ component: SalesInvoiceDetail });
++
++function SalesInvoiceDetail() {
++  const { invoiceId } = Route.useParams();
++  const { currentOrgId } = useOrg();
++  const { canEditData, canApprove, canReview } = usePermissions();
++  const navigate = useNavigate();
++  const qc = useQueryClient();
++  const [sendOpen, setSendOpen] = useState(false);
++  const [email, setEmail] = useState("");
++  const [creditOpen, setCreditOpen] = useState(false);
++  const [creditReason, setCreditReason] = useState("");
++  const [receiptOpen, setReceiptOpen] = useState(false);
++  const [receiptAmount, setReceiptAmount] = useState("");
++  const [bankAccountId, setBankAccountId] = useState("");
++  const query = useQuery({ queryKey: ["sales-invoice", currentOrgId, invoiceId], enabled: Boolean(currentOrgId), queryFn: () => salesInvoiceApi.get(currentOrgId!, invoiceId) });
++  const banks = useQuery({ queryKey: ["bank_accounts", currentOrgId], enabled: Boolean(currentOrgId && receiptOpen), queryFn: async () => (await bankApi<{ accounts: BankRow[] }>(`/api/bank/accounts?organisation_id=${currentOrgId}`)).accounts ?? [] });
++  const refresh = async () => { await qc.invalidateQueries({ queryKey: ["sales-invoice", currentOrgId, invoiceId] }); await qc.invalidateQueries({ queryKey: ["sales-invoices", currentOrgId] }); };
++  const action = useMutation({
++    mutationFn: async (kind: "submit" | "approve" | "issue") => {
++      if (!currentOrgId) throw new Error("Select an organisation");
++      if (kind === "submit") return salesInvoiceApi.submit(invoiceId, currentOrgId);
++      if (kind === "approve") return salesInvoiceApi.approve(invoiceId, currentOrgId);
++      return salesInvoiceApi.issue(invoiceId, currentOrgId);
++    },
++    onSuccess: async (_data, kind) => { toast.success(kind === "issue" ? "Invoice issued and posted" : kind === "approve" ? "Approval recorded" : "Invoice submitted"); await refresh(); },
++    onError: (error) => toast.error((error as Error).message),
++  });
++  const send = useMutation({ mutationFn: () => salesInvoiceApi.send(invoiceId, currentOrgId!, email), onSuccess: async () => { toast.success("Invoice email sent"); setSendOpen(false); await refresh(); }, onError: (e) => toast.error((e as Error).message) });
++  const credit = useMutation({ mutationFn: () => salesInvoiceApi.credit(invoiceId, currentOrgId!, creditReason), onSuccess: (created) => { toast.success("Credit note draft created"); setCreditOpen(false); void navigate({ to: "/sales-invoices/$invoiceId", params: { invoiceId: created.id } }); }, onError: (e) => toast.error((e as Error).message) });
++  const receipt = useMutation({
++    mutationFn: () => customerReceiptApi.create({
++      organisation_id: currentOrgId, customer_id: query.data!.customer_id, bank_account_id: bankAccountId,
++      receipt_date: new Date().toISOString().slice(0, 10), amount: Number(receiptAmount), currency: query.data!.currency,
++      reference: query.data!.invoice_number, allocations: [{ sales_invoice_id: invoiceId, amount: Number(receiptAmount) }],
++      idempotency_key: `manual-${invoiceId}-${Date.now()}`,
++    }),
++    onSuccess: async () => { toast.success("Customer receipt posted"); setReceiptOpen(false); await refresh(); },
++    onError: (e) => toast.error((e as Error).message),
++  });
++  if (query.isLoading || !query.data) return <div className="p-8 text-sm text-muted-foreground">Loading sales invoice...</div>;
++  const invoice = query.data;
++  const money = (value: number) => new Intl.NumberFormat("en-ZA", { style: "currency", currency: invoice.currency }).format(value || 0);
++  const openPdf = async () => { try { const blob = await salesInvoiceApi.pdf(invoiceId, currentOrgId!); window.open(URL.createObjectURL(blob), "_blank", "noopener,noreferrer"); } catch (e) { toast.error((e as Error).message); } };
++
++  return (
++    <>
++      <PageHeader title={invoice.invoice_number || (invoice.document_type === "credit_note" ? "Credit note draft" : "Sales invoice draft")} description={invoice.customer?.legal_name} actions={<>
++        <Button variant="outline" onClick={() => void navigate({ to: "/sales-invoices" })}><ArrowLeft className="mr-2 h-4 w-4" /> Back</Button>
++        {invoice.status === "draft" && <Button disabled={!canEditData || action.isPending} onClick={() => action.mutate("submit")}><Send className="mr-2 h-4 w-4" /> Submit</Button>}
++        {invoice.status === "pending_approval" && <Button disabled={!(canApprove || canReview) || action.isPending} onClick={() => action.mutate("approve")}><Check className="mr-2 h-4 w-4" /> Approve</Button>}
++        {(invoice.status === "approved" || invoice.status === "draft") && <Button disabled={!canEditData || action.isPending} onClick={() => action.mutate("issue")}>{action.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <FileCheck2 className="mr-2 h-4 w-4" />} Issue</Button>}
++        {invoice.status === "issued" && <><Button variant="outline" onClick={() => void openPdf()}><Download className="mr-2 h-4 w-4" /> PDF</Button><Button variant="outline" onClick={() => { setEmail(invoice.customer?.default_email || ""); setSendOpen(true); }}><Mail className="mr-2 h-4 w-4" /> Email</Button></>}
++      </>} />
++      <div className="grid gap-4 xl:grid-cols-[1fr_340px]">
++        <Card><CardHeader><CardTitle className="text-base">Line items</CardTitle></CardHeader><CardContent className="p-0">
++          <Table><TableHeader><TableRow><TableHead>Description</TableHead><TableHead>Qty</TableHead><TableHead className="text-right">Net</TableHead><TableHead className="text-right">VAT</TableHead><TableHead className="text-right">Gross</TableHead></TableRow></TableHeader>
++          <TableBody>{invoice.lines?.map((line) => <TableRow key={line.id}><TableCell><div>{line.description}</div>{line.source_invoice_line_id && <div className="text-xs text-muted-foreground">Rebilled cost · markup {line.markup_percent || 0}%</div>}</TableCell><TableCell>{line.quantity}</TableCell><TableCell className="text-right">{money(line.net_amount || 0)}</TableCell><TableCell className="text-right">{money(line.tax_amount || 0)}</TableCell><TableCell className="text-right font-medium">{money(line.gross_amount || 0)}</TableCell></TableRow>)}</TableBody></Table>
++        </CardContent></Card>
++        <div className="space-y-4">
++          <Card><CardHeader><CardTitle className="text-base">Status</CardTitle></CardHeader><CardContent className="space-y-3"><div className="flex justify-between"><span>Workflow</span><StatusBadge status={invoice.status.replace("_", " ")} /></div><div className="flex justify-between"><span>Payment</span><StatusBadge status={invoice.payment_status} /></div><Meta label="Issue date" value={invoice.issue_date || "-"} /><Meta label="Due date" value={invoice.due_date || "-"} /><Meta label="Reference" value={invoice.customer_reference || "-"} /></CardContent></Card>
++          <Card><CardHeader><CardTitle className="text-base">Totals</CardTitle></CardHeader><CardContent className="space-y-2"><Meta label="Subtotal" value={money(invoice.subtotal)} /><Meta label="VAT" value={money(invoice.tax_total)} /><Meta label="Total" value={money(invoice.total_amount)} strong /><Meta label="Paid" value={money(invoice.amount_paid)} /><Meta label="Credited" value={money(invoice.amount_credited)} /><Meta label="Outstanding" value={money(invoice.amount_outstanding)} strong /></CardContent></Card>
++          {invoice.status === "issued" && invoice.document_type === "invoice" && <Card><CardHeader><CardTitle className="text-base">Accounts receivable</CardTitle></CardHeader><CardContent className="space-y-2"><Button className="w-full" variant="outline" disabled={invoice.amount_outstanding <= 0} onClick={() => { setReceiptAmount(String(invoice.amount_outstanding)); setReceiptOpen(true); }}><Receipt className="mr-2 h-4 w-4" /> Allocate receipt</Button><Button className="w-full" variant="outline" onClick={() => setCreditOpen(true)}>Create credit note</Button></CardContent></Card>}
++          <Card><CardHeader><CardTitle className="text-base">Delivery history</CardTitle></CardHeader><CardContent className="space-y-2 text-xs">{invoice.delivery_events?.length ? invoice.delivery_events.map((event, index) => <div key={index} className="flex justify-between border-b pb-2"><span className="capitalize">{String(event.event_type)}</span><span className="text-muted-foreground">{String(event.created_at || "")}</span></div>) : <div className="text-muted-foreground">Not sent yet.</div>}</CardContent></Card>
++        </div>
++      </div>
++      <Dialog open={sendOpen} onOpenChange={setSendOpen}><DialogContent><DialogHeader><DialogTitle>Email invoice</DialogTitle></DialogHeader><Field label="Recipient"><Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></Field><DialogFooter><Button disabled={!email || send.isPending} onClick={() => send.mutate()}>{send.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />} Send</Button></DialogFooter></DialogContent></Dialog>
++      <Dialog open={creditOpen} onOpenChange={setCreditOpen}><DialogContent><DialogHeader><DialogTitle>Create full credit note</DialogTitle></DialogHeader><Field label="Reason"><Textarea rows={4} value={creditReason} onChange={(e) => setCreditReason(e.target.value)} /></Field><DialogFooter><Button disabled={!creditReason.trim() || credit.isPending} onClick={() => credit.mutate()}>Create draft</Button></DialogFooter></DialogContent></Dialog>
++      <Dialog open={receiptOpen} onOpenChange={setReceiptOpen}><DialogContent><DialogHeader><DialogTitle>Allocate customer receipt</DialogTitle></DialogHeader><div className="space-y-4"><Field label="Bank account"><Select value={bankAccountId} onValueChange={setBankAccountId}><SelectTrigger><SelectValue placeholder="Select bank account" /></SelectTrigger><SelectContent>{banks.data?.map((bank) => <SelectItem key={bank.id} value={bank.id}>{String(bank.name || "Bank")}</SelectItem>)}</SelectContent></Select></Field><Field label="Amount"><Input type="number" min="0.01" max={invoice.amount_outstanding} step="0.01" value={receiptAmount} onChange={(e) => setReceiptAmount(e.target.value)} /></Field></div><DialogFooter><Button disabled={!bankAccountId || Number(receiptAmount) <= 0 || receipt.isPending} onClick={() => receipt.mutate()}>Post receipt</Button></DialogFooter></DialogContent></Dialog>
++    </>
++  );
++}
++
++function Meta({ label, value, strong = false }: { label: string; value: string; strong?: boolean }) { return <div className={`flex justify-between gap-3 ${strong ? "border-t pt-2 font-semibold" : "text-sm"}`}><span className="text-muted-foreground">{label}</span><span className="text-right">{value}</span></div>; }
++function Field({ label, children }: { label: string; children: ReactNode }) { return <div className="space-y-1.5"><Label>{label}</Label>{children}</div>; }

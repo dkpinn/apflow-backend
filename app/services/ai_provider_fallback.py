@@ -30,6 +30,7 @@ DEFAULT_MODELS = {
     "gemini": "gemini-2.5-flash",
     "openai": "gpt-4.1-mini",
     "anthropic": "claude-3-5-sonnet-latest",
+    "openrouter": "google/gemini-2.5-flash",
 }
 
 
@@ -100,6 +101,14 @@ def _openai_output_text(payload: dict) -> str:
             if content.get("type") in {"output_text", "text"} and content.get("text"):
                 parts.append(str(content["text"]))
     return "\n".join(parts)
+
+
+def _openai_chat_output_text(payload: dict) -> str:
+    """Parse a standard OpenAI/OpenRouter chat completions response."""
+    try:
+        return payload["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError):
+        return ""
 
 
 def _anthropic_output_text(payload: dict) -> str:
@@ -249,6 +258,58 @@ def _run_anthropic_provider(
         }
 
 
+def _run_openrouter_provider(
+    *,
+    integration: dict,
+    api_key: str,
+    file_bytes: bytes,
+    mime_type: Optional[str],
+    prompt: Optional[str],
+) -> dict:
+    effective_mime = (mime_type or "application/pdf").lower()
+    page_parts = preprocess_for_vlm(file_bytes, effective_mime)
+    schema = vlm_invoice_json_schema()
+    text_prompt = (
+        f"{prompt or DEFAULT_EXTRACTION_PROMPT}\n\n"
+        "Return only JSON matching this schema. No markdown.\n"
+        f"Schema: {json.dumps(schema)}"
+    ).strip()
+    content: list[dict] = [{"type": "text", "text": text_prompt}]
+    for part_bytes, part_mime in page_parts:
+        encoded = base64.b64encode(part_bytes).decode("ascii")
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{part_mime};base64,{encoded}"},
+        })
+    base_url = (integration.get("base_url") or "https://openrouter.ai/api/v1").rstrip("/")
+    timeout = int((integration.get("config") or {}).get("timeout_seconds") or 60)
+    response = httpx.post(
+        f"{base_url}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": integration.get("model") or DEFAULT_MODELS["openrouter"],
+            "messages": [{"role": "user", "content": content}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0,
+        },
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    try:
+        return {
+            "data": _normalise_provider_json(_openai_chat_output_text(response.json())),
+            "reason": None,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "data": None,
+            "reason": "invalid_schema",
+            "error_type": exc.__class__.__name__,
+            "error": str(exc)[:1000],
+        }
+
+
 def _provider_not_implemented(**_kwargs) -> dict:
     return {
         "data": None,
@@ -261,7 +322,8 @@ PROVIDER_RUNNERS: dict[str, Callable[..., dict]] = {
     "gemini": _run_gemini_provider,
     "openai": _run_openai_provider,
     "anthropic": _run_anthropic_provider,
-    "openai_compatible": _provider_not_implemented,
+    "openrouter": _run_openrouter_provider,
+    "openai_compatible": _run_openrouter_provider,
 }
 
 
@@ -327,7 +389,26 @@ def extract_with_vlm_fallback(
         return env_result
 
     if not integrations:
-        return _env_gemini_fallback(file_bytes, mime_type)
+        env_result = _env_gemini_fallback(file_bytes, mime_type)
+        if env_result.get("data") is not None:
+            return env_result
+        or_key = os.getenv("OPENROUTER_API_KEY")
+        if or_key:
+            or_model = os.getenv("OPENROUTER_VLM_MODEL") or DEFAULT_MODELS["openrouter"]
+            try:
+                or_result = _run_openrouter_provider(
+                    integration={"model": or_model},
+                    api_key=or_key,
+                    file_bytes=file_bytes,
+                    mime_type=mime_type,
+                    prompt=None,
+                )
+                if or_result.get("data") is not None:
+                    or_result.update({"provider": "openrouter", "model": or_model, "source": "env"})
+                    return or_result
+            except Exception as exc:
+                env_result["openrouter_error"] = str(exc)[:500]
+        return env_result
 
     prompt = _criteria_prompt(db, task)
     attempts: list[dict] = []
