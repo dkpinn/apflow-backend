@@ -25,11 +25,48 @@ except Exception:  # pragma: no cover - optional at runtime
     fitz = None  # type: ignore
 
 
-DATE_ANCHOR_RE = re.compile(r"^(?P<date>\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})\b")
+DATE_ANCHOR_RE = re.compile(
+    r"^(?P<date>"
+    r"\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?"
+    r"|\d{4}-\d{2}-\d{2}"
+    r"|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+    r"|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}"
+    r")\b",
+    re.IGNORECASE,
+)
 MONEY_TOKEN_RE = re.compile(r"(?:[A-Z]{3}\s*)?-?\(?[A-Z$R]?\s?\d[\d\s,]*[.,]\d{2}\)?")
+
+# Strict amount pattern (no spaces within numbers) used when searching for the
+# debit/credit amount that precedes a date in description-first statement layouts.
+_AMOUNT_RE = re.compile(r"(?:[A-Z]{3}\s*)?-?\(?[A-Z$R]?\s?\d[\d,]*[.,]\d{2}\)?")
+
+# Matches [date] [balance] anchored at the end of a line.
+# Balance uses the strict no-space pattern to avoid greedily absorbing a date
+# fragment (e.g. "01" from "28/01") into the balance token.
+# Used to detect description-first layouts: [description] [amount] [date] [balance].
+_TAIL_RE = re.compile(
+    r"\b(?P<date>"
+    r"\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?"
+    r"|\d{4}-\d{2}-\d{2}"
+    r"|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+    r"|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}"
+    r")\b"
+    r"\s+"
+    r"(?P<balance>(?:[A-Z]{3}\s*)?-?\(?[A-Z$R]?\s?\d[\d,]*[.,]\d{2}\)?)"
+    r"\s*$",
+    re.IGNORECASE,
+)
 
 
 PAGE_BREAK_MARKER = "__PAGE_BREAK__"
+
+_YEAR_RE = re.compile(r"\b(20\d{2})\b")
+
+
+def _infer_statement_year(text: str) -> Optional[int]:
+    for match in _YEAR_RE.finditer(text[:2000]):
+        return int(match.group(1))
+    return None
 
 
 def extract_pdf_text(file_bytes: bytes) -> str:
@@ -57,21 +94,46 @@ def parse_transaction_blocks(text: str) -> list[dict[str, Any]]:
         date_match = DATE_ANCHOR_RE.match(line)
         money_matches = list(MONEY_TOKEN_RE.finditer(line))
         starts_transaction = bool(date_match and len(money_matches) >= 2)
+
+        # Secondary: description-first layout — date+balance anchored at end of line.
+        # [description] [amount] [date DD/MM or DD Mon] [balance]
+        # Uses _TAIL_RE (strict no-space balance) to avoid MONEY_TOKEN_RE's greedy
+        # [\d\s,]* consuming a date fragment like "01" from "28/01" into the token.
+        tail_match = None
+        embedded_amount_match = None
+        if not starts_transaction:
+            tail_match = _TAIL_RE.search(line)
+            if tail_match:
+                for m in _AMOUNT_RE.finditer(line[:tail_match.start("date")]):
+                    embedded_amount_match = m  # keep last match before the date
+                if embedded_amount_match:
+                    starts_transaction = True
+
         if starts_transaction:
             if current:
                 blocks.append(current)
-            assert date_match is not None
-            amount_match = money_matches[-2]
-            balance_match = money_matches[-1]
-            prefix = re.sub(r"\s+\*\s*$", "", normalize_text(line[date_match.end():amount_match.start()]))
+            if date_match:
+                # Date-at-start: [date] [description] [amount] [balance]
+                amount_match = money_matches[-2]
+                balance_match = money_matches[-1]
+                detected_date = date_match.group("date")
+                prefix = re.sub(r"\s+\*\s*$", "", normalize_text(line[date_match.end():amount_match.start()]))
+                block_amount = money(amount_match.group(0))
+                block_balance = money(balance_match.group(0))
+            else:
+                # Date-between-amounts: [description] [amount] [date] [balance]
+                detected_date = tail_match.group("date")  # type: ignore[union-attr]
+                prefix = re.sub(r"\s+\*\s*$", "", normalize_text(line[:embedded_amount_match.start()]))  # type: ignore[union-attr]
+                block_amount = money(embedded_amount_match.group(0))  # type: ignore[union-attr]
+                block_balance = money(tail_match.group("balance"))  # type: ignore[union-attr]
             transaction_type, reference = split_transaction_type_and_reference(prefix)
             current = {
-                "date": date_match.group("date"),
+                "date": detected_date,
                 "prefix": prefix,
                 "transaction_type": transaction_type or prefix,
                 "reference": reference,
-                "amount": money(amount_match.group(0)),
-                "balance": money(balance_match.group(0)),
+                "amount": block_amount,
+                "balance": block_balance,
                 "raw_lines": [line],
                 "continuation_lines": [],
                 "page": current_page,
@@ -86,8 +148,11 @@ def parse_transaction_blocks(text: str) -> list[dict[str, Any]]:
 
 
 _HEADER_ANCHOR_LABELS = ("date", "transaction", "charge", "debit", "credit", "balance")
+_COLUMNAR_OUTPUT_LABELS = ("transaction", "charge", "debit", "credit", "date", "balance")
+_STANDARD_BANK_COMPACT_DATE_RE = re.compile(r"^(?P<month>\d{1,2})\s+(?P<day>\d{1,2})$")
 _FOOTER_TEXT_RE = re.compile(
-    r"^(our privacy|page \d|absa bank limited|authorised financial|registration number|vat registration|csp\d)",
+    r"^(our privacy|page \d|absa bank limited|authorised financial|registration number|vat registration|csp\d"
+    r"|vat summary|total charge|total vat|##- these fees|these fees include)",
     re.IGNORECASE,
 )
 
@@ -102,7 +167,7 @@ def extract_pdf_words_by_page(file_bytes: bytes) -> list[list[tuple[Any, ...]]]:
         return []
 
 
-def _detect_columnar_header(words: list[tuple[Any, ...]]) -> Optional[tuple[dict[str, tuple[float, float]], float]]:
+def _detect_absa_columnar_header(words: list[tuple[Any, ...]]) -> Optional[dict[str, Any]]:
     # Labels like "balance", "credit" and "charge" also appear as words inside the
     # statement body (e.g. "Balance Brought Forward", "Acb Credit"), so we can't just
     # take the first occurrence of each label. Instead, group candidate words by row
@@ -135,7 +200,66 @@ def _detect_columnar_header(words: list[tuple[Any, ...]]) -> Optional[tuple[dict
         left = 0.0 if index == 0 else (anchors[ordered[index - 1]] + x0) / 2
         right = float("inf") if index == len(ordered) - 1 else (x0 + anchors[ordered[index + 1]]) / 2
         boundaries[label] = (left, right)
-    return boundaries, header_y
+    return {
+        "name": "absa",
+        "boundaries": boundaries,
+        "header_y": header_y,
+        "date_format": "default",
+        "include_charge_in_text": True,
+    }
+
+
+def _detect_standard_bank_header(words: list[tuple[Any, ...]]) -> Optional[dict[str, Any]]:
+    candidates: list[tuple[float, str, float]] = []
+    wanted = {
+        "details": "transaction",
+        "service": "service",
+        "fee": "fee",
+        "debits": "debit",
+        "credits": "credit",
+        "date": "date",
+        "balance": "balance",
+    }
+    for word in words:
+        x0, y0, _x1, _y1, text = word[0], word[1], word[2], word[3], word[4]
+        lowered = text.strip().lower().rstrip(":")
+        if lowered in wanted:
+            candidates.append((float(y0), wanted[lowered], float(x0)))
+
+    for base_y, _label, _x0 in candidates:
+        near: dict[str, float] = {}
+        for y0, label, x0 in candidates:
+            if abs(y0 - base_y) <= 12:
+                near.setdefault(label, x0)
+        if not all(label in near for label in ("transaction", "service", "fee", "debit", "credit", "date", "balance")):
+            continue
+        if not (near["transaction"] < near["service"] < near["debit"] < near["credit"] < near["date"] < near["balance"]):
+            continue
+
+        service_x = near["service"]
+        debit_x = near["debit"]
+        credit_x = near["credit"]
+        date_x = near["date"]
+        balance_x = near["balance"]
+        return {
+            "name": "standard_bank",
+            "boundaries": {
+                "transaction": (0.0, service_x - 10),
+                "charge": (service_x - 10, debit_x - 15),
+                "debit": (debit_x - 15, credit_x - 10),
+                "credit": (credit_x - 10, date_x - 10),
+                "date": (date_x - 10, balance_x - 15),
+                "balance": (balance_x - 15, float("inf")),
+            },
+            "header_y": max(y0 for y0, _label, _x0 in candidates if abs(y0 - base_y) <= 12),
+            "date_format": "month_day",
+            "include_charge_in_text": False,
+        }
+    return None
+
+
+def _detect_columnar_header(words: list[tuple[Any, ...]]) -> Optional[dict[str, Any]]:
+    return _detect_absa_columnar_header(words) or _detect_standard_bank_header(words)
 
 
 def _assign_column(x0: float, boundaries: dict[str, tuple[float, float]]) -> Optional[str]:
@@ -145,23 +269,76 @@ def _assign_column(x0: float, boundaries: dict[str, tuple[float, float]]) -> Opt
     return None
 
 
+def _is_columnar_transaction_date(value: str, profile: dict[str, Any]) -> bool:
+    if profile.get("date_format") == "month_day":
+        return bool(_STANDARD_BANK_COMPACT_DATE_RE.match(value))
+    return bool(DATE_ANCHOR_RE.match(value))
+
+
+def _columnar_prefix(row_text: dict[str, str], profile: dict[str, Any]) -> str:
+    if profile.get("include_charge_in_text", True):
+        return normalize_text(f"{row_text['transaction']} {row_text['charge']}")
+    return row_text["transaction"]
+
+
+def _columnar_continuation_text(row_text: dict[str, str], profile: dict[str, Any]) -> str:
+    text = _columnar_prefix(row_text, profile)
+    if profile.get("name") == "standard_bank":
+        lowered = text.lower()
+        if row_text["balance"] or row_text["debit"] or row_text["credit"]:
+            return ""
+        if "balance brought forward" in lowered:
+            return ""
+    return text
+
+
+def _parse_columnar_block_date(
+    raw_date: str,
+    *,
+    date_format: Optional[str],
+    statement_year: Optional[int],
+    previous_line_date: Optional[str],
+) -> Optional[str]:
+    if date_format == "month_day":
+        match = _STANDARD_BANK_COMPACT_DATE_RE.match(raw_date)
+        if not match or statement_year is None:
+            return None
+        month = int(match.group("month"))
+        day = int(match.group("day"))
+        year = statement_year
+        if previous_line_date and int(previous_line_date[5:7]) == 12 and month == 1:
+            year += 1
+        return f"{year:04d}-{month:02d}-{day:02d}"
+
+    line_date = parse_date(raw_date, year=statement_year)
+    if (
+        statement_year is not None
+        and line_date is not None
+        and line_date[5:7] == "01"
+        and previous_line_date is not None
+        and previous_line_date[5:7] == "12"
+    ):
+        line_date = parse_date(raw_date, year=statement_year + 1)
+    return line_date
+
+
 def parse_columnar_transaction_blocks(pages_words: list[list[tuple[Any, ...]]]) -> list[dict[str, Any]]:
     """Reconstruct transaction rows from word coordinates for "Print to PDF"
     statements where ``get_text("text")`` extracts dates, descriptions and
     amounts as separate column-major blocks rather than row-by-row."""
     blocks: list[dict[str, Any]] = []
     current: Optional[dict[str, Any]] = None
-    boundaries: Optional[dict[str, tuple[float, float]]] = None
-    header_y = -1.0
+    profile: Optional[dict[str, Any]] = None
 
     for page_index, words in enumerate(pages_words, start=1):
         detected = _detect_columnar_header(words)
         if detected:
-            boundaries, header_y = detected
-        if boundaries is None:
+            profile = detected
+        else:
             continue
 
-        body_words = [word for word in words if word[1] > header_y + 1.0]
+        boundaries = profile["boundaries"]
+        body_words = [word for word in words if word[1] > profile["header_y"] + 1.0]
         rows: list[list[tuple[Any, ...]]] = []
         for word in sorted(body_words, key=lambda w: (w[1], w[0])):
             if rows and abs(word[1] - rows[-1][0][1]) <= 2.0:
@@ -170,7 +347,7 @@ def parse_columnar_transaction_blocks(pages_words: list[list[tuple[Any, ...]]]) 
                 rows.append([word])
 
         for row in rows:
-            columns: dict[str, list[tuple[float, str]]] = {label: [] for label in _HEADER_ANCHOR_LABELS}
+            columns: dict[str, list[tuple[float, str]]] = {label: [] for label in _COLUMNAR_OUTPUT_LABELS}
             for word in row:
                 x0, text = word[0], word[4]
                 label = _assign_column(x0, boundaries)
@@ -181,27 +358,27 @@ def parse_columnar_transaction_blocks(pages_words: list[list[tuple[Any, ...]]]) 
                 for label, items in columns.items()
             }
 
-            date_match = DATE_ANCHOR_RE.match(row_text["date"])
-            if date_match:
+            if _is_columnar_transaction_date(row_text["date"], profile):
                 if current:
                     blocks.append(current)
-                prefix = normalize_text(f"{row_text['transaction']} {row_text['charge']}")
+                prefix = _columnar_prefix(row_text, profile)
                 transaction_type, reference = split_transaction_type_and_reference(prefix)
                 raw_line = normalize_text(" ".join(text for text in row_text.values() if text))
                 current = {
-                    "date": date_match.group("date"),
+                    "date": row_text["date"],
+                    "date_format": profile.get("date_format"),
                     "prefix": prefix,
                     "transaction_type": transaction_type or prefix,
                     "reference": reference,
-                    "debit": money(row_text["debit"]),
-                    "credit": money(row_text["credit"]),
+                    "debit": abs(money(row_text["debit"])),
+                    "credit": abs(money(row_text["credit"])),
                     "balance": money(row_text["balance"]),
                     "raw_lines": [raw_line],
                     "continuation_lines": [],
                     "page": page_index,
                 }
             elif current:
-                continuation_text = normalize_text(f"{row_text['transaction']} {row_text['charge']}")
+                continuation_text = _columnar_continuation_text(row_text, profile)
                 if not continuation_text or _FOOTER_TEXT_RE.match(continuation_text):
                     continue
                 current["raw_lines"].append(continuation_text)
@@ -219,6 +396,7 @@ def _build_statement_from_blocks(
     *,
     bank_account_id: str,
     currency: Optional[str] = None,
+    statement_year: Optional[int] = None,
 ) -> tuple[dict[str, Any], list[ParsedBankLine]]:
     warnings: list[dict[str, Any]] = []
     if not blocks:
@@ -288,8 +466,15 @@ def _build_statement_from_blocks(
             confidence = 0.72
             warnings.extend(block_warnings)
 
+        line_date = _parse_columnar_block_date(
+            block["date"],
+            date_format=block.get("date_format"),
+            statement_year=statement_year,
+            previous_line_date=lines[-1].line_date if lines else None,
+        )
+
         parsed = ParsedBankLine(
-            line_date=parse_date(block["date"]),
+            line_date=line_date,
             value_date=None,
             description=description or block["transaction_type"],
             reference=block["reference"],
@@ -357,8 +542,14 @@ def parse_text_statement_from_text(
     bank_account_id: str,
     currency: Optional[str] = None,
 ) -> tuple[dict[str, Any], list[ParsedBankLine]]:
+    statement_year = _infer_statement_year(text)
     blocks = parse_transaction_blocks(text)
-    return _build_statement_from_blocks(blocks, "pdf_text_blocks", text, bank_account_id=bank_account_id, currency=currency)
+    return _build_statement_from_blocks(
+        blocks, "pdf_text_blocks", text,
+        bank_account_id=bank_account_id,
+        currency=currency,
+        statement_year=statement_year,
+    )
 
 
 def parse_text_statement(
@@ -368,11 +559,20 @@ def parse_text_statement(
     currency: Optional[str] = None,
 ) -> tuple[dict[str, Any], list[ParsedBankLine]]:
     text = extract_pdf_text(file_bytes)
+    statement_year = _infer_statement_year(text)
     blocks = parse_transaction_blocks(text)
     parser_strategy = "pdf_text_blocks"
-    if not blocks:
-        columnar_blocks = parse_columnar_transaction_blocks(extract_pdf_words_by_page(file_bytes))
-        if columnar_blocks:
-            blocks = columnar_blocks
-            parser_strategy = "pdf_columnar_blocks"
-    return _build_statement_from_blocks(blocks, parser_strategy, text, bank_account_id=bank_account_id, currency=currency)
+    columnar_blocks = parse_columnar_transaction_blocks(extract_pdf_words_by_page(file_bytes))
+    if columnar_blocks and (
+        not blocks
+        or len(columnar_blocks) >= len(blocks) + 2
+        or len(columnar_blocks) >= max(2, int(len(blocks) * 1.25))
+    ):
+        blocks = columnar_blocks
+        parser_strategy = "pdf_columnar_blocks"
+    return _build_statement_from_blocks(
+        blocks, parser_strategy, text,
+        bank_account_id=bank_account_id,
+        currency=currency,
+        statement_year=statement_year,
+    )

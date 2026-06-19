@@ -20,8 +20,10 @@ def money(value: Any) -> Decimal:
     raw = str(value).strip()
     if not raw:
         return MONEY_ZERO
-    neg = raw.startswith("(") and raw.endswith(")")
+    neg = (raw.startswith("(") and raw.endswith(")")) or raw.endswith("-")
     cleaned = re.sub(r"[^0-9,.\-]", "", raw)
+    if cleaned.endswith("-"):
+        cleaned = cleaned[:-1]
     if cleaned.count(",") and cleaned.count("."):
         cleaned = cleaned.replace(",", "")
     elif cleaned.count(",") and not cleaned.count("."):
@@ -58,7 +60,7 @@ def clean_description(value: Any) -> str:
     return normalize_text(text)
 
 
-def parse_date(value: Any) -> Optional[str]:
+def parse_date(value: Any, *, year: Optional[int] = None) -> Optional[str]:
     if isinstance(value, datetime):
         return value.date().isoformat()
     if isinstance(value, date):
@@ -82,6 +84,24 @@ def parse_date(value: Any) -> Optional[str]:
             return datetime.strptime(raw, fmt).date().isoformat()
         except ValueError:
             pass
+    if year is not None:
+        for fmt in ("%d %b %Y", "%b %d %Y", "%d %B %Y", "%B %d %Y"):
+            try:
+                return datetime.strptime(f"{raw} {year}", fmt).date().isoformat()
+            except ValueError:
+                pass
+        if re.match(r"^\d{1,2}/\d{1,2}$", raw):
+            for fmt in ("%d/%m/%Y", "%m/%d/%Y"):
+                try:
+                    return datetime.strptime(f"{raw}/{year}", fmt).date().isoformat()
+                except ValueError:
+                    pass
+        if re.match(r"^\d{1,2}-\d{1,2}$", raw):
+            for fmt in ("%d-%m-%Y", "%m-%d-%Y"):
+                try:
+                    return datetime.strptime(f"{raw}-{year}", fmt).date().isoformat()
+                except ValueError:
+                    pass
     return raw if re.match(r"^\d{4}-\d{2}-\d{2}$", raw) else None
 
 

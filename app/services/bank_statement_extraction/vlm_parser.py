@@ -56,6 +56,41 @@ def bank_statement_vlm_json_schema() -> dict[str, Any]:
     }
 
 
+def _response_preview(text: str, limit: int = 300) -> str:
+    compact = " ".join((text or "").split())
+    return compact[:limit] + ("..." if len(compact) > limit else "")
+
+
+def _parse_vlm_json_payload(response_text: str | None, *, provider: str) -> dict[str, Any]:
+    text = (response_text or "{}").strip()
+    decoder = json.JSONDecoder()
+
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            return payload
+        raise ValueError(f"{provider} returned JSON {type(payload).__name__}, expected object")
+    except json.JSONDecodeError as direct_exc:
+        last_exc: json.JSONDecodeError = direct_exc
+
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            payload, _end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+            continue
+        if isinstance(payload, dict):
+            return payload
+        raise ValueError(f"{provider} returned JSON {type(payload).__name__}, expected object")
+
+    raise ValueError(
+        f"{provider} returned invalid JSON for bank statement extraction: "
+        f"{last_exc.msg}. Response preview: {_response_preview(text)!r}"
+    ) from last_exc
+
+
 def _call_openrouter_bank_vlm(
     page_parts: list[tuple[bytes, str]],
     *,
@@ -204,7 +239,7 @@ def parse_vlm_statement(
                 model=_or_model_name,
                 api_key=_or_key,
             )
-            payload = json.loads(_or_text)
+            payload = _parse_vlm_json_payload(_or_text, provider="OpenRouter VLM")
             _model = _or_model_name
         except Exception as _or_exc:
             print(f"[VLM] OpenRouter failed: {_or_exc}")
@@ -249,7 +284,7 @@ def parse_vlm_statement(
                 output_tokens = getattr(usage, "candidates_token_count", None)
         except Exception:
             pass
-        payload = json.loads(response.text or "{}")
+        payload = _parse_vlm_json_payload(response.text, provider=f"Gemini VLM {_model}")
 
     print(f"[VLM] Completed with model={_model!r}, hint={'yes' if parsing_hint else 'no'}")
     lines: list[ParsedBankLine] = []

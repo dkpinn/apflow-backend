@@ -31,6 +31,19 @@ from app.services.sales_invoices import (
 
 router = APIRouter(prefix="/api/sales-invoices", tags=["sales-invoices"])
 
+SalesInvoiceSortBy = Literal[
+    "invoice_number",
+    "customer",
+    "issue_date",
+    "due_date",
+    "total_amount",
+    "amount_outstanding",
+    "status",
+    "payment_status",
+    "created_at",
+]
+SortDirection = Literal["asc", "desc"]
+
 
 class SalesInvoiceLineInput(BaseModel):
     id: Optional[str] = None
@@ -291,6 +304,10 @@ def list_sales_invoices(
     status: Optional[str] = None,
     payment_status: Optional[str] = None,
     customer_id: Optional[str] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    sort_by: SalesInvoiceSortBy = "created_at",
+    sort_dir: SortDirection = "desc",
     search: Optional[str] = Query(default=None, max_length=200),
 ):
     user_id, db = auth
@@ -299,8 +316,6 @@ def list_sales_invoices(
         db.table("sales_invoices")
         .select("*, customers(legal_name, trading_name, customer_code)")
         .eq("organisation_id", organisation_id)
-        .order("created_at", desc=True)
-        .limit(500)
     )
     if status:
         query = query.eq("status", status)
@@ -308,8 +323,17 @@ def list_sales_invoices(
         query = query.eq("payment_status", payment_status)
     if customer_id:
         query = query.eq("customer_id", customer_id)
+    if date_from:
+        query = query.gte("issue_date", date_from.isoformat())
+    if date_to:
+        query = query.lte("issue_date", date_to.isoformat())
+    if sort_by == "customer":
+        query = query.order("created_at", desc=True)
+    else:
+        query = query.order(sort_by, desc=sort_dir == "desc")
+    query = query.limit(500)
     rows = query.execute().data or []
-    needle = (search or "").strip().lower()
+    needle = search.strip().lower() if isinstance(search, str) else ""
     if needle:
         rows = [
             row
@@ -324,6 +348,16 @@ def list_sales_invoices(
                 ]
             )
         ]
+    if sort_by == "customer":
+        rows = sorted(
+            rows,
+            key=lambda row: (
+                str((row.get("customers") or {}).get("legal_name") or "").lower(),
+                str(row.get("invoice_number") or "").lower(),
+                str(row.get("id") or ""),
+            ),
+            reverse=sort_dir == "desc",
+        )
     today = date.today().isoformat()
     for row in rows:
         if (
@@ -389,6 +423,137 @@ def create_sales_invoice(payload: SalesInvoiceInput, auth: UserAuth):
         return _detail(db, payload.organisation_id, invoice_id)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/item-codes")
+def list_sales_invoice_item_codes(
+    organisation_id: str,
+    auth: UserAuth,
+    search: Optional[str] = Query(default=None, max_length=200),
+):
+    user_id, db = auth
+    ensure_org_read(str(user_id), organisation_id)
+    rows = (
+        db.table("sales_invoice_lines")
+        .select("item_code")
+        .eq("organisation_id", organisation_id)
+        .limit(1000)
+        .execute()
+        .data
+        or []
+    )
+    rows += (
+        db.table("invoice_line_items")
+        .select("code")
+        .eq("organisation_id", organisation_id)
+        .limit(1000)
+        .execute()
+        .data
+        or []
+    )
+    needle = search.strip().lower() if isinstance(search, str) else ""
+    codes = {
+        str(row.get("item_code") or row.get("code") or "").strip()
+        for row in rows
+        if str(row.get("item_code") or row.get("code") or "").strip()
+    }
+    filtered = [
+        code
+        for code in codes
+        if not needle or needle in code.lower()
+    ]
+    return {"item_codes": sorted(filtered, key=str.lower)[:100]}
+
+
+def _nested_invoice(row: dict[str, Any]) -> dict[str, Any]:
+    value = row.get("invoices_extracted")
+    if isinstance(value, list):
+        value = value[0] if value else {}
+    return value if isinstance(value, dict) else {}
+
+
+def _source_unit_cost(row: dict[str, Any]) -> float | None:
+    if row.get("unit_price") not in (None, ""):
+        return float(row["unit_price"])
+    quantity = float(row.get("quantity") or 1)
+    if quantity <= 0 or row.get("line_total") in (None, ""):
+        return None
+    return round(float(row["line_total"]) / quantity, 4)
+
+
+@router.get("/rebill-bucket")
+def list_rebill_bucket_items(
+    organisation_id: str,
+    auth: UserAuth,
+    supplier_id: Optional[str] = None,
+    search: Optional[str] = Query(default=None, max_length=200),
+):
+    user_id, db = auth
+    ensure_org_read(str(user_id), organisation_id)
+    used_rows = (
+        db.table("sales_invoice_lines")
+        .select("source_invoice_line_id")
+        .eq("organisation_id", organisation_id)
+        .limit(5000)
+        .execute()
+        .data
+        or []
+    )
+    used_line_ids = {
+        str(row.get("source_invoice_line_id"))
+        for row in used_rows
+        if row.get("source_invoice_line_id")
+    }
+    source_rows = (
+        db.table("invoice_line_items")
+        .select(
+            "*, invoices_extracted!inner(id, organisation_id, invoice_number, invoice_date, supplier_id, supplier_name_extracted)"
+        )
+        .eq("organisation_id", organisation_id)
+        .limit(500)
+        .execute()
+        .data
+        or []
+    )
+    needle = search.strip().lower() if isinstance(search, str) else ""
+    items: list[dict[str, Any]] = []
+    for row in source_rows:
+        source_id = str(row.get("id") or "")
+        if not source_id or source_id in used_line_ids:
+            continue
+        invoice = _nested_invoice(row)
+        row_supplier_id = invoice.get("supplier_id") or row.get("supplier_id")
+        if supplier_id and str(row_supplier_id or "") != supplier_id:
+            continue
+        searchable = " ".join(
+            str(value or "").lower()
+            for value in (
+                row.get("code"),
+                row.get("description"),
+                invoice.get("invoice_number"),
+                invoice.get("supplier_name_extracted"),
+            )
+        )
+        if needle and needle not in searchable:
+            continue
+        items.append(
+            {
+                "id": source_id,
+                "invoice_extracted_id": row.get("invoice_extracted_id") or invoice.get("id"),
+                "supplier_id": row_supplier_id,
+                "supplier_name": invoice.get("supplier_name_extracted"),
+                "invoice_number": invoice.get("invoice_number"),
+                "invoice_date": invoice.get("invoice_date"),
+                "item_code": row.get("code"),
+                "description": row.get("description") or "Rebilled cost",
+                "quantity": row.get("quantity") or 1,
+                "unit_price": row.get("unit_price"),
+                "line_total": row.get("line_total"),
+                "vat_treatment": row.get("vat_treatment"),
+                "source_unit_cost": _source_unit_cost(row),
+            }
+        )
+    return {"items": items[:200]}
 
 
 @router.get("/{invoice_id}")

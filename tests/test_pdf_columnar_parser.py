@@ -3,6 +3,7 @@ from decimal import Decimal
 from app.services.bank_statement_extraction.pdf_parser import (
     _build_statement_from_blocks,
     parse_columnar_transaction_blocks,
+    parse_text_statement,
     parse_transaction_blocks,
 )
 
@@ -161,3 +162,144 @@ def test_build_statement_from_blocks_no_missing_continuation_warning_for_absa_ba
     assert header["extraction_warnings"] == []
     assert "Absa Bank Bryan Hellmann" in lines[0].description
     assert lines[0].counterparty == "Absa Bank Bryan Hellmann"
+
+
+STANDARD_HEADER_WORDS = [
+    _word(42.0, 402.8, "Details"),
+    _word(214.0, 402.8, "Service"),
+    _word(221.0, 412.1, "Fee"),
+    _word(276.0, 407.5, "Debits"),
+    _word(339.0, 407.5, "Credits"),
+    _word(391.0, 402.8, "Date"),
+    _word(483.0, 402.8, "Balance"),
+]
+
+
+def _standard_bank_words() -> list[tuple]:
+    return STANDARD_HEADER_WORDS + [
+        _word(42.0, 425.9, "BALANCE"),
+        _word(82.0, 425.9, "BROUGHT"),
+        _word(124.0, 425.9, "FORWARD"),
+        _word(391.0, 425.9, "10"),
+        _word(404.0, 425.9, "05"),
+        _word(473.0, 425.9, "38,292.14"),
+        _word(42.0, 436.3, "CELLPHONE"),
+        _word(93.0, 436.3, "INSTANTMON"),
+        _word(148.0, 436.3, "CASH"),
+        _word(172.0, 436.3, "TO"),
+        _word(295.0, 436.3, "350.00-"),
+        _word(391.0, 436.3, "10"),
+        _word(404.0, 436.3, "09"),
+        _word(473.0, 436.3, "37,942.14"),
+        _word(42.0, 446.7, "0849549395"),
+        _word(89.0, 446.7, "16H15"),
+        _word(114.0, 446.7, "236320221"),
+        _word(42.0, 455.5, "FEE"),
+        _word(60.0, 455.5, "-"),
+        _word(65.0, 455.5, "INSTANT"),
+        _word(101.0, 455.5, "MONEY"),
+        _word(224.0, 455.5, "##"),
+        _word(305.0, 455.5, "9.50-"),
+        _word(391.0, 455.5, "10"),
+        _word(404.0, 455.5, "09"),
+        _word(473.0, 455.5, "37,932.64"),
+        _word(42.0, 466.3, "0849549395"),
+        _word(89.0, 466.3, "16H15"),
+        _word(114.0, 466.3, "236320221"),
+        _word(42.0, 553.9, "CREDIT"),
+        _word(74.0, 553.9, "TRANSFER"),
+        _word(339.0, 553.9, "11,690.00"),
+        _word(391.0, 553.9, "10"),
+        _word(404.0, 553.9, "15"),
+        _word(473.0, 553.9, "39,311.14"),
+        _word(42.0, 564.3, "GLOSS"),
+        _word(42.0, 690.6, "VAT"),
+        _word(63.0, 690.6, "Summary"),
+        _word(44.0, 707.0, "Total"),
+        _word(66.0, 707.0, "charge"),
+        _word(96.0, 707.0, "amount"),
+        _word(481.0, 707.0, "227.36-"),
+    ]
+
+
+def test_parse_columnar_transaction_blocks_reconstructs_standard_bank_split_header():
+    blocks = parse_columnar_transaction_blocks([_standard_bank_words()])
+
+    assert len(blocks) == 4
+
+    opening = blocks[0]
+    assert opening["date"] == "10 05"
+    assert opening["date_format"] == "month_day"
+    assert opening["balance"] == Decimal("38292.14")
+
+    debit_block = blocks[1]
+    assert debit_block["prefix"] == "CELLPHONE INSTANTMON CASH TO"
+    assert debit_block["debit"] == Decimal("350.00")
+    assert debit_block["credit"] == Decimal("0.00")
+    assert debit_block["continuation_lines"] == ["0849549395 16H15 236320221"]
+
+    fee_block = blocks[2]
+    assert fee_block["prefix"] == "FEE - INSTANT MONEY"
+    assert fee_block["debit"] == Decimal("9.50")
+    assert "##" not in fee_block["prefix"]
+    assert fee_block["continuation_lines"] == ["0849549395 16H15 236320221"]
+
+    credit_block = blocks[3]
+    assert credit_block["credit"] == Decimal("11690.00")
+    assert credit_block["continuation_lines"] == ["GLOSS"]
+
+
+def test_build_statement_from_standard_bank_blocks_parses_month_day_dates():
+    blocks = parse_columnar_transaction_blocks([_standard_bank_words()])
+    header, lines = _build_statement_from_blocks(
+        blocks,
+        "pdf_columnar_blocks",
+        "Statement from 05 October 2024 to 05 November 2024",
+        bank_account_id="bank-1",
+        currency="ZAR",
+        statement_year=2024,
+    )
+
+    assert header["parser_strategy"] == "pdf_columnar_blocks"
+    assert [line.line_date for line in lines] == [
+        "2024-10-05",
+        "2024-10-09",
+        "2024-10-09",
+        "2024-10-15",
+    ]
+    assert lines[1].signed_amount == Decimal("-350.00")
+    assert lines[2].signed_amount == Decimal("-9.50")
+    assert lines[3].signed_amount == Decimal("11690.00")
+    assert header["closing_balance"] == 39311.14
+
+
+def test_parse_columnar_transaction_blocks_ignores_pages_without_table_header():
+    terms_page = [
+        _word(42.0, 410.0, "Details"),
+        _word(72.0, 410.0, "of"),
+        _word(84.0, 410.0, "Agreement"),
+    ]
+
+    blocks = parse_columnar_transaction_blocks([_standard_bank_words(), terms_page])
+
+    assert blocks[-1]["continuation_lines"] == ["GLOSS"]
+
+
+def test_parse_text_statement_prefers_stronger_columnar_result(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.bank_statement_extraction.pdf_parser.extract_pdf_text",
+        lambda _file_bytes: (
+            "Statement from 05 October 2024 to 05 November 2024\n"
+            "10/09 Single text row 350.00 37942.14\n"
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.bank_statement_extraction.pdf_parser.extract_pdf_words_by_page",
+        lambda _file_bytes: [_standard_bank_words()],
+    )
+
+    header, lines = parse_text_statement(b"pdf", bank_account_id="bank-1", currency="ZAR")
+
+    assert header["parser_strategy"] == "pdf_columnar_blocks"
+    assert len(lines) == 4
+    assert lines[1].description == "CELLPHONE INSTANTMON CASH TO 0849549395 16H15 236320221"
