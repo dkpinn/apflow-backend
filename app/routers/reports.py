@@ -6,6 +6,12 @@ from fastapi import APIRouter, HTTPException, Query, Response
 
 from app.dependencies import UserAuth, ensure_org_read
 from app.services.income_statement import generate_income_statement
+from app.services.transaction_report import (
+    generate_transaction_report,
+    transaction_report_csv,
+    transaction_report_text,
+    transaction_report_xlsx,
+)
 from app.services.trial_balance import (
     generate_trial_balance,
     trial_balance_csv,
@@ -55,6 +61,75 @@ def _ensure_reports_view(db, user_id: str, organisation_id: str) -> None:
     permissions = membership.get("permissions") if isinstance(membership.get("permissions"), dict) else {}
     if role not in {"owner", "admin", "accountant"} and not permissions.get("reports_view"):
         raise HTTPException(status_code=403, detail="You do not have permission to view reports")
+
+
+@router.get("/transactions")
+def transaction_report(
+    auth: UserAuth,
+    organisation_id: str,
+    date_from: str = Query(..., description="Start date in YYYY-MM-DD format."),
+    date_to: str = Query(..., description="End date in YYYY-MM-DD format."),
+):
+    user_id, db = auth
+    _ensure_reports_view(db, user_id, organisation_id)
+    try:
+        return {
+            "success": True,
+            "report": generate_transaction_report(
+                db,
+                organisation_id=organisation_id,
+                date_from=date_from,
+                date_to=date_to,
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/transactions/export")
+def export_transaction_report(
+    auth: UserAuth,
+    organisation_id: str,
+    date_from: str = Query(..., description="Start date in YYYY-MM-DD format."),
+    date_to: str = Query(..., description="End date in YYYY-MM-DD format."),
+    export_format: str = Query(..., alias="format", pattern="^(xlsx|csv|txt)$"),
+):
+    user_id, db = auth
+    _ensure_reports_view(db, user_id, organisation_id)
+    try:
+        report = generate_transaction_report(
+            db,
+            organisation_id=organisation_id,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    filename_base = f"transactions-{date_from}-to-{date_to}"
+    if export_format == "csv":
+        content = transaction_report_csv(report)
+        media_type = "text/csv; charset=utf-8"
+        extension = "csv"
+    elif export_format == "txt":
+        content = transaction_report_text(report)
+        media_type = "text/plain; charset=utf-8"
+        extension = "txt"
+    else:
+        try:
+            content = transaction_report_xlsx(report)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        extension = "xlsx"
+
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename_base}.{extension}"',
+        },
+    )
 
 
 @router.get("/income-statement")

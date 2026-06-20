@@ -73,9 +73,9 @@ class _Query:
             rows = [row for row in rows if row.get(key) == value]
         for key, op, value in self.range_filters:
             if op == ">=":
-                rows = [row for row in rows if row.get(key) is not None and str(row.get(key)) >= str(value)]
+                rows = [row for row in rows if _range_matches(row.get(key), value, op)]
             elif op == "<=":
-                rows = [row for row in rows if row.get(key) is not None and str(row.get(key)) <= str(value)]
+                rows = [row for row in rows if _range_matches(row.get(key), value, op)]
         for field, desc in reversed(self.orders):
             rows = sorted(
                 rows,
@@ -85,6 +85,18 @@ class _Query:
         if self.limit_count is not None:
             rows = rows[: self.limit_count]
         return _Result(rows)
+
+
+def _range_matches(row_value, filter_value, op):
+    if row_value is None:
+        return False
+    try:
+        left = Decimal(str(row_value))
+        right = Decimal(str(filter_value))
+    except Exception:
+        left = str(row_value)
+        right = str(filter_value)
+    return left >= right if op == ">=" else left <= right
 
 
 class _Rpc:
@@ -396,6 +408,47 @@ def test_sales_invoice_list_sorts_by_nested_customer_name(monkeypatch):
     assert [row["id"] for row in desc] == ["charlie", "bravo", "alpha"]
 
 
+def test_sales_invoice_list_filters_by_amount_range(monkeypatch):
+    db = _DB(
+        {
+            "sales_invoices": [
+                _sales_invoice_row("below", number="INV-001", customer="Alpha", issue_date="2026-06-01", due_date="2026-07-01", total=50, outstanding=50),
+                _sales_invoice_row("lower", number="INV-002", customer="Beta", issue_date="2026-06-02", due_date="2026-07-02", total=100, outstanding=100),
+                _sales_invoice_row("inside", number="INV-003", customer="Gamma", issue_date="2026-06-03", due_date="2026-07-03", total=250, outstanding=0),
+                _sales_invoice_row("above", number="INV-004", customer="Delta", issue_date="2026-06-04", due_date="2026-07-04", total=500, outstanding=500),
+            ]
+        }
+    )
+    monkeypatch.setattr(sales_invoice_router, "ensure_org_read", lambda *_args: None)
+
+    from_only = sales_invoice_router.list_sales_invoices(
+        "org-1",
+        auth=("user-1", db),
+        amount_from=100,
+        sort_by="total_amount",
+        sort_dir="asc",
+    )
+    to_only = sales_invoice_router.list_sales_invoices(
+        "org-1",
+        auth=("user-1", db),
+        amount_to=250,
+        sort_by="total_amount",
+        sort_dir="asc",
+    )
+    bounded = sales_invoice_router.list_sales_invoices(
+        "org-1",
+        auth=("user-1", db),
+        amount_from=100,
+        amount_to=250,
+        sort_by="total_amount",
+        sort_dir="asc",
+    )
+
+    assert [row["id"] for row in from_only] == ["lower", "inside", "above"]
+    assert [row["id"] for row in to_only] == ["below", "lower", "inside"]
+    assert [row["id"] for row in bounded] == ["lower", "inside"]
+
+
 def test_sales_invoice_list_rejects_invalid_sort_by(monkeypatch):
     app = FastAPI()
     app.include_router(sales_invoice_router.router)
@@ -407,6 +460,22 @@ def test_sales_invoice_list_rejects_invalid_sort_by(monkeypatch):
     response = client.get(
         "/api/sales-invoices",
         params={"organisation_id": "org-1", "sort_by": "not_a_column"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_sales_invoice_list_rejects_negative_amount_filter(monkeypatch):
+    app = FastAPI()
+    app.include_router(sales_invoice_router.router)
+    db = _DB({"sales_invoices": []})
+    app.dependency_overrides[authenticated_user] = lambda: ("user-1", db)
+    monkeypatch.setattr(sales_invoice_router, "ensure_org_read", lambda *_args: None)
+    client = TestClient(app)
+
+    response = client.get(
+        "/api/sales-invoices",
+        params={"organisation_id": "org-1", "amount_from": "-1"},
     )
 
     assert response.status_code == 422

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
@@ -306,6 +306,8 @@ def list_sales_invoices(
     customer_id: Optional[str] = None,
     date_from: Optional[date] = None,
     date_to: Optional[date] = None,
+    amount_from: Annotated[Optional[float], Query(ge=0)] = None,
+    amount_to: Annotated[Optional[float], Query(ge=0)] = None,
     sort_by: SalesInvoiceSortBy = "created_at",
     sort_dir: SortDirection = "desc",
     search: Optional[str] = Query(default=None, max_length=200),
@@ -327,6 +329,10 @@ def list_sales_invoices(
         query = query.gte("issue_date", date_from.isoformat())
     if date_to:
         query = query.lte("issue_date", date_to.isoformat())
+    if amount_from is not None:
+        query = query.gte("total_amount", amount_from)
+    if amount_to is not None:
+        query = query.lte("total_amount", amount_to)
     if sort_by == "customer":
         query = query.order("created_at", desc=True)
     else:

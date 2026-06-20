@@ -1,0 +1,50 @@
+Here's how the banking section works end-to-end:
+
+Banking Section Architecture
+Pages
+Route	Purpose
+/bank	Bank workspace — lists all bank accounts, create account dialog
+/bank/:accountId	Account detail — transactions, upload statements, review/post
+/admin/bank-extraction	Platform-owner benchmark tool (extraction quality testing)
+Full Statement Lifecycle
+1. Upload
+User drops a PDF/CSV/XLSX onto the account page → file goes to Supabase Storage → POST /api/bank/uploads creates a bank_statement_uploads row.
+
+2. Extraction
+POST /api/bank/uploads/{id}/extract triggers the pipeline in app/services/bank_statement_extraction/pipeline.py:
+
+CSV/XLSX → dedicated column-inference parsers
+PDF (text) → regex date/amount anchor parser
+PDF (scanned/complex) → Gemini VLM fallback with parsing hints
+Outputs: bank_statement_lines rows + balance validation + duplicate detection
+3. Review
+Clicking a line in src/routes/_app.bank.$accountId.tsx opens BankTransactionReviewSheet. The user:
+
+Gets auto-suggestions (invoice matches, rule matches via app/services/bank_statement_service.py)
+Picks a GL account + tracking + VAT treatment
+Optionally saves a rule for future auto-matching
+4. Post
+POST /api/bank/lines/{id}/draft-journal → POST /api/bank/journals/{id}/post:
+
+Creates a double-entry gl_journals record (source_type = 'bank_transaction')
+Two or three gl_journal_lines: bank GL account + allocation GL account (+ optional VAT split)
+Can be reversed with /unpost which creates a reversal journal and resets the line
+Key Tables
+Table	What it holds
+bank_accounts	Account metadata, GL link, opening balance
+bank_statement_uploads	File metadata, extraction status, balance evidence, confidence
+bank_statement_lines	Extracted transactions — all status flags (match/allocation/posting/review)
+bank_transaction_rules	User-defined auto-allocation rules (pattern → GL account)
+bank_transaction_suggestions	AI/rule suggestions per line (invoice match, rule match)
+bank_audit_events	Full event trail (upload → extract → review → post → unpost)
+bank_parsing_rules	VLM extraction hints per bank/account type
+Backend Endpoint Groups (/api/bank/...)
+Accounts: list, create, unreconciled lines + balance summary
+Uploads: list, register, extract, delete, get lines, audit trail
+Lines: delete, suggest, review, journal preview, draft journal
+Journals: post, unpost, get lines
+Parsing rules: CRUD for VLM extraction hints
+Key Design Choices
+Extraction is format-agnostic — the parser is selected by registry (format + account type), CSV and XLSX parse deterministically, PDF falls back to VLM only if text extraction yields no lines.
+Posting is reversible — unposting creates a counterpart reversal journal rather than deleting, preserving the audit trail.
+Rules are learnable — after reviewing a transaction, the user can save the allocation as a rule so future matching transactions are suggested automatically.

@@ -192,6 +192,8 @@ def test_compatibility_facade_reexports_extraction_public_api():
 # Year-less date format tests
 # ---------------------------------------------------------------------------
 
+from decimal import Decimal
+
 from app.services.bank_statement_extraction.common import parse_date
 from app.services.bank_statement_extraction.pdf_parser import (
     DATE_ANCHOR_RE,
@@ -351,3 +353,47 @@ def test_parse_text_statement_from_text_single_line_transaction():
     assert len(lines) == 1
     assert lines[0].line_date == "2024-01-28"
     assert lines[0].description
+
+
+# ---------------------------------------------------------------------------
+# FNB Gold Business Account — three-token (amount + balance Cr/Dr + bank charges)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_text_statement_from_text_fnb_three_token_cr_balance():
+    # Balance 473,674.11 is followed immediately by "Cr" in the text.
+    # Without the fix, the parser picks balance→amount (473,674.11) and
+    # bank-charges→balance (15.00). With the fix, amount=15,000.00 and
+    # balance=473,674.11. Use debit+credit sum to test the extracted
+    # amount magnitude without depending on direction inference.
+    text = (
+        "FNB Gold Business Account\n"
+        "Statement Period: 02 Feb 2026 to 28 Feb 2026\n"
+        "\n"
+        "02 Feb FNB App Rtc Pmt To Nicole Mia Salary 15,000.00 473,674.11Cr 15.00\n"
+        "03 Feb Payshap Account Off-Us Tgs Softw 823.87 472,850.24Cr 3.00\n"
+    )
+    _header, lines = parse_text_statement_from_text(text, bank_account_id="bank-1")
+    assert len(lines) == 2
+    assert lines[0].balance_amount == Decimal("473674.11")
+    assert lines[0].debit_amount + lines[0].credit_amount == Decimal("15000.00")
+    assert lines[1].balance_amount == Decimal("472850.24")
+    # Second transaction has a prior balance — movement matches → direction inferred
+    assert lines[1].debit_amount == Decimal("823.87")
+
+
+def test_parse_text_statement_from_text_fnb_two_token_line_unaffected():
+    """2-token lines (no bank charges column) must continue to work correctly."""
+    text = (
+        "FNB Gold Business Account\n"
+        "Statement Period: 02 Feb 2026 to 28 Feb 2026\n"
+        "\n"
+        "23 Feb FNB App Payment To Feb Mia Salary 54,012.04 149,428.04Cr\n"
+        "17 Feb Magtape Credit Capitec N Jacobsen 8,000.00Cr 361,137.33Cr\n"
+    )
+    _header, lines = parse_text_statement_from_text(text, bank_account_id="bank-1")
+    assert len(lines) == 2
+    assert lines[0].balance_amount == Decimal("149428.04")
+    assert lines[0].debit_amount == Decimal("54012.04")
+    assert lines[1].balance_amount == Decimal("361137.33")
+    assert lines[1].credit_amount == Decimal("8000.00")

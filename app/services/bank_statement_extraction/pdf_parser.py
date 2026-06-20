@@ -62,6 +62,11 @@ PAGE_BREAK_MARKER = "__PAGE_BREAK__"
 
 _YEAR_RE = re.compile(r"\b(20\d{2})\b")
 
+# Detects "Cr" or "Dr" immediately after a money token — indicates FNB-style
+# running balances where the suffix is printed directly after the number.
+# Used to identify the extra "Accrued Bank Charges" column in FNB statements.
+_CR_DR_RE = re.compile(r"^[CcDd][Rr]\b")
+
 
 def _infer_statement_year(text: str) -> Optional[int]:
     for match in _YEAR_RE.finditer(text[:2000]):
@@ -114,8 +119,18 @@ def parse_transaction_blocks(text: str) -> list[dict[str, Any]]:
                 blocks.append(current)
             if date_match:
                 # Date-at-start: [date] [description] [amount] [balance]
-                amount_match = money_matches[-2]
-                balance_match = money_matches[-1]
+                # FNB Gold Business: when ≥3 tokens and the second-to-last is
+                # immediately followed by "Cr"/"Dr", the last token is "Accrued
+                # Bank Charges" — shift the assignment one position left.
+                if (
+                    len(money_matches) >= 3
+                    and _CR_DR_RE.match(line[money_matches[-2].end():])
+                ):
+                    amount_match = money_matches[-3]
+                    balance_match = money_matches[-2]
+                else:
+                    amount_match = money_matches[-2]
+                    balance_match = money_matches[-1]
                 detected_date = date_match.group("date")
                 prefix = re.sub(r"\s+\*\s*$", "", normalize_text(line[date_match.end():amount_match.start()]))
                 block_amount = money(amount_match.group(0))

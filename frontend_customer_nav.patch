@@ -10,7 +10,7 @@ diff --git a/src/components/app/AppTopNav.tsx b/src/components/app/AppTopNav.tsx
      { label: "To Be Billed",              icon: ClipboardList },
      { label: "Statements",                icon: FileSpreadsheet },
      { label: "Reconciliations",           icon: GitCompareArrows },
-@@ -122,7 +122,7 @@ const CUSTOMER_NAV = {
+@@ -122,7 +122,25 @@ const CUSTOMER_NAV = {
      { label: "Approvals",                 icon: ShieldCheck },
    ],
    management: [
@@ -19,16 +19,94 @@ diff --git a/src/components/app/AppTopNav.tsx b/src/components/app/AppTopNav.tsx
      { label: "Customers Audit",     icon: SearchCheck },
    ],
  } as const;
-@@ -300,6 +300,8 @@ export function AppTopNav() {
++const PROJECT_NAV = {
++  projects: [
++    { to: "/projects", label: "Project Dashboard", icon: ClipboardList },
++    { to: "/projects/register", label: "Project Register", icon: FileSpreadsheet },
++    { to: "/projects/new", label: "New Project", icon: ReceiptText },
++  ],
++  activity: [
++    { to: "/projects/milestones", label: "Milestones", icon: ClipboardList },
++    { to: "/projects/budgets", label: "Budgets vs Actuals", icon: FileSpreadsheet },
++    { to: "/projects/costs", label: "Project Costs", icon: FileText },
++    { to: "/projects/approvals", label: "Project Approvals", icon: ShieldCheck },
++  ],
++  management: [
++    { to: "/projects/manage", label: "Project Edit / Add", icon: Users },
++    { to: "/settings/modules/project", label: "Project Settings", icon: GitCompareArrows },
++    { label: "Projects Audit", icon: SearchCheck },
++  ],
++} as const;
+@@ -300,6 +318,10 @@ export function AppTopNav() {
    const initial = (user?.email ?? "?").charAt(0).toUpperCase();
    const isDashboardActive = pathname.startsWith("/dashboard");
    const isSupplierActive  = SUPPLIER_PATHS.some((p) => pathname.startsWith(p));
 +  const isCustomerActive =
 +    pathname.startsWith("/customers") || pathname.startsWith("/sales-invoices");
++  const isProjectsActive =
++    pathname.startsWith("/projects") || pathname === "/settings/modules/project";
    const isReportsActive = pathname.startsWith("/reports");
  
    const handleSignOut = async () => {
-@@ -419,7 +421,7 @@ export function AppTopNav() {
+@@ -419,7 +441,65 @@ export function AppTopNav() {
++          {/* Projects */}
++          <DropdownMenu>
++            <DropdownMenuTrigger asChild>
++              <button type="button" className={navTriggerClass(isProjectsActive)}>
++                <ClipboardList className="mr-1.5 h-4 w-4" />
++                Projects
++                <ChevronDown className="ml-1 h-3 w-3 opacity-50" />
++              </button>
++            </DropdownMenuTrigger>
++            <DropdownMenuContent align="start" className="w-72">
++              <div className="p-2">
++                <SectionLabel>Projects</SectionLabel>
++                {PROJECT_NAV.projects.map((item) => {
++                  const Icon = item.icon;
++                  return (
++                    <SupplierNavLink
++                      key={item.label}
++                      to={item.to}
++                      label={item.label}
++                      icon={<Icon className="h-4 w-4" />}
++                      active={pathname === item.to}
++                    />
++                  );
++                })}
++
++                <SectionLabel className="mt-3">Activity</SectionLabel>
++                {PROJECT_NAV.activity.map((item) => {
++                  const Icon = item.icon;
++                  return (
++                    <SupplierNavLink
++                      key={item.label}
++                      to={item.to}
++                      label={item.label}
++                      icon={<Icon className="h-4 w-4" />}
++                      active={pathname.startsWith(item.to)}
++                    />
++                  );
++                })}
++
++                <SectionLabel className="mt-3">Management</SectionLabel>
++                {PROJECT_NAV.management.map((item) => {
++                  const Icon = item.icon;
++                  return "to" in item ? (
++                    <SupplierNavLink
++                      key={item.label}
++                      to={item.to}
++                      label={item.label}
++                      icon={<Icon className="h-4 w-4" />}
++                      active={pathname === item.to}
++                    />
++                  ) : (
++                    <DisabledNavItem key={item.label} label={item.label} icon={<Icon className="h-4 w-4" />} />
++                  );
++                })}
++              </div>
++            </DropdownMenuContent>
++          </DropdownMenu>
++
            {/* Customer */}
            <DropdownMenu>
              <DropdownMenuTrigger asChild>
@@ -37,7 +115,7 @@ diff --git a/src/components/app/AppTopNav.tsx b/src/components/app/AppTopNav.tsx
                  <Users className="mr-1.5 h-4 w-4" />
                  Customer
                  <ChevronDown className="ml-1 h-3 w-3 opacity-50" />
-@@ -434,14 +436,30 @@ export function AppTopNav() {
+@@ -434,14 +514,36 @@ export function AppTopNav() {
                  ))}
  
                  <SectionLabel className="mt-3">Activity</SectionLabel>

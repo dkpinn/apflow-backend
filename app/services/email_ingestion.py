@@ -102,16 +102,22 @@ def resolve_member_user_id(supabase, org_id: str, sender_email: str) -> Optional
     user_ids = [row["user_id"] for row in (res.data or [])]
 
     if user_ids:
-        # Look up emails in auth.users for these user_ids (service role only)
-        users_res = (
-            supabase.table("users")  # auth.users exposed via service role
-            .select("id, email")
-            .in_("id", user_ids)
-            .execute()
-        )
-        for u in users_res.data or []:
-            if (u.get("email") or "").lower() == clean:
-                return u["id"]
+        # Look up emails in auth.users for these user_ids (service role only).
+        # If auth.users is not in the schema cache, fall back gracefully.
+        try:
+            users_res = (
+                supabase.table("auth.users")
+                .select("id, email")
+                .in_("id", user_ids)
+                .execute()
+            )
+        except Exception:
+            users_res = None
+
+        if users_res and users_res.data:
+            for u in users_res.data:
+                if (u.get("email") or "").lower() == clean:
+                    return u["id"]
 
     # -- 2. Fallback: external_sender_emails array -------------------------
     res2 = (
