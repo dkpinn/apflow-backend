@@ -7,28 +7,187 @@ Route	Purpose
 /bank/:accountId	Account detail — transactions, upload statements, review/post
 /admin/bank-extraction	Platform-owner benchmark tool (extraction quality testing)
 Full Statement Lifecycle
+
+0.
+
+USER QUESTIONS:
+
+Under the bank/cash section, when a new account is opened:
+
+1) how is this added to the chart-of-accounts?
+2) where is the original file stored?
+3) in what format is the original file stored?
+4) from a space aspect, should we compress the bank statements?
+5) what security is surrounding the file?
+6) Anything else I should know before we move on?
+
+QUESTION: "Chart mapping: bank_accounts stores bank account metadata; linking to the chart of accounts is via the gl_account_id column — 
+the create call accepts gl_account_id but does not auto-create a GL account. See the create endpoint in bank.py:520-548 
+and the schema gl_account_id reference in bank_cash_phase_c1.sql:1-20."
+
+ANSWER: The standard chart of accounts is fully live. 
+The platform_standard_accounts table is created, seeded with ~35 accounts across all groups, 
+and create_org_system_accounts() is updated to seed from the template for every new organisation going forward.
+The one remaining approved item from earlier is the 4 AI reconciliation agent features
+(smarter suggestions, auto-reconcile high-confidence, rule learning, chat assistant) as org-level 
+multi-select settings. Want to tackle those next, or is there something else?
+
+QUESTION: "add the option to upload a .csv, xlsx, xls, txt.
+Allow the user to upload they own chart of accounts by giving them the headers and an example file to populate
+
+ANSWER: Everything is in place. Here's a summary of what was done:
+
+    Backend (app/routers/admin_accounts.py)
+
+    GET /api/admin/standard-accounts/template — returns a ready-to-use CSV with comment lines explaining allowed 
+    values and one example row per account group.
+    POST /api/admin/standard-accounts/import — accepts .csv/.txt (via csv.DictReader), .xlsx (via openpyxl), or 
+    .xls (via xlrd); validates each row; skips codes that already exist; returns { imported, skipped, errors }
+    Frontend (src/routes/_app.admin.standard-chart.tsx)
+
+    Download template button — fetches the CSV and triggers a browser download
+
+        Issue 1 — URL.revokeObjectURL(url) is called immediately after a.click() on line 144. 
+        The browser download is asynchronous; revoking the URL before the browser fetches it causes 
+        the "file not found" error in the download bar.
+
+        Issue 2 — GET /template is registered after DELETE /{account_id}. FastAPI matches routes in order; 
+        while there's no GET /{account_id} that would conflict today, it's best practice to put specific routes 
+        before parameterized ones.
+
+            Both fixes are applied:
+                Frontend — setTimeout(() => URL.revokeObjectURL(url), 1000) gives the browser a full second to 
+                initiate the download before the blob URL is cleaned up.
+                Backend — /template and /import routes now sit before /{account_id} in the file, which is the correct 
+                FastAPI convention.
+                Restart the backend server, then try Download template again — the CSV should download cleanly.
+
+    Import button — opens a hidden file input (.csv,.xlsx,.xls,.txt), POSTs the file as multipart/form-data, shows 
+    a toast with the import summary. xlrd==2.0.1 was already in the venv (added to requirements.txt for completeness). 
+    No new npm packages needed.
+
+QUESTION: Original file location: The uploaded file is saved into Supabase Storage (default bucket statement-files) and 
+the storage path is recorded in bank_statement_uploads.storage_path. See the upload create handler in bank.py:680-709.
+
+Stored format: The original file is kept as the original binary (PDF/CSV/XLSX/etc.); the DB row stores original_filename, mime_type, file_sha256 and later source_format / raw_extraction after extraction. The code downloads the raw bytes from storage for extraction (db.storage.from_(bucket).download(...)) and computes SHA256. See extraction/download code in bank.py:620-656.
+Compression / space: The system does not compress uploads by default. It does deduplicate by file_sha256 (duplicate detection) 
+and has atomic delete RPCs that remove storage files. Recommended options: enable dedupe/skip-duplicates (already present), implement retention or tiering (move old uploads to cold storage), or compress/archive large multi-year PDFs if acceptable for your extraction/workflow. No automatic compression is implemented today.
+Security around files: Access is protected by JWT + Row-Level Security (RLS) on the DB tables (bank_accounts, bank_statement_uploads have RLS). Server code uses a Supabase service-role client for uploads/extraction; user-scoped clients (RLS enforced) are used for requests. See client handling in supabase_client.py and auth/RLS enforcement in dependencies.py:1-40. Uploads and deletions are logged to bank_audit_events.
+Other important notes:
+Audit trail: events are recorded in bank_audit_events for upload/extract/post actions.
+Deduplication: file_sha256 is used to detect duplicate files before re-processing.
+Extraction metadata: post-extract the DB stores extraction_evidence, raw_extraction, confidence_score, and costs (VLM token usage).
+Posting flow: a reviewed line → draft journal → post; gl_journals exist and link back to lines, but GL linkage must be set (gl_account_id) for the bank account to appear in TB/transaction reports.
+Deletion/cleanup: uploads are removable via atomic RPCs that also delete storage files (see delete handlers).
+ 
+
+
 1. Upload
+
 User drops a PDF/CSV/XLSX onto the account page → file goes to Supabase Storage → POST /api/bank/uploads creates a bank_statement_uploads row.
 
+USER QUESTION: When a bank statement is imported, where is the information saved? Is there a view where I can see/edit/delete draft journal entries after review? At the moment when it says it has posted, I cannot find it on the Transaction Listing report or the TB Report. Is there a "hard core" no to unbalanced Dr's and Cr's for a transaction?
+
+CODEX ANSWER: 
+
+There are real gaps here.
+
+1) Original file: Supabase Storage, usually statement-files. 
+2) Upload metadata: bank_statement_uploads.
+3) Extracted transactions: bank_statement_lines.
+4) Draft/posted journal headers: gl_journals.
+5) Debit and credit entries: gl_journal_lines.
+6) History: bank_audit_events.
+
+Reviewing does not automatically mean GL posting. A normal bank line progresses through:
+
+1) reviewed → draft journal created → journal posted
+2) The Transaction Listing only reads gl_journals.status = 'posted' within its selected date range. 
+   The TB similarly reads posted journals up to the selected date. Therefore, if an entry is genuinely 
+   posted with the correct organisation and journal date, it should appear in both reports. See 
+   [transaction_report.py (line 66)](C:/Users/dale/Documents/apflow-backend/app/services/transaction_report.py:66) 
+   and [trial_balance.py (line 106)](C:/Users/dale/Documents/apflow-backend/app/services/trial_balance.py:106).
+3) The likely causes are:
+3.1) The line was reviewed but no GL journal was posted.
+3.2) The report date range excludes the bank transaction date.
+3.3) The UI says “posted” based on the bank-line status while the linked journal is missing or inconsistent.
+3.4) The journal lines reference missing/unavailable accounts.
+3.5) A frontend workflow is skipping the draft/post endpoints.
+
+There is currently no proper journal-register view/API for listing, editing and deleting all draft journals. The backend can:
+
+1) Preview a journal.
+2) Create a draft.
+3) Retrieve that journal’s lines.
+4) Post it.
+5) Reverse it after posting.
+
+It cannot directly edit or delete a draft journal. Deleting its underlying bank line/upload indirectly removes associated drafts. Also, requesting a draft again simply returns the existing one instead of updating it. See [bank.py (line 1152)](C:/Users/dale/Documents/apflow-backend/app/routers/bank.py:1152).
+On balancing: the ordinary builder produces balanced two- or three-line journals, and gl_journals has a constraint requiring its stored total_debit and total_credit to match. However, there is no database-level check that those header totals equal the actual sum of gl_journal_lines. The posting endpoint also does not recompute and verify the line totals before setting status = 'posted'.
+So the honest answer is: no, there is not yet a “hard-core” database guarantee preventing an unbalanced collection of journal lines from being posted. Normal application use constructs balanced entries, but the accounting invariant is not fully enforced. The missing safeguard should be an atomic database posting function that sums the lines, requires at least two valid lines, confirms debit equals credit, and only then marks the journal posted.
+
 2. Extraction
+
 POST /api/bank/uploads/{id}/extract triggers the pipeline in app/services/bank_statement_extraction/pipeline.py:
 
 CSV/XLSX → dedicated column-inference parsers
 PDF (text) → regex date/amount anchor parser
 PDF (scanned/complex) → Gemini VLM fallback with parsing hints
 Outputs: bank_statement_lines rows + balance validation + duplicate detection
-3. Review
-Clicking a line in src/routes/_app.bank.$accountId.tsx opens BankTransactionReviewSheet. The user:
 
+2.1 Multi-month, one .PDF, Upload
+
+The PDF should be treated as a container of statements:
+
+1) Read every page independently using selectable text or OCR.
+2) Identify account number, statement period, page number, opening balance and closing balance.
+3) Group pages belonging to the same monthly statement.
+4) Order groups chronologically by statement dates—not by balance values alone, because balances can rise or fall.
+5) Send each monthly group through extraction separately.
+6) Validate each month:
+    opening balance + transaction movement = closing balance
+7) Validate continuity:
+    January closing balance = February opening balance
+8) Detect gaps, overlaps, missing pages and inconsistent account numbers.
+9) Deduplicate using a transaction fingerprint containing date, amount, reference, description and account—not transaction count alone.
+10) Stage questionable months for review while accepting clean months.
+
+The original five-year PDF should remain one parent upload, with approximately 60 child “statement segments.” Each child behaves like an independently uploaded monthly statement and retains page-level provenance.
+This also solves the current 10-page AI fallback limit because the AI receives only one monthly segment at a time. The existing transaction fingerprinting in [common.py](C:/Users/dale/Documents/apflow-backend/app/services/bank_statement_extraction/common.py) and duplicate pipeline can be extended for this workflow.
+The critical principle is: use dates, account identity, page numbering and balance continuity together. Opening and closing balances alone are not reliable enough to determine page order.
+
+The harder parts are:
+
+1) Correctly grouping multi-page monthly statements.
+2) Handling dates without years across five years.
+3) Detecting missing, repeated, or out-of-order pages.
+4) Distinguishing genuine duplicate transactions from identical legitimate payments.
+5) Validating monthly balances and continuity.
+6) Supporting scanned PDFs and low-confidence OCR.
+7) Preventing partial imports when one month fails.
+
+2.2 Cleaning up the extraction
+
+a) "Balance brought forward", "Opening balance", "Closing balance", "Balance carried forward" should be imported
+for accuracy and not for reconciliation.
+b) Some bank charges will only show a line of information, but no amount. These need to be excluded from
+the reconciliation page.
+
+3. Review
+
+Clicking a line in src/routes/_app.bank.$accountId.tsx opens BankTransactionReviewSheet. The user:
 Gets auto-suggestions (invoice matches, rule matches via app/services/bank_statement_service.py)
 Picks a GL account + tracking + VAT treatment
 Optionally saves a rule for future auto-matching
-4. Post
-POST /api/bank/lines/{id}/draft-journal → POST /api/bank/journals/{id}/post:
 
+
+4. Post
+
+POST /api/bank/lines/{id}/draft-journal → POST /api/bank/journals/{id}/post:
 Creates a double-entry gl_journals record (source_type = 'bank_transaction')
 Two or three gl_journal_lines: bank GL account + allocation GL account (+ optional VAT split)
 Can be reversed with /unpost which creates a reversal journal and resets the line
+
 Key Tables
 Table	What it holds
 bank_accounts	Account metadata, GL link, opening balance
@@ -44,7 +203,38 @@ Uploads: list, register, extract, delete, get lines, audit trail
 Lines: delete, suggest, review, journal preview, draft journal
 Journals: post, unpost, get lines
 Parsing rules: CRUD for VLM extraction hints
+
 Key Design Choices
-Extraction is format-agnostic — the parser is selected by registry (format + account type), CSV and XLSX parse deterministically, PDF falls back to VLM only if text extraction yields no lines.
-Posting is reversible — unposting creates a counterpart reversal journal rather than deleting, preserving the audit trail.
-Rules are learnable — after reviewing a transaction, the user can save the allocation as a rule so future matching transactions are suggested automatically.
+
+Extraction is format-agnostic — the parser is selected by registry (format + account type), 
+ CSV and XLSX parse deterministically, PDF falls back to VLM only if text extraction yields no lines.
+Posting is reversible — unposting creates a counterpart reversal journal rather than deleting, 
+ preserving the audit trail.
+Rules are learnable — after reviewing a transaction, the user can save the allocation as a rule 
+ so future matching transactions are suggested automatically.
+
+ Non-Accountant-Reconciliation-UX/UI Design:
+ 
+ 1) Like a flash card in the middle horizontally.
+ 2) The top of the card shows the date, next 1-2 lines shows the details from the bank transaction.
+ 3) And lastly the 3-4 line shows the amount as negative or positive.
+ 4) Below this there are 6 buttons (or 6 quick keys)
+ 4.1) Match (quick key on numpad "7")
+      (this will go green if there is 1 document that matches the amount)
+      (this will go green if there is 1 amount to many documents matches total)
+      (this will go green if there is 1 document that matches the amount less a discount received/given)
+      (this will go green if there is 1 amount to many documents matches total less discount)
+ 4.2) Suggestion (quick key on numpad "9")
+      (this will give a suggestion if the transaction has no historic or rules based allocation)
+ 4.3) Split between various accounts (quick key on numpad "4")
+      (if there is no matching document)
+ 4.4) put to suspenss accounts for either supplier or customer/client until there is more information
+      (quick key on numpad "6")
+ 4.5) Another button placement (no function yet)
+ 4.6) New account creation (goes through wizard with user)
+        is this an income or and expense?
+        is this for personal of business?
+        tell me about this expense (where, what, why, when) AI gives suggestion.
+ "<-" left arrow is go back a transaction.
+ "->" right arrow goes forward a transaction.
+ 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any, Optional
 
@@ -73,6 +74,7 @@ def _parse_vlm_json_payload(response_text: str | None, *, provider: str) -> dict
     except json.JSONDecodeError as direct_exc:
         last_exc: json.JSONDecodeError = direct_exc
 
+
     for index, char in enumerate(text):
         if char != "{":
             continue
@@ -89,6 +91,53 @@ def _parse_vlm_json_payload(response_text: str | None, *, provider: str) -> dict
         f"{provider} returned invalid JSON for bank statement extraction: "
         f"{last_exc.msg}. Response preview: {_response_preview(text)!r}"
     ) from last_exc
+
+
+_STATEMENT_PERIOD_RE = re.compile(
+    r"statement\s+period\s*:\s*"
+    r"(?P<date_from>\d{1,2}\s+[A-Za-z]+\s+\d{4})\s+to\s+"
+    r"(?P<date_to>\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+    re.IGNORECASE,
+)
+
+
+def _vlm_statement_period_dates(
+    payload: dict[str, Any],
+    pdf_text: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    date_from = parse_date(payload.get("statement_period_from"))
+    date_to = parse_date(payload.get("statement_period_to"))
+    if date_from and date_to:
+        return date_from, date_to
+
+    match = _STATEMENT_PERIOD_RE.search(pdf_text or "")
+    if match:
+        date_from = date_from or parse_date(match.group("date_from"))
+        date_to = date_to or parse_date(match.group("date_to"))
+    return date_from, date_to
+
+
+def _parse_vlm_transaction_date(
+    value: Any,
+    *,
+    statement_period_from: Optional[str],
+    statement_period_to: Optional[str],
+) -> Optional[str]:
+    parsed = parse_date(value)
+    if parsed or not statement_period_from:
+        return parsed
+
+    start_year = int(statement_period_from[:4])
+    parsed = parse_date(value, year=start_year)
+    if not parsed:
+        return None
+
+    if statement_period_to and statement_period_to[:4] != statement_period_from[:4]:
+        end_year = int(statement_period_to[:4])
+        end_year_candidate = parse_date(value, year=end_year)
+        if end_year_candidate and statement_period_from <= end_year_candidate <= statement_period_to:
+            return end_year_candidate
+    return parsed
 
 
 def _call_openrouter_bank_vlm(
@@ -178,6 +227,8 @@ def parse_vlm_statement(
     prompt = (
         "Extract bank statement header fields and transaction rows. "
         "Return strict JSON only. Debits are money out; credits are money in. "
+        "Every transaction date must be returned as YYYY-MM-DD. If the statement prints only day and month "
+        "on a transaction, take its year from the Statement Period. "
         "Preserve continuation lines, beneficiary names, transaction labels, bank references, and raw row text. "
         "Do not drop rows with fees, stop orders, transfers, card purchases, credits, interest, or charges. "
         "For each transaction, set page_number to the 1-based index of the page image it appears on "
@@ -245,7 +296,41 @@ def parse_vlm_statement(
             print(f"[VLM] OpenRouter failed: {_or_exc}")
             _final_exc = _or_exc
 
-    # Step 3 — lite Gemini (if still no result and model differs from primary)
+    # Step 3 — LlamaParse → Gemini lite text-only (if LLAMA_CLOUD_API_KEY is set)
+    _llp_key = os.getenv("LLAMA_CLOUD_API_KEY")
+    if response is None and payload is None and _llp_key:
+        print("[VLM] Falling back to LlamaParse")
+        try:
+            import io as _io
+            from llama_parse import LlamaParse as _LlamaParse
+            _lp = _LlamaParse(api_key=_llp_key, result_type="markdown", verbose=False)
+            _lp_docs = _lp.load_data(
+                _io.BytesIO(file_bytes),
+                extra_info={"file_name": "statement.pdf"},
+            )
+            _lp_text = "\n\n".join(d.text for d in _lp_docs)
+            if _lp_text.strip():
+                _lp_contents: list[Any] = [
+                    prompt,
+                    (
+                        "DOCUMENT TEXT EXTRACTED BY LLAMAPARSE — use this as the primary source "
+                        f"for all dates, amounts, and descriptions:\n\n{_lp_text}"
+                    ),
+                ]
+                response = client.models.generate_content(
+                    model=_lite_model,
+                    contents=_lp_contents,
+                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                )
+                _model = f"llamaparse+{_lite_model}"
+            else:
+                print("[VLM] LlamaParse returned empty text — skipping")
+        except Exception as _lp_exc:
+            print(f"[VLM] LlamaParse step failed: {_lp_exc}")
+            _final_exc = _lp_exc
+            response = None  # ensure fall-through to Gemini lite with images
+
+    # Step 4 — lite Gemini with images (if still no result and model differs from primary)
     if response is None and payload is None and _lite_model != _primary_model:
         print(f"[VLM] Falling back to {_lite_model!r}")
         _model = _lite_model
@@ -287,6 +372,10 @@ def parse_vlm_statement(
         payload = _parse_vlm_json_payload(response.text, provider=f"Gemini VLM {_model}")
 
     print(f"[VLM] Completed with model={_model!r}, hint={'yes' if parsing_hint else 'no'}")
+    statement_period_from, statement_period_to = _vlm_statement_period_dates(
+        payload,
+        pdf_text_block,
+    )
     lines: list[ParsedBankLine] = []
     for transaction in payload.get("transactions") or []:
         debit = money(transaction.get("debit_amount"))
@@ -298,8 +387,16 @@ def parse_vlm_statement(
         except (TypeError, ValueError):
             page_number = None
         parsed = ParsedBankLine(
-            line_date=parse_date(transaction.get("line_date")),
-            value_date=parse_date(transaction.get("value_date")),
+            line_date=_parse_vlm_transaction_date(
+                transaction.get("line_date"),
+                statement_period_from=statement_period_from,
+                statement_period_to=statement_period_to,
+            ),
+            value_date=_parse_vlm_transaction_date(
+                transaction.get("value_date"),
+                statement_period_from=statement_period_from,
+                statement_period_to=statement_period_to,
+            ),
             description=clean_description(transaction.get("description")),
             reference=normalize_text(transaction.get("reference")) or None,
             counterparty=clean_description(transaction.get("counterparty")) or None,
@@ -342,8 +439,8 @@ def parse_vlm_statement(
     ]
     confidence_score = payload.get("confidence_score") or 0.5
     header = {
-        "statement_period_from": parse_date(payload.get("statement_period_from")),
-        "statement_period_to": parse_date(payload.get("statement_period_to")),
+        "statement_period_from": statement_period_from,
+        "statement_period_to": statement_period_to,
         "opening_balance": dec_to_float(money(payload.get("opening_balance"))) if payload.get("opening_balance") is not None else None,
         "closing_balance": dec_to_float(money(payload.get("closing_balance"))) if payload.get("closing_balance") is not None else None,
         "currency": payload.get("currency") or currency,

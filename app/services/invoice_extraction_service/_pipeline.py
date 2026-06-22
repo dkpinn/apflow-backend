@@ -23,15 +23,13 @@ from app.services.document_jobs import (
 from app.services.invoice_extraction.entity_detection import (
     classify_document_direction,
     name_matches_org,
-    normalise_name,
 )
 from app.services.invoice_extraction.extraction_rules import looks_like_location_cluster
-from app.services.invoice_extraction.supplier_parser import (
-    extract_supplier_name,
-    is_valid_supplier_candidate,
-)
+from app.services.invoice_extraction.supplier_parser import is_valid_supplier_candidate
 from app.services.ai_provider_fallback import extract_with_vlm_fallback
 from app.services.invoice_extraction.vlm_parser import VLM_MERGE_FIELDS
+from ._vat_reconciliation import _auto_reconcile_vat
+from ._supplier_matching import _attempt_supplier_auto_link, _correct_extracted_supplier
 
 # Published rates (USD per million tokens) — update when providers change pricing.
 _COST_PER_MILLION: dict[str, dict[str, float]] = {
@@ -43,75 +41,6 @@ _COST_PER_MILLION: dict[str, dict[str, float]] = {
     "gpt-4.1-mini":     {"input": 0.40, "output": 1.60},
     "claude-3-5-sonnet-latest": {"input": 3.00, "output": 15.00},
 }
-
-def _auto_reconcile_vat(parsed_data: dict, vat_rate: float = 0.15) -> None:
-    """
-    Detect whether extracted line item prices are VAT-inclusive or exclusive by
-    Determine VAT treatment using the canonical decision tree:
-      1. No VAT number on document → non-VAT supplier, no VAT claimed
-      2. SUM(line_totals) ≈ doc_total → prices are VAT-INCLUSIVE → strip VAT from lines
-      3. SUM × (1+rate) ≈ doc_total  → prices are EX-VAT → use as-is, derive VAT
-      4. Neither matches → cannot determine, user sees Solve button
-
-    VLM now returns prices EXACTLY as printed — this function normalises to ex-VAT.
-    """
-    from decimal import Decimal
-
-    doc_total_raw = parsed_data.get("total_amount")
-    line_items = parsed_data.get("line_items") or []
-    vat_number = parsed_data.get("vat_number_extracted")
-
-    if not doc_total_raw or not line_items:
-        return
-
-    try:
-        doc_total = float(doc_total_raw)
-    except (TypeError, ValueError):
-        return
-
-    line_sum = sum(float(it.get("line_total") or 0) for it in line_items)
-    if line_sum <= 0 or doc_total <= 0:
-        return
-
-    # Case 1: No VAT number → non-VAT supplier, use line totals as-is
-    if not vat_number:
-        parsed_data["prices_include_vat_detected"] = None  # not applicable, not a DB enum value
-        parsed_data["subtotal"] = round(line_sum, 2)
-        parsed_data["tax_amount"] = 0.0
-        return
-
-    TOLERANCE = 0.03  # 3%
-
-    # Case 2: Prices inclusive (SUM ≈ doc_total)
-    diff_inclusive = abs(line_sum - doc_total) / doc_total
-
-    # Case 3: Prices exclusive (SUM × (1+rate) ≈ doc_total)
-    diff_exclusive = abs(line_sum * (1 + vat_rate) - doc_total) / doc_total
-
-    if diff_inclusive <= diff_exclusive and diff_inclusive < TOLERANCE:
-        # VAT-INCLUSIVE: strip VAT from printed prices → store ex-VAT
-        parsed_data["prices_include_vat_detected"] = "inclusive"
-        new_items = []
-        scale = Decimal(str(1 + vat_rate))
-        for it in line_items:
-            raw_total = float(it.get("line_total") or 0)
-            ex_total = round(float(Decimal(str(raw_total)) / scale), 2)
-            raw_unit = float(it.get("unit_price") or 0)
-            ex_unit = round(float(Decimal(str(raw_unit)) / scale), 4) if raw_unit else 0
-            new_items.append({**it, "unit_price": ex_unit, "line_total": ex_total})
-        parsed_data["line_items"] = new_items
-        ex_sum = round(sum(it["line_total"] for it in new_items), 2)
-        parsed_data["subtotal"] = ex_sum
-        parsed_data["tax_amount"] = round(doc_total - ex_sum, 2)
-
-    elif diff_exclusive < diff_inclusive and diff_exclusive < TOLERANCE:
-        # EX-VAT: prices already ex-VAT → derive VAT from doc_total
-        parsed_data["prices_include_vat_detected"] = "exclusive"
-        parsed_data["subtotal"] = round(line_sum, 2)
-        parsed_data["tax_amount"] = round(doc_total - line_sum, 2)
-
-    # else: cannot determine — leave as-is, user sees Solve button
-
 
 def _calc_cost_usd(model: str | None, input_tokens: int | None, output_tokens: int | None) -> float | None:
     if not model or input_tokens is None:
@@ -572,75 +501,9 @@ def run_invoice_extraction(
             )
 
         original_supplier_name = parsed_data.get("supplier_name_extracted")
-        supplier_correction_reason = None
-
-        # Correct the common AP extraction error where the parser picks the
-        # recipient/customer block as the supplier. In APPayPal, "supplier" means
-        # the invoice issuer/vendor, not the recipient/customer.
-        original_supplier_norm = normalise_name(original_supplier_name)
-        issuer_norm = normalise_name(direction_result.issuer_name)
-        recipient_norm = normalise_name(direction_result.recipient_name)
-
-        if direction_result.issuer_name and original_supplier_norm == recipient_norm and recipient_norm:
-            if direction_result.document_direction == "customer_sales_invoice":
-                parsed_data["supplier_name_extracted"] = None
-                supplier_correction_reason = (
-                    "Original supplier candidate matched the invoice recipient. "
-                    "Document appears to be a customer sales invoice, so supplier was cleared."
-                )
-            else:
-                parsed_data["supplier_name_extracted"] = direction_result.issuer_name
-                supplier_correction_reason = (
-                    "Original supplier candidate matched the invoice recipient. "
-                    "Supplier corrected to detected invoice issuer."
-                )
-        elif (
-            direction_result.document_direction == "supplier_invoice_payable"
-            and direction_result.issuer_name
-            and not parsed_data.get("supplier_name_extracted")
-        ):
-            parsed_data["supplier_name_extracted"] = direction_result.issuer_name
-            supplier_correction_reason = (
-                "Supplier was missing. Supplier set to detected invoice issuer "
-                "because selected organisation appears to be the recipient."
-            )
-        elif (
-            direction_result.document_direction == "supplier_invoice_payable"
-            and direction_result.issuer_name
-            and issuer_norm
-            and original_supplier_norm
-            and original_supplier_norm != issuer_norm
-        ):
-            parsed_data["supplier_name_extracted"] = direction_result.issuer_name
-            supplier_correction_reason = (
-                "Supplier candidate differed from detected invoice issuer. "
-                "Supplier corrected to issuer because selected organisation appears to be the recipient."
-            )
-
-        rejected_supplier_candidate = None
-        current_supplier_name = parsed_data.get("supplier_name_extracted")
-        if current_supplier_name and not is_valid_supplier_candidate(str(current_supplier_name)):
-            rejected_supplier_candidate = current_supplier_name
-            recovered_supplier_name = extract_supplier_name(text)
-            if recovered_supplier_name and is_valid_supplier_candidate(recovered_supplier_name):
-                parsed_data["supplier_name_extracted"] = recovered_supplier_name
-                supplier_correction_reason = (
-                    "Supplier candidate looked like a date or document metadata. "
-                    "Supplier recovered from the document header."
-                )
-            else:
-                parsed_data["supplier_name_extracted"] = None
-                if parsed_data.get("validation_status") != MISSING_SUPPLIER_VALIDATION_STATUS:
-                    parsed_data["validation_status"] = "needs_review"
-                rejection_note = (
-                    f"Rejected supplier candidate '{rejected_supplier_candidate}' because it looked like "
-                    "a date or document metadata. Manual supplier review is required."
-                )
-                parsed_data["validation_notes"] = (
-                    (parsed_data.get("validation_notes") + " " if parsed_data.get("validation_notes") else "")
-                    + rejection_note
-                )
-                parsed_data["supplier_candidate_rejected"] = True
+        supplier_correction_reason, rejected_supplier_candidate = _correct_extracted_supplier(
+            parsed_data, direction_result, text
+        )
 
         if direction_result.confidence_adjustment:
             parsed_data["confidence_score"] = round(
@@ -869,41 +732,9 @@ def run_invoice_extraction(
         "prices_include_vat_detected": parsed_data.get("prices_include_vat_detected"),
     }
 
-    auto_linked_supplier_id = None
-    auto_link_match_result = None
-
-    # Auto-link supplier when the organisation's configured identity threshold is met.
-    if not extracted_payload.get("supplier_id"):
-        try:
-            from app.services.supplier_matcher import find_supplier_match_result  # noqa: PLC0415
-            match_result = find_supplier_match_result(
-                supabase,
-                org_id=org_id,
-                invoice_total=parsed_data.get("total_amount"),
-                supplier_name_extracted=parsed_data.get("supplier_name_extracted"),
-                vat_number_extracted=parsed_data.get("vat_number_extracted"),
-                company_registration_number_extracted=parsed_data.get("company_registration_number_extracted"),
-                cus_code_extracted=parsed_data.get("cus_code_extracted"),
-                bank_account_number_extracted=parsed_data.get("bank_account_number_extracted"),
-                supplier_telephone_extracted=parsed_data.get("supplier_telephone_extracted") or parsed_data.get("supplier_cell_extracted"),
-                supplier_email_extracted=parsed_data.get("supplier_email_extracted"),
-                supplier_acc_email_extracted=parsed_data.get("supplier_acc_email_extracted"),
-            )
-            if match_result and match_result.get("auto_link"):
-                matched_id = str(match_result["supplier_id"])
-                extracted_payload["supplier_id"] = matched_id
-                auto_linked_supplier_id = matched_id
-                auto_link_match_result = match_result
-                try:
-                    supabase.table("invoices_raw").update({
-                        "supplier_id": matched_id,
-                        "updated_at": utc_now_iso(),
-                    }).eq("id", invoice_raw_id).execute()
-                except Exception as raw_link_exc:
-                    print(f"INVOICES_RAW AUTO-LINK UPDATE FAILED (non-fatal): {raw_link_exc}")
-                print(f"AUTO-LINKED supplier {matched_id} via supplier identity threshold")
-        except Exception as exc:
-            print(f"SUPPLIER AUTO-MATCH FAILED (non-fatal): {exc}")
+    auto_linked_supplier_id, auto_link_match_result = _attempt_supplier_auto_link(
+        supabase, org_id, invoice_raw_id, parsed_data, extracted_payload
+    )
 
     supplier_settings = fetch_supplier_processing_settings(
         supabase,

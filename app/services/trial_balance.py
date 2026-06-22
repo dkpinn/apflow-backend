@@ -7,6 +7,8 @@ from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
+from app.services.money import money
+
 
 ZERO = Decimal("0.00")
 MONEY = Decimal("0.01")
@@ -16,15 +18,6 @@ CURRENT_FY_TYPES = {"income", "expense"}
 
 MONTH_NAME_TO_NUM = {name: index for index, name in enumerate(calendar.month_name) if name}
 DEFAULT_FINANCIAL_YEAR_END = "February"
-
-
-def money(value: Any) -> Decimal:
-    if value in (None, ""):
-        return ZERO
-    try:
-        return Decimal(str(value)).quantize(MONEY, rounding=ROUND_HALF_UP)
-    except Exception:
-        return ZERO
 
 
 def amount_out(value: Decimal) -> float:

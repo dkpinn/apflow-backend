@@ -6,19 +6,12 @@ from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
+from app.services.money import money
+
 
 ZERO = Decimal("0.00")
 MONEY = Decimal("0.01")
 VAT_TREATMENTS = {"full", "blocked", "exempt", "zero_rated"}
-
-
-def money(value: Any) -> Decimal:
-    if value in (None, ""):
-        return ZERO
-    try:
-        return Decimal(str(value)).quantize(MONEY, rounding=ROUND_HALF_UP)
-    except Exception:
-        return ZERO
 
 
 def amount_out(value: Decimal) -> float:

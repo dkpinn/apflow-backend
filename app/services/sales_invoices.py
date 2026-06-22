@@ -4,6 +4,7 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterable
 
+from app.services.money import money
 from app.services.organisation_module_settings import (
     missing_tracking_dimensions,
     required_tracking_dimensions,
@@ -19,10 +20,6 @@ def decimal_value(value: Any, default: str = "0") -> Decimal:
     if value in (None, ""):
         return Decimal(default)
     return Decimal(str(value))
-
-
-def money(value: Any) -> Decimal:
-    return decimal_value(value).quantize(MONEY, rounding=ROUND_HALF_UP)
 
 
 def calculate_sales_line(line: dict[str, Any]) -> dict[str, Any]:

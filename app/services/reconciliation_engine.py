@@ -2,12 +2,7 @@ from uuid import uuid4
 from decimal import Decimal
 from app.models.schemas import RunReconciliationRequest, RunReconciliationResponse
 from app.db.supabase_client import get_supabase_client
-
-
-def money(value) -> Decimal:
-    if value is None:
-        return Decimal("0.00")
-    return Decimal(str(value)).quantize(Decimal("0.01"))
+from app.services.money import money
 
 
 def dec_to_float(value):

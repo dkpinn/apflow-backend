@@ -6,7 +6,11 @@ from openpyxl import Workbook
 
 import app.services.bank_statement_extraction as extraction
 import app.services.bank_statement_service as facade
-from app.services.bank_statement_extraction.vlm_parser import _parse_vlm_json_payload
+from app.services.bank_statement_extraction.vlm_parser import (
+    _parse_vlm_json_payload,
+    _parse_vlm_transaction_date,
+    _vlm_statement_period_dates,
+)
 from app.services.extraction_foundation import detect_source_format
 from app.services.extractor_registry import select_bank_cash_extractor
 
@@ -178,6 +182,34 @@ def test_vlm_json_payload_accepts_markdown_fenced_json():
 def test_vlm_json_payload_rejects_invalid_response_with_preview():
     with pytest.raises(ValueError, match="Test VLM returned invalid JSON"):
         _parse_vlm_json_payload("I could not extract this statement", provider="Test VLM")
+
+
+def test_fnb_vlm_yearless_transaction_date_uses_statement_period_year():
+    statement_from, statement_to = _vlm_statement_period_dates(
+        {"transactions": [], "confidence_score": 0.9},
+        "Gold Business Account\nStatement Period : 3 April 2024 to 3 May 2024\n",
+    )
+
+    assert statement_from == "2024-04-03"
+    assert statement_to == "2024-05-03"
+    assert _parse_vlm_transaction_date(
+        "15 Apr",
+        statement_period_from=statement_from,
+        statement_period_to=statement_to,
+    ) == "2024-04-15"
+    assert _parse_vlm_transaction_date(
+        "2 May",
+        statement_period_from=statement_from,
+        statement_period_to=statement_to,
+    ) == "2024-05-02"
+
+
+def test_vlm_full_transaction_date_is_unchanged():
+    assert _parse_vlm_transaction_date(
+        "2024-04-15",
+        statement_period_from="2024-04-03",
+        statement_period_to="2024-05-03",
+    ) == "2024-04-15"
 
 
 def test_compatibility_facade_reexports_extraction_public_api():

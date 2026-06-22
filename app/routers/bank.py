@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from app.db.supabase_client import get_fresh_supabase_client, get_supabase_client
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
+from app.models.schemas import BulkAllocateRequest, LineSkipRequest
 from app.services.extraction_foundation import file_sha256
 from app.services.bank_extraction_validation import validate_extracted_statement_quality
 from app.services.bank_statement_service import (
@@ -410,7 +411,11 @@ def is_unreconciled_bank_line(line: dict[str, Any]) -> bool:
     posting_status = str(line.get("posting_status") or "unposted").lower()
     allocation_status = str(line.get("allocation_status") or "unallocated").lower()
     review_status = str(line.get("review_status") or "pending").lower()
-    return posting_status != "posted" or allocation_status != "allocated" or review_status != "reviewed"
+    return (
+        posting_status != "posted"
+        or allocation_status not in {"allocated", "split"}
+        or review_status != "reviewed"
+    )
 
 
 def bank_line_sort_key(line: dict[str, Any]) -> tuple[str, int, str]:
@@ -470,13 +475,40 @@ def list_bank_account_unreconciled_lines(account_id: str, organisation_id: str, 
         upload_rows = []
     uploads_by_id = {str(row.get("id")): row for row in upload_rows if row.get("id")}
 
+    # Batch-fetch open suggestions to enrich lines with confidence + account hints
+    top_suggestion: dict[str, dict] = {}
+    if lines:
+        line_id_strs = [str(l["id"]) for l in lines[:500]]
+        sug_rows = (
+            db.table("bank_transaction_suggestions")
+            .select("bank_statement_line_id, confidence_score, suggested_account_id, suggested_tax_treatment, matched_invoice_number")
+            .eq("organisation_id", organisation_id)
+            .in_("bank_statement_line_id", line_id_strs)
+            .eq("status", "open")
+            .order("confidence_score", desc=True)
+            .limit(5000)
+            .execute()
+            .data
+            or []
+        )
+        for s in sug_rows:
+            lid = str(s.get("bank_statement_line_id") or "")
+            if lid and lid not in top_suggestion:
+                top_suggestion[lid] = s
+
     enriched = []
     for line in lines:
         upload = uploads_by_id.get(str(line.get("bank_statement_upload_id"))) or {}
+        sug = top_suggestion.get(str(line.get("id") or ""), {})
+        confidence = float(sug.get("confidence_score") or (0.75 if line.get("match_status") == "suggested" else 0.5))
         enriched.append({
             **line,
             "upload_original_filename": upload.get("original_filename"),
             "upload_uploaded_at": upload.get("uploaded_at"),
+            "recon_confidence": confidence,
+            "recon_suggested_account_id": sug.get("suggested_account_id"),
+            "recon_suggested_tax": sug.get("suggested_tax_treatment"),
+            "recon_matched_invoice_ref": sug.get("matched_invoice_number") or line.get("matched_invoice_number"),
         })
 
     balances = BankBalanceSummary.model_validate(
@@ -502,6 +534,48 @@ def create_bank_account(payload: BankAccountCreate, auth: UserAuth):
     organisation_id = str(payload.organisation_id)
     ensure_org_write(user_id, organisation_id)
     opening = float(money(payload.opening_balance))
+
+    # Auto-create GL account in the 6200xxx range when none is provided
+    gl_account_id: str | None = str(payload.gl_account_id) if payload.gl_account_id else None
+    if not gl_account_id:
+        code_rows = (
+            db.table("accounts")
+            .select("code")
+            .eq("organisation_id", organisation_id)
+            .like("code", "6200%")
+            .execute()
+            .data
+            or []
+        )
+        used: set[int] = set()
+        for r in code_rows:
+            try:
+                used.add(int(r["code"]))
+            except (TypeError, ValueError):
+                pass
+        next_code = 6200001
+        while next_code in used:
+            next_code += 1
+        if next_code > 6200999:
+            raise HTTPException(status_code=400, detail="No bank GL codes available in range 6200001–6200999")
+        gl_res = (
+            db.table("accounts")
+            .insert({
+                "organisation_id": organisation_id,
+                "code": str(next_code),
+                "name": payload.name,
+                "type": "asset",
+                "group_name": "Bank",
+                "vat_treatment": "full",
+                "is_system": False,
+                "active": True,
+            })
+            .execute()
+        )
+        if not gl_res.data:
+            raise HTTPException(status_code=500, detail="Failed to create GL account for bank account")
+        gl_account_id = str(gl_res.data[0]["id"])
+
     row = {
         "organisation_id": organisation_id,
         "name": payload.name,
@@ -510,7 +584,7 @@ def create_bank_account(payload: BankAccountCreate, auth: UserAuth):
         "currency": payload.currency,
         "account_number_mask": payload.account_number_mask,
         "account_number_hash": payload.account_number_hash,
-        "gl_account_id": str(payload.gl_account_id) if payload.gl_account_id else None,
+        "gl_account_id": gl_account_id,
         "opening_balance": opening,
         "current_reconciled_balance": opening,
         "active": True,
@@ -1096,269 +1170,60 @@ def review_bank_line(line_id: str, payload: ReviewLineRequest, auth: UserAuth):
     return {"success": True, "customer_receipt": receipt_result}
 
 
-@router.post("/lines/{line_id}/journal-preview")
-def preview_bank_journal(line_id: str, payload: DraftJournalRequest, auth: UserAuth):
-    user_id, db = _auth(auth)
-    organisation_id = str(payload.organisation_id)
-    ensure_org_read(user_id, organisation_id)
-    line = _one(
-        db.table("bank_statement_lines").select("*").eq("id", line_id).eq("organisation_id", organisation_id).limit(1).execute(),
-        "Bank statement line not found",
-    )
-    rows = build_journal_rows_for_line(
-        db,
-        organisation_id=organisation_id,
-        line=line,
-        gl_account_id=str(payload.gl_account_id),
-        tracking=payload.tracking,
-        vat_rate=payload.vat_rate,
-        vat_account_id=str(payload.vat_account_id) if payload.vat_account_id else None,
-    )
-    return {
-        "success": True,
-        "lines": journal_preview_lines(db, organisation_id, rows),
-        "total_debit": dec_to_float(sum(money(row["debit_amount"]) for row in rows)),
-        "total_credit": dec_to_float(sum(money(row["credit_amount"]) for row in rows)),
-    }
-
-
-@router.post("/lines/{line_id}/draft-journal")
-def draft_bank_journal(line_id: str, payload: DraftJournalRequest, auth: UserAuth):
+@router.post("/lines/{line_id}/skip")
+def skip_bank_line(line_id: str, payload: LineSkipRequest, auth: UserAuth):
+    """Defer a bank statement line — keeps it in the unreconciled queue."""
     user_id, db = _auth(auth)
     organisation_id = str(payload.organisation_id)
     ensure_org_write(user_id, organisation_id)
     line = _one(
-        db.table("bank_statement_lines").select("*").eq("id", line_id).eq("organisation_id", organisation_id).limit(1).execute(),
+        db.table("bank_statement_lines")
+        .select("id, bank_account_id, bank_statement_upload_id")
+        .eq("id", line_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
         "Bank statement line not found",
     )
-    if line.get("posting_status") == "posted":
-        raise HTTPException(status_code=400, detail="Posted bank transactions must be unposted before redrafting")
-    if line.get("posting_status") == "draft" and line.get("gl_journal_id"):
-        journal = _one(
-            db.table("gl_journals").select("*").eq("id", line["gl_journal_id"]).eq("organisation_id", organisation_id).limit(1).execute(),
-            "Draft journal not found",
-        )
-        existing_lines = (
-            db.table("gl_journal_lines")
-            .select("*")
-            .eq("gl_journal_id", journal["id"])
-            .order("sort_order")
-            .execute()
-            .data
-            or []
-        )
-        return {"success": True, "journal": journal, "lines": journal_preview_lines(db, organisation_id, existing_lines)}
-    journal_id = new_uuid()
-    description = line.get("description") or "Bank transaction"
-    journal_lines = build_journal_rows_for_line(
-        db,
-        organisation_id=organisation_id,
-        line=line,
-        gl_account_id=str(payload.gl_account_id),
-        tracking=payload.tracking,
-        vat_rate=payload.vat_rate,
-        vat_account_id=str(payload.vat_account_id) if payload.vat_account_id else None,
-    )
-    total_debit = sum(money(row["debit_amount"]) for row in journal_lines)
-    total_credit = sum(money(row["credit_amount"]) for row in journal_lines)
-    journal = {
-        "id": journal_id,
-        "organisation_id": organisation_id,
-        "source_type": "bank_transaction",
-        "source_id": line_id,
-        "journal_date": line.get("line_date"),
-        "description": description,
-        "status": "draft",
-        "total_debit": dec_to_float(total_debit),
-        "total_credit": dec_to_float(total_credit),
-        "created_by": user_id,
-    }
-    db.table("gl_journals").insert(journal).execute()
-    db.table("gl_journal_lines").insert([{**row, "gl_journal_id": journal_id} for row in journal_lines]).execute()
-    db.table("bank_statement_lines").update({"posting_status": "draft", "gl_journal_id": journal_id}).eq("id", line_id).execute()
     log_bank_event(
         db,
         organisation_id=organisation_id,
-        event_type="bank_journal_drafted",
+        event_type="bank_line_deferred",
         actor_user_id=user_id,
         bank_account_id=line["bank_account_id"],
-        bank_statement_upload_id=line["bank_statement_upload_id"],
+        bank_statement_upload_id=line.get("bank_statement_upload_id"),
         bank_statement_line_id=line_id,
-        gl_journal_id=journal_id,
     )
-    return {"success": True, "journal": journal, "lines": journal_preview_lines(db, organisation_id, journal_lines)}
-
-
-@router.post("/journals/{journal_id}/post")
-def post_bank_journal(journal_id: str, payload: PostJournalRequest, auth: UserAuth):
-    user_id, db = _auth(auth)
-    organisation_id = str(payload.organisation_id)
-    ensure_org_write(user_id, organisation_id)
-    journal = _one(
-        db.table("gl_journals").select("*").eq("id", journal_id).eq("organisation_id", organisation_id).limit(1).execute(),
-        "Journal not found",
-    )
-    if journal.get("status") != "draft":
-        raise HTTPException(status_code=400, detail="Only draft journals can be posted")
-    journal_lines = (
-        db.table("gl_journal_lines")
-        .select("account_id, tracking, sort_order")
-        .eq("gl_journal_id", journal_id)
-        .order("sort_order")
-        .execute()
-        .data
-        or []
-    )
-    if journal.get("source_type") == "bank_transaction" and journal.get("source_id"):
-        source_line = _one(
-            db.table("bank_statement_lines")
-            .select("bank_account_id")
-            .eq("id", journal["source_id"])
-            .eq("organisation_id", organisation_id)
-            .limit(1)
-            .execute(),
-            "Bank statement line not found",
-        )
-        bank_account = _one(
-            db.table("bank_accounts")
-            .select("gl_account_id")
-            .eq("id", source_line["bank_account_id"])
-            .eq("organisation_id", organisation_id)
-            .limit(1)
-            .execute(),
-            "Bank account not found",
-        )
-        allocation_line = next(
-            (
-                line
-                for line in journal_lines
-                if str(line.get("account_id")) != str(bank_account.get("gl_account_id"))
-            ),
-            None,
-        )
-        try:
-            validate_bank_allocation_tracking(
-                tracking=(allocation_line or {}).get("tracking") or {},
-                required_dimensions=required_tracking_dimensions(
-                    db,
-                    organisation_id=organisation_id,
-                    module_key="bank_cash",
-                ),
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-    db.table("gl_journals").update({"status": "posted", "posted_by": user_id, "posted_at": now_iso()}).eq("id", journal_id).execute()
-    if journal.get("source_type") == "bank_transaction" and journal.get("source_id"):
-        db.table("bank_statement_lines").update({"posting_status": "posted"}).eq("id", journal["source_id"]).execute()
-    log_bank_event(db, organisation_id=organisation_id, event_type="bank_journal_posted", actor_user_id=user_id, gl_journal_id=journal_id)
     return {"success": True}
 
 
-@router.get("/journals/{journal_id}/lines")
-def list_bank_journal_lines(journal_id: str, organisation_id: str, auth: UserAuth):
-    user_id, db = _auth(auth)
-    ensure_org_read(user_id, organisation_id)
-    _one(
-        db.table("gl_journals").select("id").eq("id", journal_id).eq("organisation_id", organisation_id).limit(1).execute(),
-        "Journal not found",
-    )
-    rows = (
-        db.table("gl_journal_lines")
-        .select("*")
-        .eq("gl_journal_id", journal_id)
-        .order("sort_order")
-        .execute()
-        .data
-        or []
-    )
-    return {"success": True, "lines": journal_preview_lines(db, organisation_id, rows)}
-
-
-@router.post("/journals/{journal_id}/unpost")
-def unpost_bank_journal(journal_id: str, payload: PostJournalRequest, auth: UserAuth):
+@router.post("/lines/bulk-allocate")
+def bulk_allocate_bank_lines(payload: BulkAllocateRequest, auth: UserAuth):
+    """Atomically create balanced draft journals for selected bank lines."""
     user_id, db = _auth(auth)
     organisation_id = str(payload.organisation_id)
     ensure_org_write(user_id, organisation_id)
-    journal = _one(
-        db.table("gl_journals").select("*").eq("id", journal_id).eq("organisation_id", organisation_id).limit(1).execute(),
-        "Journal not found",
-    )
-    if journal.get("status") != "posted":
-        raise HTTPException(status_code=400, detail="Only posted journals can be unposted")
-    source_line_id = journal.get("source_id") if journal.get("source_type") == "bank_transaction" else None
-    if not source_line_id:
-        raise HTTPException(status_code=400, detail="Only bank transaction journals can be unposted here")
-    existing_reversal = (
-        db.table("gl_journals")
-        .select("id")
-        .eq("organisation_id", organisation_id)
-        .eq("reversal_of_journal_id", journal_id)
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
-    if existing_reversal:
-        raise HTTPException(status_code=400, detail="This journal has already been reversed")
-
-    original_lines = (
-        db.table("gl_journal_lines")
-        .select("*")
-        .eq("gl_journal_id", journal_id)
-        .order("sort_order")
-        .execute()
-        .data
-        or []
-    )
-    if not original_lines:
-        raise HTTPException(status_code=400, detail="Journal has no lines to reverse")
-
-    reversal_id = new_uuid()
-    description = f"Reversal: {journal.get('description') or 'Bank journal'}"
-    reversal_rows = reversal_lines_for_journal(original_lines, description=description)
-    total_debit = sum(money(row["debit_amount"]) for row in reversal_rows)
-    total_credit = sum(money(row["credit_amount"]) for row in reversal_rows)
-    reversal_journal = {
-        "id": reversal_id,
-        "organisation_id": organisation_id,
-        "source_type": "bank_transaction_reversal",
-        "source_id": source_line_id,
-        "reversal_of_journal_id": journal_id,
-        "journal_date": journal.get("journal_date"),
-        "description": description,
-        "status": "posted",
-        "total_debit": dec_to_float(total_debit),
-        "total_credit": dec_to_float(total_credit),
-        "created_by": user_id,
-        "posted_by": user_id,
-        "posted_at": now_iso(),
-    }
-    db.table("gl_journals").insert(reversal_journal).execute()
-    db.table("gl_journal_lines").insert([{**row, "gl_journal_id": reversal_id} for row in reversal_rows]).execute()
-    db.table("gl_journals").update({"status": "reversed", "reversed_by": user_id, "reversed_at": now_iso()}).eq("id", journal_id).execute()
-    db.table("bank_statement_lines").update({
-        "posting_status": "unposted",
-        "allocation_status": "unallocated",
-        "match_status": "unmatched",
-        "review_status": "pending",
-        "accepted_suggestion_id": None,
-        "accepted_rule_id": None,
-        "gl_journal_id": None,
-        "reviewed_by": None,
-        "reviewed_at": None,
-    }).eq("id", source_line_id).eq("organisation_id", organisation_id).execute()
-    log_bank_event(
-        db,
-        organisation_id=organisation_id,
-        event_type="bank_journal_unposted",
-        actor_user_id=user_id,
-        bank_statement_line_id=source_line_id,
-        gl_journal_id=journal_id,
-        reversal_journal_id=reversal_id,
-    )
-    return {
-        "success": True,
-        "journal": journal,
-        "reversal_journal": reversal_journal,
-        "lines": journal_preview_lines(db, organisation_id, reversal_rows),
-    }
+    items = [item.model_dump(mode="json") for item in payload.items]
+    try:
+        result = db.rpc(
+            "create_bank_draft_journals_atomic",
+            {
+                "p_org_id": organisation_id,
+                "p_items": items,
+                "p_actor_user_id": user_id,
+            },
+        ).execute()
+    except Exception as exc:
+        message, details = _database_error_parts(exc)
+        raise HTTPException(
+            status_code=400,
+            detail={"message": message, "details": details},
+        ) from exc
+    data = _rpc_data(result)
+    for item in data.get("items") or []:
+        item["lines"] = journal_preview_lines(
+            db,
+            organisation_id,
+            item.get("lines") or [],
+        )
+    return {"success": True, **data}

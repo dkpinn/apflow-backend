@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import logging
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -8,15 +9,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routers.reconciliation import router as reconciliation_router
 from app.db.supabase_client import get_supabase_client
 from app.routers import invoices
+from app.routers import invoices_gl
 from app.routers import organisations
 from app.routers import suppliers
+from app.routers import supplier_kyc
+from app.routers import supplier_branches
+from app.routers import supplier_allocation_rules
 from app.routers import themes
 from app.routers import consolidation
 from app.routers import webhooks
 from app.routers import channels
 from app.routers import admin_integrations
+from app.routers import admin_accounts
 from app.routers import integrations
 from app.routers import bank
+from app.routers import bank_journals
 from app.routers import bank_extraction_benchmark
 from app.routers import bank_extraction_admin
 from app.routers import reports
@@ -26,10 +33,7 @@ from app.routers import customers
 from app.routers import sales_invoices
 from app.routers import customer_receipts
 
-
-def _sweep_log(msg: str) -> None:
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    print(f"[{ts} SWEEP] {msg}")
+logger = logging.getLogger("apflow.sweep")
 
 
 def _rescue_pending_invoices(supabase_client) -> None:
@@ -44,7 +48,7 @@ def _rescue_pending_invoices(supabase_client) -> None:
     from app.services.audit_log import log_invoice_event
 
     sweep_start = datetime.now(timezone.utc)
-    _sweep_log("=== Sweep start ===")
+    logger.info("=== Sweep start ===")
 
     stale_reset    = 0
     orphans_reset  = 0
@@ -62,11 +66,11 @@ def _rescue_pending_invoices(supabase_client) -> None:
             .execute()
         ).data or []
         for row in stale:
-            _sweep_log(f"Resetting stale invoice {row['id']} (processing → pending)")
+            logger.info("Resetting stale invoice %s (processing → pending)", row["id"])
             safe_update_invoice_raw_status(supabase_client, invoice_raw_id=row["id"], parse_status="pending")
             stale_reset += 1
-    except Exception as exc:
-        _sweep_log(f"Error resetting stale processing items: {exc}")
+    except Exception:
+        logger.exception("Error resetting stale processing items")
 
     # Step 1b — detect 'queued' raw invoices with no active job (orphaned after server restart/job failure)
     try:
@@ -90,11 +94,11 @@ def _rescue_pending_invoices(supabase_client) -> None:
             }
             for row in queued_raw:
                 if row["id"] not in active_job_raw_ids:
-                    _sweep_log(f"Orphaned queued invoice {row['id']} (no active job) → resetting to pending")
+                    logger.info("Orphaned queued invoice %s (no active job) → resetting to pending", row["id"])
                     safe_update_invoice_raw_status(supabase_client, invoice_raw_id=row["id"], parse_status="pending")
                     stale_reset += 1
-    except Exception as exc:
-        _sweep_log(f"Error resetting orphaned queued items: {exc}")
+    except Exception:
+        logger.exception("Error resetting orphaned queued items")
 
     # Step 1c — detect 'completed' raw invoices with no extracted record and reset to 'pending'
     try:
@@ -133,10 +137,14 @@ def _rescue_pending_invoices(supabase_client) -> None:
                         .execute()
                     ).count or 0
                 except Exception:
+                    logger.debug("Could not count past jobs for invoice %s; assuming 0", raw_id)
                     past_jobs = 0
 
                 if past_jobs >= MAX_SWEEP_ATTEMPTS:
-                    _sweep_log(f"Giving up on orphaned invoice {raw_id} after {past_jobs} attempts → marking failed")
+                    logger.warning(
+                        "Giving up on orphaned invoice %s after %d attempts → marking failed",
+                        raw_id, past_jobs,
+                    )
                     safe_update_invoice_raw_status(
                         supabase_client,
                         invoice_raw_id=raw_id,
@@ -156,7 +164,10 @@ def _rescue_pending_invoices(supabase_client) -> None:
                     orphans_failed += 1
                     continue
 
-                _sweep_log(f"Orphaned invoice {raw_id} (completed, no extracted record, attempt {past_jobs + 1}/{MAX_SWEEP_ATTEMPTS}) → resetting to pending")
+                logger.info(
+                    "Orphaned invoice %s (completed, no extracted record, attempt %d/%d) → resetting to pending",
+                    raw_id, past_jobs + 1, MAX_SWEEP_ATTEMPTS,
+                )
                 safe_update_invoice_raw_status(
                     supabase_client,
                     invoice_raw_id=raw_id,
@@ -174,8 +185,8 @@ def _rescue_pending_invoices(supabase_client) -> None:
                         notes=f"Reset to pending by SWEEP (attempt {past_jobs + 1}/{MAX_SWEEP_ATTEMPTS}): completed status but no extracted record found.",
                     )
                 orphans_reset += 1
-    except Exception as exc:
-        _sweep_log(f"Error checking for orphaned completed invoices: {exc}")
+    except Exception:
+        logger.exception("Error checking for orphaned completed invoices")
 
     # Step 2 — find 'pending' items with no active job and queue them.
     # Collect orgs_to_drain here; do NOT return early — step 3 must always run.
@@ -242,13 +253,13 @@ def _rescue_pending_invoices(supabase_client) -> None:
                         actor_type="system",
                         notes="Queued by startup/periodic sweep.",
                     )
-                    _sweep_log(f"Queued invoice {raw_id}")
+                    logger.info("Queued invoice %s", raw_id)
                     newly_queued += 1
-                except Exception as exc:
-                    _sweep_log(f"Failed to queue {raw_id}: {exc}")
+                except Exception:
+                    logger.exception("Failed to queue invoice %s", raw_id)
 
-    except Exception as exc:
-        _sweep_log(f"Error finding pending items: {exc}")
+    except Exception:
+        logger.exception("Error finding pending items")
         # orgs_to_drain may be partial; fall through to step 3 anyway
 
     # Step 3 — augment orgs_to_drain with any org that already has queued jobs
@@ -265,22 +276,20 @@ def _rescue_pending_invoices(supabase_client) -> None:
         for row in pre_queued:
             if row.get("organisation_id"):
                 orgs_to_drain.add(row["organisation_id"])
-    except Exception as exc:
-        _sweep_log(f"Error fetching pre-queued orgs: {exc}")
+    except Exception:
+        logger.exception("Error fetching pre-queued orgs")
 
     # Step 3 — drain per-org (sequential; EXTRACT_WORKER_LOCK guards inside)
     for org_id in orgs_to_drain:
         try:
             invoices.run_extract_worker_until_empty(organisation_id=org_id)
-        except Exception as exc:
-            _sweep_log(f"Worker error for org {org_id}: {exc}")
+        except Exception:
+            logger.exception("Worker error for org %s", org_id)
 
     elapsed = (datetime.now(timezone.utc) - sweep_start).total_seconds()
-    _sweep_log(
-        f"Done in {elapsed:.2f}s — "
-        f"stale={stale_reset} orphans_reset={orphans_reset} "
-        f"orphans_failed={orphans_failed} queued={newly_queued} "
-        f"drain_orgs={len(orgs_to_drain)}"
+    logger.info(
+        "Done in %.2fs — stale=%d orphans_reset=%d orphans_failed=%d queued=%d drain_orgs=%d",
+        elapsed, stale_reset, orphans_reset, orphans_failed, newly_queued, len(orgs_to_drain),
     )
 
 
@@ -293,15 +302,15 @@ def _background_sweep_thread() -> None:
         if supabase_client is None:
             try:
                 supabase_client = get_supabase_client()
-            except Exception as exc:
-                _sweep_log(f"Cannot connect to Supabase, will retry next cycle: {exc}")
+            except Exception:
+                logger.exception("Cannot connect to Supabase, will retry next cycle")
                 time.sleep(60)
                 continue
 
         try:
             _rescue_pending_invoices(supabase_client)
-        except Exception as exc:
-            _sweep_log(f"THREAD ERROR: {exc}")
+        except Exception:
+            logger.exception("Unhandled sweep thread error — resetting Supabase client")
             # Reset client so the next cycle gets a fresh connection
             supabase_client = None
 
@@ -312,7 +321,7 @@ def _background_sweep_thread() -> None:
 async def lifespan(app: FastAPI):
     t = threading.Thread(target=_background_sweep_thread, daemon=True, name="invoice-sweep")
     t.start()
-    print("SWEEP: Background invoice rescue thread started")
+    logger.info("Background invoice rescue thread started")
     yield
 
 
@@ -345,15 +354,21 @@ app.add_middleware(
 
 app.include_router(reconciliation_router)
 app.include_router(invoices.router)
+app.include_router(invoices_gl.router)
 app.include_router(organisations.router)
 app.include_router(suppliers.router)
+app.include_router(supplier_kyc.router)
+app.include_router(supplier_branches.router)
+app.include_router(supplier_allocation_rules.router)
 app.include_router(themes.router)
 app.include_router(consolidation.router)
 app.include_router(webhooks.router)
 app.include_router(channels.router)
 app.include_router(admin_integrations.router)
+app.include_router(admin_accounts.router)
 app.include_router(integrations.router)
 app.include_router(bank.router)
+app.include_router(bank_journals.router)
 app.include_router(bank_extraction_benchmark.router)
 app.include_router(bank_extraction_admin.router)
 app.include_router(reports.router)
@@ -367,10 +382,3 @@ app.include_router(customer_receipts.router)
 @app.get("/")
 def root():
     return {"message": "APPayPal backend is running"}
-
-
-@app.get("/test-db")
-def test_db():
-    supabase = get_supabase_client()
-    data = supabase.table("suppliers").select("*").limit(2).execute()
-    return data.data

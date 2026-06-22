@@ -6,6 +6,7 @@ import re
 from typing import Optional
 
 from app.services.audit_log import log_invoice_event
+from app.services.money import numeric_amount
 from app.services.invoice_line_items import replace_invoice_line_items
 from app.services.invoice_parse_attempts import fetch_parse_attempts
 
@@ -31,30 +32,8 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _numeric_amount(value) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-
-    clean = str(value).strip()
-    if not clean:
-        return None
-
-    clean = clean.replace("R", "").replace("ZAR", "").replace(" ", "")
-    if "," in clean and "." not in clean:
-        clean = clean.replace(",", ".")
-    else:
-        clean = clean.replace(",", "")
-
-    try:
-        return float(clean)
-    except Exception:
-        return None
-
-
 def _round_money(value) -> Optional[float]:
-    numeric = _numeric_amount(value)
+    numeric = numeric_amount(value)
     if numeric is None:
         return None
     return round(numeric, 2)
@@ -69,7 +48,7 @@ def _document_scope(parsed_data: dict) -> str:
     if "credit" in document_type:
         return "credit_note"
     try:
-        total = _numeric_amount(parsed_data.get("total_amount"))
+        total = numeric_amount(parsed_data.get("total_amount"))
         if total is not None and total < 0:
             return "credit_note"
     except Exception:
@@ -151,7 +130,7 @@ def _normalise_rule_splits(rule: dict) -> list[dict]:
     for index, split in enumerate(splits):
         if not isinstance(split, dict):
             continue
-        percent = _numeric_amount(split.get("percent"))
+        percent = numeric_amount(split.get("percent"))
         if percent is None or percent <= 0:
             continue
         normalised.append({
@@ -245,7 +224,7 @@ def _sum_line_totals(line_items: list[dict]) -> Optional[float]:
     total = 0.0
     found = False
     for item in line_items or []:
-        line_total = _numeric_amount(item.get("line_total"))
+        line_total = numeric_amount(item.get("line_total"))
         if line_total is None:
             continue
         total += line_total
@@ -258,20 +237,20 @@ def _strip_vat_from_line_item(item: dict, vat_rate: float) -> dict:
     if divisor <= 0:
         return item
 
-    quantity = _numeric_amount(item.get("quantity")) or 1
-    unit_price = _round_money((_numeric_amount(item.get("unit_price")) or 0) / divisor) if item.get("unit_price") is not None else None
+    quantity = numeric_amount(item.get("quantity")) or 1
+    unit_price = _round_money((numeric_amount(item.get("unit_price")) or 0) / divisor) if item.get("unit_price") is not None else None
     discounted_unit_price = (
-        _round_money((_numeric_amount(item.get("discounted_unit_price")) or 0) / divisor)
+        _round_money((numeric_amount(item.get("discounted_unit_price")) or 0) / divisor)
         if item.get("discounted_unit_price") is not None
         else None
     )
     discount_amount = (
-        _round_money((_numeric_amount(item.get("discount_amount") or item.get("discount")) or 0) / divisor)
+        _round_money((numeric_amount(item.get("discount_amount") or item.get("discount")) or 0) / divisor)
         if item.get("discount_amount") is not None or item.get("discount") is not None
         else None
     )
     line_total = (
-        _round_money((_numeric_amount(item.get("line_total")) or 0) / divisor)
+        _round_money((numeric_amount(item.get("line_total")) or 0) / divisor)
         if item.get("line_total") is not None
         else None
     )
@@ -413,10 +392,10 @@ def apply_supplier_processing_rules(
             "line_total": total,
         }]
     elif line_items_include_vat and line_items:
-        subtotal = _numeric_amount(parsed_data.get("subtotal"))
-        tax_amount = _numeric_amount(parsed_data.get("tax_amount"))
-        total_amount = _numeric_amount(parsed_data.get("total_amount"))
-        default_vat_rate = _numeric_amount(settings.get("default_vat_rate"))
+        subtotal = numeric_amount(parsed_data.get("subtotal"))
+        tax_amount = numeric_amount(parsed_data.get("tax_amount"))
+        total_amount = numeric_amount(parsed_data.get("total_amount"))
+        default_vat_rate = numeric_amount(settings.get("default_vat_rate"))
 
         if tax_amount is not None and subtotal and subtotal > 0:
             vat_rate = round((tax_amount / subtotal) * 10000) / 10000
@@ -560,13 +539,13 @@ def _looks_like_generated_summary_line(line_items: list[dict], invoice: dict) ->
     if not description.startswith("purchase from "):
         return False
 
-    quantity = _numeric_amount(item.get("quantity"))
+    quantity = numeric_amount(item.get("quantity"))
     if quantity is not None and quantity != 1:
         return False
 
-    line_total = _numeric_amount(item.get("line_total"))
-    invoice_total = _numeric_amount(invoice.get("total_amount"))
-    subtotal = _numeric_amount(invoice.get("subtotal"))
+    line_total = numeric_amount(item.get("line_total"))
+    invoice_total = numeric_amount(invoice.get("total_amount"))
+    subtotal = numeric_amount(invoice.get("subtotal"))
     expected_total = subtotal if subtotal is not None else invoice_total
     if line_total is None or expected_total is None:
         return True

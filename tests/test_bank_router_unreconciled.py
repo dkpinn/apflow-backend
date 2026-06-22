@@ -17,6 +17,7 @@ class _Query:
         self.filters = []
         self.in_filters = []
         self._limit = None
+        self.orders = []
 
     def select(self, *_args, **_kwargs):
         return self
@@ -33,12 +34,18 @@ class _Query:
         self._limit = value
         return self
 
+    def order(self, field, desc=False):
+        self.orders.append((field, desc))
+        return self
+
     def execute(self):
         rows = self.rows
         for field, value in self.filters:
             rows = [row for row in rows if row.get(field) == value]
         for field, values in self.in_filters:
             rows = [row for row in rows if row.get(field) in values]
+        for field, desc in reversed(self.orders):
+            rows = sorted(rows, key=lambda row: row.get(field) or 0, reverse=desc)
         if self._limit is not None:
             rows = rows[: self._limit]
         return _Response(rows)
@@ -69,6 +76,9 @@ def test_unreconciled_helper_includes_any_incomplete_status():
     )
     assert bank.is_unreconciled_bank_line(
         {"posting_status": "posted", "allocation_status": "allocated", "review_status": "pending"}
+    )
+    assert not bank.is_unreconciled_bank_line(
+        {"posting_status": "posted", "allocation_status": "split", "review_status": "reviewed"}
     )
 
 
@@ -133,6 +143,26 @@ def test_account_unreconciled_endpoint_filters_org_account_status_and_enriches_u
                 {"id": "upload-1", "organisation_id": "org-1", "bank_account_id": "bank-1", "original_filename": "april.pdf", "uploaded_at": "2026-05-31T12:00:00Z"},
                 {"id": "upload-2", "organisation_id": "org-1", "bank_account_id": "bank-1", "original_filename": "may.pdf", "uploaded_at": "2026-05-31T13:00:00Z"},
             ],
+            "bank_transaction_suggestions": [
+                {
+                    "id": "suggestion-low",
+                    "organisation_id": "org-1",
+                    "bank_statement_line_id": "pending",
+                    "confidence_score": 0.71,
+                    "suggested_account_id": "account-low",
+                    "suggested_tax_treatment": "blocked",
+                    "status": "open",
+                },
+                {
+                    "id": "suggestion-high",
+                    "organisation_id": "org-1",
+                    "bank_statement_line_id": "pending",
+                    "confidence_score": 0.96,
+                    "suggested_account_id": "account-high",
+                    "suggested_tax_treatment": "full",
+                    "status": "open",
+                },
+            ],
         }
     )
     calls = []
@@ -144,7 +174,12 @@ def test_account_unreconciled_endpoint_filters_org_account_status_and_enriches_u
     assert result["account"]["name"] == "Cheque Account"
     assert [line["id"] for line in result["lines"]] == ["draft", "pending"]
     assert result["lines"][0]["upload_original_filename"] == "april.pdf"
+    assert result["lines"][0]["recon_confidence"] == 0.5
+    assert result["lines"][0]["recon_suggested_account_id"] is None
     assert result["lines"][1]["upload_uploaded_at"] == "2026-05-31T13:00:00Z"
+    assert result["lines"][1]["recon_confidence"] == 0.96
+    assert result["lines"][1]["recon_suggested_account_id"] == "account-high"
+    assert result["lines"][1]["recon_suggested_tax"] == "full"
 
 
 def test_account_unreconciled_endpoint_rejects_account_from_other_org(monkeypatch):
@@ -290,3 +325,107 @@ def test_c19_migration_contains_atomic_guards_and_draft_cleanup():
     assert "journal.status = 'draft'" in migration
     assert "refresh_bank_account_statement_state" in migration
     assert "get_bank_account_balance_summary" in migration
+
+
+def test_skip_is_audited_without_changing_review_status(monkeypatch):
+    db = _DB({
+        "bank_statement_lines": [{
+            "id": "33333333-3333-3333-3333-333333333333",
+            "organisation_id": "22222222-2222-2222-2222-222222222222",
+            "bank_account_id": "55555555-5555-5555-5555-555555555555",
+            "bank_statement_upload_id": "66666666-6666-6666-6666-666666666666",
+            "review_status": "pending",
+        }],
+    })
+    _patch_write_auth(monkeypatch, db)
+    events = []
+    monkeypatch.setattr(bank, "log_bank_event", lambda _db, **details: events.append(details))
+
+    result = bank.skip_bank_line(
+        "33333333-3333-3333-3333-333333333333",
+        bank.LineSkipRequest(organisation_id="22222222-2222-2222-2222-222222222222"),
+        auth=("user", None),
+    )
+
+    assert result == {"success": True}
+    assert db.tables["bank_statement_lines"][0]["review_status"] == "pending"
+    assert events[0]["event_type"] == "bank_line_deferred"
+
+
+def test_bulk_allocate_calls_atomic_draft_rpc_with_split_vat_payload(monkeypatch):
+    db = _RpcDB(rpc_result=[{
+        "created_count": 1,
+        "items": [{"line_id": "33333333-3333-3333-3333-333333333333", "journal_id": "journal-1", "lines": []}],
+    }])
+    _patch_write_auth(monkeypatch, db)
+    payload = bank.BulkAllocateRequest(
+        organisation_id="22222222-2222-2222-2222-222222222222",
+        items=[{
+            "line_id": "33333333-3333-3333-3333-333333333333",
+            "allocations": [
+                {
+                    "account_id": "44444444-4444-4444-4444-444444444444",
+                    "gross_amount": 115,
+                    "tracking": {},
+                    "vat_treatment": "full",
+                    "vat_rate": 15,
+                },
+                {
+                    "account_id": "55555555-5555-5555-5555-555555555555",
+                    "gross_amount": 25,
+                    "tracking": {},
+                    "vat_treatment": "blocked",
+                },
+            ],
+        }],
+    )
+
+    result = bank.bulk_allocate_bank_lines(payload, auth=("user", None))
+
+    assert result["success"] is True
+    assert result["created_count"] == 1
+    rpc_name, params = db.rpc_calls[0]
+    assert rpc_name == "create_bank_draft_journals_atomic"
+    assert params["p_actor_user_id"] == "11111111-1111-1111-1111-111111111111"
+    assert params["p_items"][0]["allocations"][0]["vat_treatment"] == "full"
+    assert params["p_items"][0]["allocations"][1]["vat_treatment"] == "blocked"
+
+
+def test_bulk_allocate_surfaces_atomic_rpc_failure(monkeypatch):
+    db = _RpcDB(rpc_error=Exception({"message": "Allocations do not balance", "details": None}))
+    _patch_write_auth(monkeypatch, db)
+    payload = bank.BulkAllocateRequest(
+        organisation_id="22222222-2222-2222-2222-222222222222",
+        items=[{
+            "line_id": "33333333-3333-3333-3333-333333333333",
+            "allocations": [{
+                "account_id": "44444444-4444-4444-4444-444444444444",
+                "gross_amount": 99,
+            }],
+        }],
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        bank.bulk_allocate_bank_lines(payload, auth=("user", None))
+
+    assert exc.value.status_code == 400
+    assert "Allocations do not balance" in exc.value.detail["message"]
+
+
+def test_c21_bulk_draft_migration_enforces_atomic_accounting_guards():
+    migration = (
+        Path(__file__).parents[1]
+        / "app"
+        / "db"
+        / "applied"
+        / "bank_bulk_draft_hardening_phase_c21.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "create_bank_draft_journals_atomic" in migration
+    assert "FOR UPDATE" in migration
+    assert "abs(allocation_total - journal_total) > 0.02" in migration
+    assert "account.vat_treatment" in migration
+    assert "nullif(trim(org.vat_number), '') IS NOT NULL" in migration
+    assert "account.system_key = 'vat_control'" in migration
+    assert "Generated journal for bank statement line % is not balanced" in migration
+    assert "REVOKE ALL ON FUNCTION" in migration

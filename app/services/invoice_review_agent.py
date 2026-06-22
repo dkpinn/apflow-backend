@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from app.services.organisation_module_settings import missing_tracking_dimensions
+from app.services.money import numeric_amount
 
 
 SUGGESTION_STATUSES = {"open", "applied", "dismissed", "checked"}
@@ -75,25 +76,6 @@ def has_value(value: Any) -> bool:
     if isinstance(value, (list, dict)):
         return bool(value)
     return True
-
-
-def money(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return round(float(value), 2)
-    clean = str(value).strip()
-    if not clean:
-        return None
-    clean = clean.replace("R", "").replace("ZAR", "").replace(" ", "")
-    if "," in clean and "." not in clean:
-        clean = clean.replace(",", ".")
-    else:
-        clean = clean.replace(",", "")
-    try:
-        return round(float(clean), 2)
-    except Exception:
-        return None
 
 
 def compact_string(value: Any) -> str:
@@ -254,7 +236,7 @@ def _supplier_identity_suggestions(
             target={"tab": "supplier", "section": "supplier_master"},
         ))
 
-    tax_amount = money(invoice.get("tax_amount"))
+    tax_amount = numeric_amount(invoice.get("tax_amount"))
     branches = supplier_branches or []
     matched_branch = supplier_branch or find_branch_match(invoice, branches)
     vat_value = branch_value(matched_branch, supplier, "vat_number") or invoice.get("vat_number_extracted")
@@ -499,8 +481,8 @@ def _allocation_suggestions(line_items: list[dict]) -> list[AgentSuggestion]:
         allocations = item.get("allocations") or []
         if not allocations:
             continue
-        line_total = money(item.get("line_total") if item.get("line_total") is not None else item.get("amount"))
-        allocation_total = round(sum(money(row.get("amount")) or 0 for row in allocations), 2)
+        line_total = numeric_amount(item.get("line_total") if item.get("line_total") is not None else item.get("amount"))
+        allocation_total = round(sum(numeric_amount(row.get("amount")) or 0 for row in allocations), 2)
         if line_total is None:
             suggestions.append(AgentSuggestion(
                 category="allocation_splits",
@@ -524,9 +506,9 @@ def _allocation_suggestions(line_items: list[dict]) -> list[AgentSuggestion]:
 
 def _total_suggestions(invoice: dict, line_items: list[dict]) -> list[AgentSuggestion]:
     suggestions: list[AgentSuggestion] = []
-    subtotal = money(invoice.get("subtotal"))
-    tax = money(invoice.get("tax_amount")) or 0.0
-    total = money(invoice.get("total_amount"))
+    subtotal = numeric_amount(invoice.get("subtotal"))
+    tax = numeric_amount(invoice.get("tax_amount")) or 0.0
+    total = numeric_amount(invoice.get("total_amount"))
 
     if subtotal is not None and total is not None:
         expected = round(subtotal + tax, 2)
@@ -541,7 +523,7 @@ def _total_suggestions(invoice: dict, line_items: list[dict]) -> list[AgentSugge
             ))
 
     if line_items and subtotal is not None:
-        line_total = round(sum(money(item.get("line_total") if item.get("line_total") is not None else item.get("amount")) or 0 for item in line_items), 2)
+        line_total = round(sum(numeric_amount(item.get("line_total") if item.get("line_total") is not None else item.get("amount")) or 0 for item in line_items), 2)
         if abs(line_total - subtotal) > 0.02:
             suggestions.append(AgentSuggestion(
                 category="totals",

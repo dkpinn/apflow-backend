@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
 import re
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Optional
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 from app.services.bank_statement_extraction import (
     MONEY_ZERO,
@@ -51,6 +55,7 @@ def detect_line_duplicates(
             )
             existing_hashes = {row["transaction_hash"] for row in (res.data or [])}
         except Exception:
+            logger.exception("detect_line_duplicates DB query failed for org=%s", organisation_id)
             existing_hashes = set()
 
     seen: set[str] = set()
@@ -151,8 +156,16 @@ def score_invoice_suggestions(
         for key in ["reference", "bank_reference", "counterparty", "description", "raw_text"]
     ).lower()
     if signed_amount >= 0:
+        _date_floor: str | None = None
+        _line_date_str = line.get("line_date")
+        if _line_date_str:
+            try:
+                _ld = date.fromisoformat(str(_line_date_str)[:10])
+                _date_floor = (_ld - timedelta(days=180)).isoformat()
+            except (ValueError, TypeError):
+                pass
         try:
-            invoices = (
+            _q = (
                 db.table("sales_invoices")
                 .select(
                     "id, invoice_number, customer_id, total_amount, amount_outstanding, "
@@ -161,11 +174,10 @@ def score_invoice_suggestions(
                 .eq("organisation_id", organisation_id)
                 .eq("document_type", "invoice")
                 .eq("status", "issued")
-                .limit(500)
-                .execute()
-                .data
-                or []
             )
+            if _date_floor:
+                _q = _q.gte("issue_date", _date_floor)
+            invoices = _q.limit(1000).execute().data or []
             receivables = (
                 db.table("accounts")
                 .select("id")
@@ -178,6 +190,7 @@ def score_invoice_suggestions(
             )
             receivables_id = receivables[0].get("id") if receivables else None
         except Exception:
+            logger.exception("score_invoice_suggestions receivables query failed for org=%s", organisation_id)
             return []
 
         suggestions: list[dict[str, Any]] = []
@@ -229,17 +242,25 @@ def score_invoice_suggestions(
         suggestions.sort(key=lambda suggestion: suggestion["confidence_score"], reverse=True)
         return suggestions[:limit]
 
+    _date_floor_s: str | None = None
+    _line_date_str_s = line.get("line_date")
+    if _line_date_str_s:
+        try:
+            _ld_s = date.fromisoformat(str(_line_date_str_s)[:10])
+            _date_floor_s = (_ld_s - timedelta(days=180)).isoformat()
+        except (ValueError, TypeError):
+            pass
     try:
-        invoices = (
+        _sq = (
             db.table("invoices_extracted")
             .select("id, invoice_number, supplier_name, supplier_id, total_amount, invoice_date, review_status, approval_status")
             .eq("organisation_id", organisation_id)
-            .limit(500)
-            .execute()
-            .data
-            or []
         )
+        if _date_floor_s:
+            _sq = _sq.gte("invoice_date", _date_floor_s)
+        invoices = _sq.limit(1000).execute().data or []
     except Exception:
+        logger.exception("score_invoice_suggestions supplier query failed for org=%s", organisation_id)
         return []
 
     suggestions: list[dict[str, Any]] = []
@@ -375,6 +396,7 @@ def score_rule_suggestions(
             or []
         )
     except Exception:
+        logger.exception("score_rule_suggestions DB query failed for org=%s", organisation_id)
         return []
 
     fields = bank_rule_search_fields(line)

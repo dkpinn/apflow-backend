@@ -3,6 +3,8 @@ from __future__ import annotations
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
+from app.services.money import money
+
 
 REPORTING_STANDARDS = {"ifrs", "us_gaap", "uk_gaap_frs_102", "aspe"}
 PRESENTATIONS = {"function", "nature"}
@@ -40,15 +42,6 @@ FUNCTION_LABELS = {
     "r_and_d": "Research and development expenses",
     "other_operating": "Other operating expenses",
 }
-
-
-def money(value: Any) -> Decimal:
-    if value in (None, ""):
-        return Decimal("0.00")
-    try:
-        return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    except Exception:
-        return Decimal("0.00")
 
 
 def amount_out(value: Decimal) -> float:

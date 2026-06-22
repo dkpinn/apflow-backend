@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from uuid import UUID
-from typing import Optional
+from typing import Literal, Optional
 
 
 class ReconciliationOptions(BaseModel):
@@ -41,3 +41,25 @@ class RunReconciliationResponse(BaseModel):
     status: str
     summary: ReconciliationSummary
     lines: list[ReconciliationLineResult]
+
+
+class LineSkipRequest(BaseModel):
+    organisation_id: UUID
+
+
+class BankDraftAllocation(BaseModel):
+    account_id: UUID
+    gross_amount: float = Field(gt=0)
+    tracking: dict[str, str] = Field(default_factory=dict)
+    vat_treatment: Optional[Literal["full", "blocked", "exempt", "zero_rated"]] = None
+    vat_rate: Optional[float] = Field(default=None, ge=0, le=100)
+
+
+class BankBulkDraftItem(BaseModel):
+    line_id: UUID
+    allocations: list[BankDraftAllocation] = Field(min_length=1)
+
+
+class BulkAllocateRequest(BaseModel):
+    organisation_id: UUID
+    items: list[BankBulkDraftItem] = Field(min_length=1)

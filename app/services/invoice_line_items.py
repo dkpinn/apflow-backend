@@ -2,27 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-
-def _numeric_amount(value) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-
-    clean = str(value).strip()
-    if not clean:
-        return None
-
-    clean = clean.replace("R", "").replace("ZAR", "").replace(" ", "")
-    if "," in clean and "." not in clean:
-        clean = clean.replace(",", ".")
-    else:
-        clean = clean.replace(",", "")
-
-    try:
-        return float(clean)
-    except Exception:
-        return None
+from app.services.money import numeric_amount
 
 
 def build_line_item_diagnostics(
@@ -36,13 +16,13 @@ def build_line_item_diagnostics(
     total_seen = False
 
     for item in line_items or []:
-        line_total = _numeric_amount(item.get("line_total"))
+        line_total = numeric_amount(item.get("line_total"))
         if line_total is None:
             continue
         total_seen = True
         line_items_total += line_total
 
-    parsed_invoice_total = _numeric_amount(invoice_total)
+    parsed_invoice_total = numeric_amount(invoice_total)
     rounded_line_total = round(line_items_total, 2) if total_seen else None
     totals_match = None
     if rounded_line_total is not None and parsed_invoice_total is not None:
@@ -95,7 +75,7 @@ def build_line_item_payload(
 
 
 def _round_money(value) -> Optional[float]:
-    numeric = _numeric_amount(value)
+    numeric = numeric_amount(value)
     if numeric is None:
         return None
     return round(numeric, 2)

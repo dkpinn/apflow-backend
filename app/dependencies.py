@@ -3,8 +3,11 @@ Shared FastAPI dependencies for authenticated routes.
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Annotated, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 import jwt
 from cachetools import TTLCache
@@ -122,6 +125,7 @@ def org_role_for_user(user_id: str, organisation_id: Optional[str]) -> Optional[
         row = res.data[0] if res.data else None
         role = row.get("role") if row else None
     except Exception:
+        logger.exception("org_role_for_user failed for user=%s org=%s", user_id, organisation_id)
         return None
     _org_role_cache[cache_key] = role
     return role
@@ -208,6 +212,7 @@ def is_platform_owner(user_id: str) -> bool:
         )
         return bool(res.data)
     except Exception:
+        logger.exception("is_platform_owner check failed for user=%s", user_id)
         return False
 
 
