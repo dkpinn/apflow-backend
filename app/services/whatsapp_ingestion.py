@@ -22,11 +22,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 import httpx
 
@@ -189,9 +192,9 @@ def send_whatsapp_text(
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             resp.raise_for_status()
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         # Replies are best-effort — log but don't fail the webhook handler
-        print(f"[WhatsApp] Failed to send reply to {to_wa_id}: {exc}")
+        logger.exception("[WhatsApp] Failed to send reply to %s", to_wa_id)
 
 
 def download_whatsapp_media(

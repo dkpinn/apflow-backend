@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
 
 from app.services.integration_secrets import (
     decrypt_secret,
@@ -63,8 +66,8 @@ def _insert_audit(
     }
     try:
         db.table(AUDIT_TABLE).insert(payload).execute()
-    except Exception as exc:  # pragma: no cover - audit must not break config management
-        print("INTEGRATION AUDIT INSERT FAILED:", str(exc), payload)
+    except Exception:  # pragma: no cover - audit must not break config management
+        logger.exception("integration audit insert failed: %s", payload)
 
 
 def _build_integration_payload(payload: dict, *, existing: Optional[dict] = None) -> dict:

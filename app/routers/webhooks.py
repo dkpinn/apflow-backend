@@ -15,8 +15,11 @@ Current channels
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import PlainTextResponse
@@ -248,7 +251,7 @@ def whatsapp_verify(request: Request) -> str:
     hub_challenge = request.query_params.get("hub.challenge", "")
     expected_token = os.environ.get("META_WEBHOOK_VERIFY_TOKEN", "")
 
-    print(f"[WhatsApp] Verify challenge: mode={hub_mode!r} match={hub_verify_token == expected_token}")
+    logger.debug("[WhatsApp] Verify challenge: mode=%r match=%s", hub_mode, hub_verify_token == expected_token)
 
     if hub_mode == "subscribe" and hub_verify_token == expected_token and expected_token:
         return hub_challenge
@@ -376,8 +379,8 @@ async def _handle_whatsapp_message(
                         return True
                     else:
                         reply("Sorry, that file type isn't supported. Please send a PDF or photo.")
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[WhatsApp] Media download/ingest failed: {exc}")
+                except Exception:  # noqa: BLE001
+                    logger.exception("[WhatsApp] Media download/ingest failed")
                     reply("Sorry, I couldn't process that file. Please try again.")
             else:
                 reply(
@@ -451,8 +454,8 @@ async def _handle_whatsapp_message(
                 return True
             else:
                 reply("Sorry, that file type isn't supported. Please send a PDF or photo.")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[WhatsApp] Media download/ingest failed: {exc}")
+        except Exception:  # noqa: BLE001
+            logger.exception("[WhatsApp] Media download/ingest failed")
             reply("Sorry, I couldn't process that file. Please try again.")
         return False
 

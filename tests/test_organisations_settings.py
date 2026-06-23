@@ -60,42 +60,48 @@ if "fastapi" not in sys.modules:
 
 from fastapi import HTTPException
 
-if "app.services.invoice_extraction_service._helpers" not in sys.modules:
-    helpers_mod = types.ModuleType("app.services.invoice_extraction_service._helpers")
+# Always reinstall the stub so these tests are order-independent — if another
+# test module (e.g. test_invoices_queue.py) imports the real _helpers first,
+# the `if "..." not in sys.modules` guard would skip stub installation and the
+# tests would call the real DB-backed function instead of the stub.
+helpers_mod = types.ModuleType("app.services.invoice_extraction_service._helpers")
 
-    def get_organisation_extraction_settings(organisation_id: str):
-        row = next(
-            (org for org in helpers_mod.organisation_rows if org.get("id") == organisation_id),
-            None,
-        )
-        return {
-            "extraction_strategy": row.get("extraction_strategy") if row else "auto_group",
-            "ask_per_upload": bool(row.get("ask_per_upload")) if row else False,
-            "vlm_enabled": bool(row.get("vlm_enabled")) if row else False,
-            "supplier_auto_link_min_matches": int(row.get("supplier_auto_link_min_matches", 2)) if row else 2,
-            "auto_link_amount_tiers": row.get("auto_link_amount_tiers", []) if row else [],
-            "reporting_standard": row.get("reporting_standard") if row else "ifrs",
-            "income_statement_presentation": (
-                "function"
-                if row and row.get("reporting_standard") == "us_gaap"
-                else row.get("income_statement_presentation") if row else "function"
-            ),
-        }
 
-    def update_organisation_extraction_settings(organisation_id: str, updates: dict):
-        row = next(
-            (org for org in helpers_mod.organisation_rows if org.get("id") == organisation_id),
-            None,
-        )
-        if not row:
-            raise ValueError("Organisation not found")
-        row.update(updates)
-        return get_organisation_extraction_settings(organisation_id)
+def get_organisation_extraction_settings(organisation_id: str):
+    row = next(
+        (org for org in helpers_mod.organisation_rows if org.get("id") == organisation_id),
+        None,
+    )
+    return {
+        "extraction_strategy": row.get("extraction_strategy") if row else "auto_group",
+        "ask_per_upload": bool(row.get("ask_per_upload")) if row else False,
+        "vlm_enabled": bool(row.get("vlm_enabled")) if row else False,
+        "supplier_auto_link_min_matches": int(row.get("supplier_auto_link_min_matches", 2)) if row else 2,
+        "auto_link_amount_tiers": row.get("auto_link_amount_tiers", []) if row else [],
+        "reporting_standard": row.get("reporting_standard") if row else "ifrs",
+        "income_statement_presentation": (
+            "function"
+            if row and row.get("reporting_standard") == "us_gaap"
+            else row.get("income_statement_presentation") if row else "function"
+        ),
+    }
 
-    helpers_mod.organisation_rows = []
-    helpers_mod.get_organisation_extraction_settings = get_organisation_extraction_settings
-    helpers_mod.update_organisation_extraction_settings = update_organisation_extraction_settings
-    sys.modules["app.services.invoice_extraction_service._helpers"] = helpers_mod
+
+def update_organisation_extraction_settings(organisation_id: str, updates: dict):
+    row = next(
+        (org for org in helpers_mod.organisation_rows if org.get("id") == organisation_id),
+        None,
+    )
+    if not row:
+        raise ValueError("Organisation not found")
+    row.update(updates)
+    return get_organisation_extraction_settings(organisation_id)
+
+
+helpers_mod.organisation_rows = []
+helpers_mod.get_organisation_extraction_settings = get_organisation_extraction_settings
+helpers_mod.update_organisation_extraction_settings = update_organisation_extraction_settings
+sys.modules["app.services.invoice_extraction_service._helpers"] = helpers_mod
 
 from app.routers.organisations import (
     get_organisation_settings,
@@ -104,6 +110,10 @@ from app.routers.organisations import (
     router as organisations_router,
 )
 organisations_module = importlib.import_module("app.routers.organisations")
+# Patch function references in the already-imported module so it uses the stub
+# even if the real _helpers was loaded before this file was collected.
+organisations_module.get_organisation_extraction_settings = helpers_mod.get_organisation_extraction_settings
+organisations_module.update_organisation_extraction_settings = helpers_mod.update_organisation_extraction_settings
 
 
 class _FakeQuery:

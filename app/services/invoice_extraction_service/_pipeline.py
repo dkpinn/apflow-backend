@@ -8,9 +8,12 @@ Group G from the original invoice_extraction_service.py:
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
 
 from app.db.supabase_client import get_supabase_client
 from app.services.audit_log import log_invoice_event
@@ -152,7 +155,10 @@ def run_invoice_extraction(
     job_id: Optional[str] = None,
     extraction_strategy: Optional[str] = None,
 ) -> dict:
-    print("RUN INVOICE EXTRACTION:", {"invoice_raw_id": invoice_raw_id, "organisation_id": organisation_id, "job_id": job_id})
+    logger.info(
+        "RUN INVOICE EXTRACTION: invoice_raw_id=%s organisation_id=%s job_id=%s",
+        invoice_raw_id, organisation_id, job_id,
+    )
 
     raw = get_raw_invoice(invoice_raw_id)
     org_id = organisation_id or raw.get("organisation_id")
@@ -318,8 +324,8 @@ def run_invoice_extraction(
                 strategy=strategy,
                 total_pages=page_count,
             )
-        except Exception as _grouping_exc:
-            print(f"GROUPING METADATA UPDATE FAILED (non-fatal): {_grouping_exc}")
+        except Exception:
+            logger.warning("GROUPING METADATA UPDATE FAILED (non-fatal)", exc_info=True)
 
         if page_count > 1 or strategy != "auto_group":
             try:
@@ -330,8 +336,8 @@ def run_invoice_extraction(
                     supplier_detected=parsed_data.get("supplier_name_extracted"),
                     confidence=parsed_data.get("confidence_score"),
                 )
-            except Exception as _page_group_exc:
-                print(f"PERSIST PAGE GROUP FAILED (non-fatal): {_page_group_exc}")
+            except Exception:
+                logger.warning("PERSIST PAGE GROUP FAILED (non-fatal)", exc_info=True)
 
         # Fetch org early — needed to detect when Tesseract picked up the org's own name
         # as the supplier (a common AP error when the customer block appears before the issuer).
@@ -744,7 +750,7 @@ def run_invoice_extraction(
     extracted_payload.update(supplier_rule_result["invoice_patch"])
     line_items = supplier_rule_result["line_items"]
 
-    print("EXTRACTED PAYLOAD TO SAVE:", extracted_payload)
+    logger.debug("EXTRACTED PAYLOAD TO SAVE: %s", extracted_payload)
 
     if job_id:
         mark_job_stage(supabase, job_id=job_id, stage="save_extracted_invoice")
@@ -769,7 +775,7 @@ def run_invoice_extraction(
             .eq("id", extracted_invoice_id)
             .execute()
         )
-        print("UPDATED INVOICES_EXTRACTED:", update_res.data)
+        logger.debug("UPDATED INVOICES_EXTRACTED: %s", update_res.data)
 
         log_invoice_event(
             supabase,
@@ -787,7 +793,7 @@ def run_invoice_extraction(
     else:
         insert_res = supabase.table("invoices_extracted").insert(extracted_payload).execute()
         extracted_invoice_id = insert_res.data[0]["id"] if insert_res.data else None
-        print("INSERTED INVOICES_EXTRACTED:", insert_res.data)
+        logger.debug("INSERTED INVOICES_EXTRACTED: %s", insert_res.data)
 
         log_invoice_event(
             supabase,
@@ -855,7 +861,7 @@ def run_invoice_extraction(
             )
 
         if line_items:
-            print("INSERTED LINE ITEMS:", line_item_diagnostics)
+            logger.debug("INSERTED LINE ITEMS: %s", line_item_diagnostics)
 
             log_invoice_event(
                 supabase,
@@ -869,7 +875,7 @@ def run_invoice_extraction(
                 new_value=line_item_diagnostics,
             )
         else:
-            print("NO LINE ITEMS EXTRACTED")
+            logger.info("NO LINE ITEMS EXTRACTED")
             log_invoice_event(
                 supabase,
                 organisation_id=org_id,
@@ -968,8 +974,8 @@ def run_invoice_extraction(
                             else f"STP skipped: {stp_result.get('reason')}"
                         ),
                     )
-                except Exception as audit_exc:
-                    print(f"STP AUDIT LOG FAILED (non-fatal): {audit_exc}")
+                except Exception:
+                    logger.exception("STP AUDIT LOG FAILED (non-fatal)")
 
     _doc_count = parsed_data.get("document_count") or 1
     _final_status = "needs_split" if _doc_count > 1 else "completed"
@@ -1053,5 +1059,5 @@ def run_invoice_extraction(
         },
     }
 
-    print("EXTRACT RESPONSE:", response)
+    logger.debug("EXTRACT RESPONSE: %s", response)
     return response

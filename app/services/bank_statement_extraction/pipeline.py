@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 from app.services.extraction_foundation import extraction_metadata
 from app.services.extractor_registry import select_bank_cash_extractor
@@ -89,7 +92,7 @@ def extract_statement(
             currency=currency,
         )
         if not lines:
-            print("[EXTRACT] Text parser found no lines — falling back to VLM")
+            logger.info("[EXTRACT] Text parser found no lines — falling back to VLM")
             header, lines = parse_vlm_statement(
                 file_bytes,
                 mime_type=mime_type or "application/pdf",
@@ -98,7 +101,7 @@ def extract_statement(
                 parsing_hint=parsing_hint,
             )
         else:
-            print(f"[EXTRACT] Text parser extracted {len(lines)} lines")
+            logger.info("[EXTRACT] Text parser extracted %d lines", len(lines))
     else:
         header, lines = parse_vlm_statement(
             file_bytes,

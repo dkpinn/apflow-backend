@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import io
+import logging
 from datetime import datetime, timezone
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from PIL import Image
 
@@ -104,7 +107,7 @@ def persist_preview_artifacts(
                     result["processed_preview_path"] = processed_path
 
         except Exception as exc:
-            print(f"PREVIEW ARTIFACT STORAGE FAILED (page {page_number}):", str(exc))
+            logger.exception("preview artifact storage failed (page %d)", page_number)
             result["error"] = str(exc)
 
     update_payload = {"updated_at": utc_now_iso()}
@@ -115,7 +118,7 @@ def persist_preview_artifacts(
     if len(update_payload) > 1:
         try:
             supabase.table("invoices_raw").update(update_payload).eq("id", invoice_raw_id).execute()
-        except Exception as exc:
-            print("INVOICES_RAW PREVIEW UPDATE FAILED:", str(exc))
+        except Exception:
+            logger.exception("invoices_raw preview update failed")
 
     return result

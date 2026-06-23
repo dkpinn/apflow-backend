@@ -10,9 +10,12 @@ Groups B + D + E from the original invoice_extraction_service.py:
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
 
 from app.db.supabase_client import get_supabase_client
 from app.services.audit_log import log_invoice_event
@@ -257,7 +260,7 @@ def rename_invoice_file_after_extraction(
             "reason": None,
         }
     except Exception as e:
-        print("FILE RENAME FAILED:", str(e))
+        logger.exception("file rename failed")
         return {
             "file_name": old_file_name,
             "file_path": old_file_path,
@@ -372,5 +375,5 @@ def store_basic_document_page_snapshot(
 
         supabase.table("document_pages").delete().eq("invoice_raw_id", invoice_raw_id).execute()
         supabase.table("document_pages").insert(page_payloads).execute()
-    except Exception as exc:
-        print("DOCUMENT PAGE SNAPSHOT FAILED:", str(exc))
+    except Exception:
+        logger.exception("document page snapshot failed")

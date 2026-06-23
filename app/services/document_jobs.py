@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now_iso() -> str:
@@ -130,5 +133,5 @@ def safe_update_invoice_raw_status(
 
     try:
         supabase.table("invoices_raw").update(payload).eq("id", invoice_raw_id).execute()
-    except Exception as exc:
-        print("INVOICE_RAW STATUS UPDATE FAILED:", str(exc), payload)
+    except Exception:
+        logger.exception("invoices_raw status update failed: %s", payload)

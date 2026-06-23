@@ -237,4 +237,3 @@ Rules are learnable — after reviewing a transaction, the user can save the all
         tell me about this expense (where, what, why, when) AI gives suggestion.
  "<-" left arrow is go back a transaction.
  "->" right arrow goes forward a transaction.
- 

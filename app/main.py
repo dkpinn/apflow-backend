@@ -10,6 +10,8 @@ from app.routers.reconciliation import router as reconciliation_router
 from app.db.supabase_client import get_supabase_client
 from app.routers import invoices
 from app.routers import invoices_gl
+from app.routers import invoices_queue
+from app.routers import invoices_review
 from app.routers import organisations
 from app.routers import suppliers
 from app.routers import supplier_kyc
@@ -24,6 +26,8 @@ from app.routers import admin_accounts
 from app.routers import integrations
 from app.routers import bank
 from app.routers import bank_journals
+from app.routers import bank_uploads
+from app.routers import bank_lines
 from app.routers import bank_extraction_benchmark
 from app.routers import bank_extraction_admin
 from app.routers import reports
@@ -31,6 +35,7 @@ from app.routers import asset_types
 from app.routers import document_autofill
 from app.routers import customers
 from app.routers import sales_invoices
+from app.routers import sales_invoices_actions
 from app.routers import customer_receipts
 
 logger = logging.getLogger("apflow.sweep")
@@ -355,6 +360,8 @@ app.add_middleware(
 app.include_router(reconciliation_router)
 app.include_router(invoices.router)
 app.include_router(invoices_gl.router)
+app.include_router(invoices_queue.router)
+app.include_router(invoices_review.router)
 app.include_router(organisations.router)
 app.include_router(suppliers.router)
 app.include_router(supplier_kyc.router)
@@ -369,6 +376,8 @@ app.include_router(admin_accounts.router)
 app.include_router(integrations.router)
 app.include_router(bank.router)
 app.include_router(bank_journals.router)
+app.include_router(bank_uploads.router)
+app.include_router(bank_lines.router)
 app.include_router(bank_extraction_benchmark.router)
 app.include_router(bank_extraction_admin.router)
 app.include_router(reports.router)
@@ -376,6 +385,7 @@ app.include_router(asset_types.router)
 app.include_router(document_autofill.router)
 app.include_router(customers.router)
 app.include_router(sales_invoices.router)
+app.include_router(sales_invoices_actions.router)
 app.include_router(customer_receipts.router)
 
 

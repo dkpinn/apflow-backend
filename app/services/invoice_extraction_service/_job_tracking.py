@@ -9,9 +9,12 @@ Groups A + C from the original invoice_extraction_service.py:
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from threading import Lock
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from app.db.supabase_client import get_supabase_client
 
@@ -224,8 +227,8 @@ def get_extracted_invoice_id_for_raw(invoice_raw_id: Optional[str]) -> Optional[
         )
         if res.data:
             return res.data[0].get("id")
-    except Exception as exc:
-        print("EXTRACTED ID LOOKUP FAILED:", str(exc))
+    except Exception:
+        logger.exception("extracted id lookup failed")
     return None
 
 

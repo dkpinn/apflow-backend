@@ -5,9 +5,12 @@ Routers should import from here rather than implementing these directly.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
 from pydantic import BaseModel
 
 from app.db.supabase_client import get_supabase_client
@@ -328,8 +331,8 @@ def _link_supplier_to_invoice(
                 "supplier_id": supplier_id,
                 "updated_at": utc_now_iso(),
             }).eq("id", invoice_raw_id).execute()
-        except Exception as exc:
-            print("INVOICES_RAW SUPPLIER LINK FAILED:", str(exc))
+        except Exception:
+            logger.exception("invoices_raw supplier link failed")
 
     if organisation_id:
         log_invoice_event(

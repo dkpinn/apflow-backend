@@ -9,9 +9,12 @@ Group H from the original invoice_extraction_service.py:
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
 
 from app.db.supabase_client import get_supabase_client
 from app.services.audit_log import log_invoice_event
@@ -235,11 +238,15 @@ def run_invoice_re_extraction(
                 organisation_id=org_id,
             )
             vlm_data = vlm_result.get("data")
-            print("RE-EXTRACT VLM RAW RESULT:", vlm_data)
+            logger.debug("RE-EXTRACT VLM RAW RESULT: %s", vlm_data)
             if vlm_data is not None:
                 vlm_confidence = vlm_data.get("confidence_score", 0)
                 tesseract_confidence = parsed_data.get("confidence_score", 0)
-                print(f"RE-EXTRACT VLM LINE ITEMS: {len(vlm_data.get('line_items') or [])} items — {vlm_data.get('line_items')}")
+                logger.debug(
+                    "RE-EXTRACT VLM LINE ITEMS: %d items — %s",
+                    len(vlm_data.get("line_items") or []),
+                    vlm_data.get("line_items"),
+                )
 
                 for field in VLM_MERGE_FIELDS:
                     vlm_value = vlm_data.get(field)
@@ -247,7 +254,7 @@ def run_invoice_re_extraction(
                         if not parsed_data.get(field) or vlm_confidence > tesseract_confidence:
                             parsed_data[field] = vlm_value
 
-                print(f"RE-EXTRACT MERGED LINE ITEMS: {len(parsed_data.get('line_items') or [])} items")
+                logger.debug("RE-EXTRACT MERGED LINE ITEMS: %d items", len(parsed_data.get("line_items") or []))
                 parsed_data["confidence_score"] = calculate_confidence(parsed_data)
 
                 log_invoice_event(
@@ -451,7 +458,7 @@ def run_invoice_re_extraction(
                 raise_on_error=False,
             )
             if line_item_diagnostics.get("line_items_insert_error"):
-                print("RE-EXTRACT LINE ITEM INSERT FAILED:", line_item_diagnostics["line_items_insert_error"])
+                logger.error("RE-EXTRACT LINE ITEM INSERT FAILED: %s", line_item_diagnostics["line_items_insert_error"])
             else:
                 line_items_replaced = True
                 improved_fields.append({

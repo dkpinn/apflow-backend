@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import io
+import logging
 import re
 from datetime import datetime
 from typing import Optional
 import fitz  # PyMuPDF
 import os
 import pytesseract
+
+logger = logging.getLogger(__name__)
 
 try:
     from dotenv import load_dotenv
@@ -962,8 +965,8 @@ def extract_text_with_fallback(file_bytes: bytes, file_type: Optional[str] = Non
                         previews = generate_preview_images(img, img)
                         page["original_preview_image"] = previews.original_preview
                         page["processed_preview_image"] = previews.processed_preview
-                except Exception as _prev_exc:
-                    print(f"[extract_text_with_fallback] preview render skipped: {_prev_exc}")
+                except Exception:
+                    logger.debug("[extract_text_with_fallback] preview render skipped", exc_info=True)
                 return {
                     "method": "pdf_text",
                     "ocr_used": False,

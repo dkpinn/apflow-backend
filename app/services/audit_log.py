@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now_iso() -> str:
@@ -68,5 +71,5 @@ def log_invoice_event(
 
     try:
         supabase.table("invoice_audit_events").insert(payload).execute()
-    except Exception as exc:  # pragma: no cover - best-effort logging
-        print("AUDIT LOG INSERT FAILED:", str(exc), payload)
+    except Exception:  # pragma: no cover - best-effort logging
+        logger.exception("audit log insert failed: %s", payload)

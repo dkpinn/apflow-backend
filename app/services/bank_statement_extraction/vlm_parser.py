@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 from app.services.extraction_foundation import extraction_metadata, warning
 
@@ -272,16 +275,16 @@ def parse_vlm_statement(
                 _final_exc = _exc
                 if _attempt < 2:
                     _wait = 5 * (_attempt + 1)
-                    print(f"[VLM] {_model} attempt {_attempt + 1}/3 failed, retrying in {_wait}s: {_exc}")
+                    logger.warning("[VLM] %s attempt %d/3 failed, retrying in %ds", _model, _attempt + 1, _wait)
                     time.sleep(_wait)
                 else:
-                    print(f"[VLM] {_model} exhausted all 3 attempts")
+                    logger.warning("[VLM] %s exhausted all 3 attempts", _model)
             else:
                 raise
 
     # Step 2 — OpenRouter (if primary Gemini failed and key is available)
     if response is None and _or_key:
-        print(f"[VLM] Falling back from {_model} to OpenRouter model={_or_model_name!r}")
+        logger.info("[VLM] Falling back from %s to OpenRouter model=%r", _model, _or_model_name)
         try:
             _or_text = _call_openrouter_bank_vlm(
                 page_parts,
@@ -292,14 +295,14 @@ def parse_vlm_statement(
             )
             payload = _parse_vlm_json_payload(_or_text, provider="OpenRouter VLM")
             _model = _or_model_name
-        except Exception as _or_exc:
-            print(f"[VLM] OpenRouter failed: {_or_exc}")
+        except Exception:
+            logger.exception("[VLM] OpenRouter failed")
             _final_exc = _or_exc
 
     # Step 3 — LlamaParse → Gemini lite text-only (if LLAMA_CLOUD_API_KEY is set)
     _llp_key = os.getenv("LLAMA_CLOUD_API_KEY")
     if response is None and payload is None and _llp_key:
-        print("[VLM] Falling back to LlamaParse")
+        logger.info("[VLM] Falling back to LlamaParse")
         try:
             import io as _io
             from llama_parse import LlamaParse as _LlamaParse
@@ -324,15 +327,15 @@ def parse_vlm_statement(
                 )
                 _model = f"llamaparse+{_lite_model}"
             else:
-                print("[VLM] LlamaParse returned empty text — skipping")
-        except Exception as _lp_exc:
-            print(f"[VLM] LlamaParse step failed: {_lp_exc}")
+                logger.info("[VLM] LlamaParse returned empty text — skipping")
+        except Exception:
+            logger.exception("[VLM] LlamaParse step failed")
             _final_exc = _lp_exc
             response = None  # ensure fall-through to Gemini lite with images
 
     # Step 4 — lite Gemini with images (if still no result and model differs from primary)
     if response is None and payload is None and _lite_model != _primary_model:
-        print(f"[VLM] Falling back to {_lite_model!r}")
+        logger.info("[VLM] Falling back to %r", _lite_model)
         _model = _lite_model
         for _attempt in range(3):
             try:
@@ -348,10 +351,10 @@ def parse_vlm_statement(
                     _final_exc = _exc
                     if _attempt < 2:
                         _wait = 5 * (_attempt + 1)
-                        print(f"[VLM] {_model} attempt {_attempt + 1}/3 failed, retrying in {_wait}s: {_exc}")
+                        logger.warning("[VLM] %s attempt %d/3 failed, retrying in %ds", _model, _attempt + 1, _wait)
                         time.sleep(_wait)
                     else:
-                        print(f"[VLM] {_model} exhausted all 3 attempts")
+                        logger.warning("[VLM] %s exhausted all 3 attempts", _model)
                 else:
                     raise
 
@@ -371,7 +374,7 @@ def parse_vlm_statement(
             pass
         payload = _parse_vlm_json_payload(response.text, provider=f"Gemini VLM {_model}")
 
-    print(f"[VLM] Completed with model={_model!r}, hint={'yes' if parsing_hint else 'no'}")
+    logger.info("[VLM] Completed with model=%r, hint=%s", _model, "yes" if parsing_hint else "no")
     statement_period_from, statement_period_to = _vlm_statement_period_dates(
         payload,
         pdf_text_block,

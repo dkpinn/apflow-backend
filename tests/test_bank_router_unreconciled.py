@@ -4,6 +4,8 @@ import pytest
 from fastapi import HTTPException
 
 from app.routers import bank
+from app.routers import bank_lines
+from app.routers import bank_uploads
 
 
 class _Response:
@@ -222,8 +224,14 @@ class _RpcDB:
 
 
 def _patch_write_auth(monkeypatch, db):
-    monkeypatch.setattr(bank, "_auth", lambda _auth: ("11111111-1111-1111-1111-111111111111", db))
-    monkeypatch.setattr(bank, "ensure_org_write", lambda *_args: None)
+    _fake_auth = lambda _auth: ("11111111-1111-1111-1111-111111111111", db)
+    _noop = lambda *_args: None
+    monkeypatch.setattr(bank, "_auth", _fake_auth)
+    monkeypatch.setattr(bank, "ensure_org_write", _noop)
+    monkeypatch.setattr(bank_lines, "_auth", _fake_auth)
+    monkeypatch.setattr(bank_lines, "ensure_org_write", _noop)
+    monkeypatch.setattr(bank_uploads, "_auth", _fake_auth)
+    monkeypatch.setattr(bank_uploads, "ensure_org_write", _noop)
 
 
 def test_explicit_bulk_line_delete_route_calls_atomic_rpc(monkeypatch):
@@ -237,7 +245,7 @@ def test_explicit_bulk_line_delete_route_calls_atomic_rpc(monkeypatch):
         ],
     )
 
-    result = bank.bulk_delete_bank_lines(payload, auth=("user", None))
+    result = bank_lines.bulk_delete_bank_lines(payload, auth=("user", None))
 
     assert result == {"success": True, "deleted_count": 2}
     assert db.rpc_calls == [(
@@ -251,7 +259,7 @@ def test_explicit_bulk_line_delete_route_calls_atomic_rpc(monkeypatch):
             "p_actor_user_id": "11111111-1111-1111-1111-111111111111",
         },
     )]
-    routes = {(route.path, ",".join(sorted(route.methods or []))) for route in bank.router.routes}
+    routes = {(route.path, ",".join(sorted(route.methods or []))) for route in bank_lines.router.routes}
     assert ("/api/bank/lines/bulk-delete", "POST") in routes
 
 
@@ -269,7 +277,7 @@ def test_bulk_line_delete_returns_409_with_blocked_details(monkeypatch):
     )
 
     with pytest.raises(HTTPException) as exc:
-        bank.bulk_delete_bank_lines(payload, auth=("user", None))
+        bank_lines.bulk_delete_bank_lines(payload, auth=("user", None))
 
     assert exc.value.status_code == 409
     assert exc.value.detail["blocked"][0]["line_id"] == "33333333-3333-3333-3333-333333333333"
@@ -283,7 +291,7 @@ def test_compatibility_delete_line_endpoint_uses_same_atomic_path(monkeypatch):
         line_ids=["33333333-3333-3333-3333-333333333333"],
     )
 
-    assert bank.delete_bank_lines(payload, auth=("user", None))["deleted_count"] == 1
+    assert bank_lines.delete_bank_lines(payload, auth=("user", None))["deleted_count"] == 1
     assert db.rpc_calls[0][0] == "delete_bank_statement_lines_atomic"
 
 
@@ -298,7 +306,7 @@ def test_explicit_bulk_upload_delete_route_calls_atomic_rpc(monkeypatch):
         ],
     )
 
-    result = bank.bulk_delete_bank_uploads(payload, auth=("user", None))
+    result = bank_uploads.bulk_delete_bank_uploads(payload, auth=("user", None))
 
     assert result == {
         "success": True,
@@ -306,7 +314,7 @@ def test_explicit_bulk_upload_delete_route_calls_atomic_rpc(monkeypatch):
         "storage_cleanup_failures": [],
     }
     assert db.rpc_calls[0][0] == "delete_bank_statement_uploads_atomic"
-    routes = {(route.path, ",".join(sorted(route.methods or []))) for route in bank.router.routes}
+    routes = {(route.path, ",".join(sorted(route.methods or []))) for route in bank_uploads.router.routes}
     assert ("/api/bank/uploads/bulk-delete", "POST") in routes
 
 
@@ -339,9 +347,9 @@ def test_skip_is_audited_without_changing_review_status(monkeypatch):
     })
     _patch_write_auth(monkeypatch, db)
     events = []
-    monkeypatch.setattr(bank, "log_bank_event", lambda _db, **details: events.append(details))
+    monkeypatch.setattr(bank_lines, "log_bank_event", lambda _db, **details: events.append(details))
 
-    result = bank.skip_bank_line(
+    result = bank_lines.skip_bank_line(
         "33333333-3333-3333-3333-333333333333",
         bank.LineSkipRequest(organisation_id="22222222-2222-2222-2222-222222222222"),
         auth=("user", None),
@@ -380,7 +388,7 @@ def test_bulk_allocate_calls_atomic_draft_rpc_with_split_vat_payload(monkeypatch
         }],
     )
 
-    result = bank.bulk_allocate_bank_lines(payload, auth=("user", None))
+    result = bank_lines.bulk_allocate_bank_lines(payload, auth=("user", None))
 
     assert result["success"] is True
     assert result["created_count"] == 1
@@ -406,7 +414,7 @@ def test_bulk_allocate_surfaces_atomic_rpc_failure(monkeypatch):
     )
 
     with pytest.raises(HTTPException) as exc:
-        bank.bulk_allocate_bank_lines(payload, auth=("user", None))
+        bank_lines.bulk_allocate_bank_lines(payload, auth=("user", None))
 
     assert exc.value.status_code == 400
     assert "Allocations do not balance" in exc.value.detail["message"]
