@@ -295,7 +295,7 @@ def parse_vlm_statement(
             )
             payload = _parse_vlm_json_payload(_or_text, provider="OpenRouter VLM")
             _model = _or_model_name
-        except Exception:
+        except Exception as _or_exc:
             logger.exception("[VLM] OpenRouter failed")
             _final_exc = _or_exc
 

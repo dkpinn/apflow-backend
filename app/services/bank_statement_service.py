@@ -34,6 +34,40 @@ from app.services.bank_statement_extraction import (
 )
 
 
+def correct_amounts_from_balance(
+    lines: list[ParsedBankLine],
+    *,
+    bank_account_id: str,
+) -> list[ParsedBankLine]:
+    """Fix amounts that a VLM misread by recomputing them from the running balance.
+
+    If balance[n] - balance[n-1] disagrees with signed_amount by more than
+    one cent the amount is likely a column-misalignment artefact (e.g. the
+    FNB '0.000.00Cr' nil-amount rows that VLM reads as the next row's value).
+    The balance column is almost always correct, so we trust it.
+    """
+    previous_balance: Optional[Decimal] = None
+    for line in lines:
+        if line.balance_amount is not None and previous_balance is not None:
+            expected = money(line.balance_amount) - money(previous_balance)
+            if abs(expected - line.signed_amount) > Decimal("0.01"):
+                line.signed_amount = expected
+                line.debit_amount = abs(expected) if expected < MONEY_ZERO else MONEY_ZERO
+                line.credit_amount = expected if expected >= MONEY_ZERO else MONEY_ZERO
+                line.transaction_hash = transaction_fingerprint(
+                    bank_account_id=bank_account_id,
+                    line_date=line.line_date,
+                    amount=line.signed_amount,
+                    reference=line.reference,
+                    counterparty=line.counterparty,
+                    bank_reference=line.bank_reference,
+                    description=line.description,
+                )
+        if line.balance_amount is not None:
+            previous_balance = line.balance_amount
+    return lines
+
+
 def detect_line_duplicates(
     *,
     db,
@@ -78,7 +112,7 @@ def detect_line_duplicates(
 
 def validate_balances(
     *,
-    account_current_balance: Decimal,
+    account_current_balance: Optional[Decimal],
     header: dict[str, Any],
     lines: list[ParsedBankLine],
 ) -> dict[str, Any]:
@@ -86,13 +120,15 @@ def validate_balances(
     closing = money(header.get("closing_balance")) if header.get("closing_balance") is not None else None
     if opening is None or closing is None:
         return {"balance_status": "missing_balance", "expected_closing": None, "difference": None}
-    if abs(opening - account_current_balance) > Decimal("0.01"):
-        return {
-            "balance_status": "opening_mismatch",
-            "expected_opening": dec_to_float(account_current_balance),
-            "actual_opening": dec_to_float(opening),
-            "difference": dec_to_float(opening - account_current_balance),
-        }
+    if account_current_balance is not None:
+        current = money(account_current_balance)
+        if abs(opening - current) > Decimal("0.01"):
+            return {
+                "balance_status": "opening_mismatch",
+                "expected_opening": dec_to_float(current),
+                "actual_opening": dec_to_float(opening),
+                "difference": dec_to_float(opening - current),
+            }
     expected = opening + sum((line.signed_amount for line in lines), MONEY_ZERO)
     if abs(expected - closing) > Decimal("0.01"):
         return {

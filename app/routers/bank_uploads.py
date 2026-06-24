@@ -16,6 +16,7 @@ from app.db.supabase_client import get_fresh_supabase_client
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
 from app.services.bank_extraction_validation import validate_extracted_statement_quality
 from app.services.bank_statement_service import (
+    correct_amounts_from_balance,
     detect_line_duplicates,
     extract_statement,
     line_to_insert,
@@ -141,6 +142,7 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             account_type=account.get("account_type"),
             parsing_hint=parsing_hint,
         )
+        correct_amounts_from_balance(lines, bank_account_id=account["id"])
         # Refresh the DB connection after the long extraction call (Gemini VLM can take
         # 30-60s) — the persistent HTTP/2 connection may have gone stale while waiting.
         db = get_fresh_supabase_client()
@@ -164,6 +166,16 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             balance_summary=balance_summary,
         )
 
+        nil_line_count = sum(
+            1 for w in line_wrappers
+            if w["duplicate_status"] == "clear" and w["line"].signed_amount == 0
+        )
+        clearable = [
+            w for w in line_wrappers
+            if w["duplicate_status"] == "clear" and w["line"].signed_amount != 0
+        ]
+        duplicate_summary["nil_line_count"] = nil_line_count
+
         db.table("bank_statement_lines").delete().eq("bank_statement_upload_id", upload_id).execute()
         inserts = [
             line_to_insert(
@@ -173,7 +185,7 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
                 upload_id=upload_id,
                 duplicate_status=wrapper["duplicate_status"],
             )
-            for wrapper in line_wrappers
+            for wrapper in clearable
         ]
         if inserts:
             db.table("bank_statement_lines").insert(inserts).execute()
