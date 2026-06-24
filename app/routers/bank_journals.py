@@ -302,3 +302,26 @@ def unpost_bank_journal(journal_id: str, payload: PostJournalRequest, auth: User
         "reversal_journal": reversal_journal,
         "lines": journal_preview_lines(db, organisation_id, reversal_rows),
     }
+
+
+@router.get("/accounts/{account_id}/posted-lines")
+def list_posted_bank_lines(account_id: str, organisation_id: str, auth: UserAuth, limit: int = 30):
+    """Return recently posted bank statement lines for the account (newest first).
+
+    Used by the frontend "Recently posted" section to surface an Undo button.
+    """
+    user_id, db = _auth(auth)
+    ensure_org_read(user_id, organisation_id)
+    rows = (
+        db.table("bank_statement_lines")
+        .select("id, line_date, description, counterparty, reference, signed_amount, gl_journal_id")
+        .eq("organisation_id", organisation_id)
+        .eq("bank_account_id", account_id)
+        .eq("posting_status", "posted")
+        .order("line_date", desc=True)
+        .limit(max(1, min(limit, 100)))
+        .execute()
+        .data
+        or []
+    )
+    return {"lines": rows}
