@@ -249,6 +249,7 @@ def skip_bank_line(line_id: str, payload: LineSkipRequest, auth: UserAuth):
         .execute(),
         "Bank statement line not found",
     )
+    db.table("bank_statement_lines").update({"review_status": "deferred"}).eq("id", line_id).execute()
     log_bank_event(
         db,
         organisation_id=organisation_id,

@@ -243,6 +243,7 @@ def validate_extracted_statement_quality(
     ]
     running_balance_passed = _check_running_balance_continuity(opening_balance, transactions, critical_errors)
 
+    can_allocate = not bool(critical_errors)
     return {
         "extracted_transaction_count": len(extracted_lines),
         "running_balance_passed": running_balance_passed,
@@ -250,6 +251,7 @@ def validate_extracted_statement_quality(
         "duplicate_count": duplicate_count,
         "critical_errors": critical_errors,
         "warnings": warnings,
+        "can_allocate": can_allocate,
     }
 
 

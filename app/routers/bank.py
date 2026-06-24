@@ -414,6 +414,8 @@ def is_unreconciled_bank_line(line: dict[str, Any]) -> bool:
     posting_status = str(line.get("posting_status") or "unposted").lower()
     allocation_status = str(line.get("allocation_status") or "unallocated").lower()
     review_status = str(line.get("review_status") or "pending").lower()
+    if review_status in {"ignored", "deferred"}:
+        return False
     return (
         posting_status != "posted"
         or allocation_status not in {"allocated", "split"}

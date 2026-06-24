@@ -216,14 +216,9 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
                 "parser_strategy": header.get("parser_strategy"),
                 "line_count": len(inserts),
                 "warnings": header.get("extraction_warnings") or [],
-                # Observational quality result — not yet used to gate allocation.
-                # TODO: once validation should become blocking, check
-                # validation_result["can_allocate"] here and, if False, set
-                # extraction_status="needs_review" instead of "extracted" and
-                # skip the bank_accounts.current_reconciled_balance update below.
                 "validation": validation_result,
             },
-            "extraction_status": "extracted",
+            "extraction_status": "extracted" if validation_result["can_allocate"] else "needs_review",
             "extracted_at": now_iso(),
             "extraction_input_tokens": header.get("extraction_input_tokens"),
             "extraction_output_tokens": header.get("extraction_output_tokens"),
@@ -236,7 +231,7 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
         }
         db.table("bank_statement_uploads").update(upload_patch).eq("id", upload_id).execute()
 
-        if balance_summary["balance_status"] == "balanced" and closing is not None:
+        if validation_result["can_allocate"] and balance_summary["balance_status"] == "balanced" and closing is not None:
             db.table("bank_accounts").update({
                 "current_reconciled_balance": closing,
                 "last_statement_upload_id": upload_id,
