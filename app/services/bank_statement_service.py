@@ -44,9 +44,41 @@ def correct_amounts_from_balance(
     If balance[n] - balance[n-1] disagrees with signed_amount by more than
     one cent the amount is likely a column-misalignment artefact (e.g. the
     FNB '0.000.00Cr' nil-amount rows that VLM reads as the next row's value).
-    The balance column is almost always correct, so we trust it.
+    The balance column is almost always correct, so we trust it — BUT only when
+    the majority of lines carry balance data and fewer than half need correction
+    (if more than half need correcting the balance column itself was likely
+    misread, and applying corrections would corrupt good amounts).
     """
+    if not lines:
+        return lines
+
+    # Require at least 60% of lines to have a balance before trusting it.
+    lines_with_balance = sum(1 for ln in lines if ln.balance_amount is not None)
+    if lines_with_balance < max(2, len(lines) * 0.6):
+        logger.debug("[BALANCE-CORRECT] Skipping: only %d/%d lines have balance_amount", lines_with_balance, len(lines))
+        return lines
+
+    # Dry-run: count how many corrections would be applied.
     previous_balance: Optional[Decimal] = None
+    corrections_needed = 0
+    for line in lines:
+        if line.balance_amount is not None and previous_balance is not None:
+            expected = money(line.balance_amount) - money(previous_balance)
+            if abs(expected - line.signed_amount) > Decimal("0.01"):
+                corrections_needed += 1
+        if line.balance_amount is not None:
+            previous_balance = line.balance_amount
+
+    # If more than half the lines need "correction" the balance column is suspect.
+    if corrections_needed > lines_with_balance * 0.5:
+        logger.warning(
+            "[BALANCE-CORRECT] Skipping: %d/%d lines would be corrected — balance column likely misread",
+            corrections_needed, lines_with_balance,
+        )
+        return lines
+
+    # Apply corrections.
+    previous_balance = None
     for line in lines:
         if line.balance_amount is not None and previous_balance is not None:
             expected = money(line.balance_amount) - money(previous_balance)
@@ -65,6 +97,8 @@ def correct_amounts_from_balance(
                 )
         if line.balance_amount is not None:
             previous_balance = line.balance_amount
+    if corrections_needed:
+        logger.debug("[BALANCE-CORRECT] Applied %d corrections from running balance", corrections_needed)
     return lines
 
 
@@ -138,6 +172,45 @@ def validate_balances(
             "difference": dec_to_float(closing - expected),
         }
     return {"balance_status": "balanced", "expected_closing": dec_to_float(expected), "difference": 0}
+
+
+def validate_running_balance(lines: list[ParsedBankLine], header: dict[str, Any]) -> dict[str, Any]:
+    """Walk each line's balance column: prev_balance + credit - debit = curr_balance.
+
+    Returns a summary dict included in extraction_evidence.
+    """
+    if not lines:
+        return {"balance_walk_status": "no_lines", "balance_walk_mismatches": 0}
+
+    mismatches: list[dict] = []
+    prev_balance: Optional[Decimal] = (
+        money(header["opening_balance"]) if header.get("opening_balance") is not None else None
+    )
+
+    for i, line in enumerate(lines):
+        if line.balance_amount is None:
+            continue
+        curr = line.balance_amount
+        if prev_balance is not None:
+            expected = prev_balance + line.credit_amount - line.debit_amount
+            diff = abs(expected - curr)
+            if diff > Decimal("0.02"):
+                mismatches.append({
+                    "row_index": i,
+                    "date": str(line.line_date or ""),
+                    "description": (line.description or "")[:60],
+                    "expected_balance": dec_to_float(expected),
+                    "actual_balance": dec_to_float(curr),
+                    "diff": dec_to_float(diff),
+                })
+        prev_balance = curr
+
+    status = "balanced" if not mismatches else "balance_walk_failed"
+    return {
+        "balance_walk_status": status,
+        "balance_walk_mismatches": len(mismatches),
+        "balance_walk_details": mismatches[:20],
+    }
 
 
 def line_to_insert(

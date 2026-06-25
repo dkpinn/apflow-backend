@@ -37,6 +37,9 @@ from app.routers import customers
 from app.routers import sales_invoices
 from app.routers import sales_invoices_actions
 from app.routers import customer_receipts
+from app.routers import inventory
+from app.routers import finance_leases
+from app.routers import command_centre
 
 logger = logging.getLogger("apflow.sweep")
 
@@ -387,6 +390,9 @@ app.include_router(customers.router)
 app.include_router(sales_invoices.router)
 app.include_router(sales_invoices_actions.router)
 app.include_router(customer_receipts.router)
+app.include_router(inventory.router)
+app.include_router(finance_leases.router)
+app.include_router(command_centre.router)
 
 
 @app.get("/")

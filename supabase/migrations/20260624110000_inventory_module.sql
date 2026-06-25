@@ -1,0 +1,68 @@
+-- Inventory master data, BOMs/recipes and perpetual stock movement ledger.
+-- Keep this deploy migration in sync with app/db/applied/20260624110000_inventory_module.sql.
+
+create table if not exists public.inventory_items (
+  id uuid primary key default gen_random_uuid(),
+  organisation_id uuid not null references public.organisations(id) on delete cascade,
+  code text not null, name text not null,
+  item_type text not null check (item_type in ('stock_item', 'service')),
+  description text, unit_of_measure text not null default 'Each',
+  standard_cost numeric(14,4) not null default 0 check (standard_cost >= 0),
+  selling_price numeric(14,4) not null default 0 check (selling_price >= 0),
+  reorder_point numeric(14,4) not null default 0 check (reorder_point >= 0),
+  vat_treatment text not null default 'standard' check (vat_treatment in ('standard', 'zero_rated', 'exempt')),
+  active boolean not null default true,
+  created_by uuid references auth.users(id) on delete set null,
+  updated_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now(), updated_at timestamptz not null default now(),
+  unique (organisation_id, code)
+);
+create index if not exists inventory_items_org_type_idx on public.inventory_items(organisation_id, item_type, active, code);
+
+create table if not exists public.inventory_structures (
+  id uuid primary key default gen_random_uuid(),
+  organisation_id uuid not null references public.organisations(id) on delete cascade,
+  output_item_id uuid not null references public.inventory_items(id) on delete restrict,
+  structure_type text not null check (structure_type in ('bom', 'recipe')),
+  name text not null, output_quantity numeric(14,4) not null default 1 check (output_quantity > 0),
+  active boolean not null default true, notes text,
+  created_by uuid references auth.users(id) on delete set null,
+  updated_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now(), updated_at timestamptz not null default now()
+);
+create index if not exists inventory_structures_org_type_idx on public.inventory_structures(organisation_id, structure_type, active, name);
+
+create table if not exists public.inventory_structure_lines (
+  id uuid primary key default gen_random_uuid(),
+  organisation_id uuid not null references public.organisations(id) on delete cascade,
+  structure_id uuid not null references public.inventory_structures(id) on delete cascade,
+  component_item_id uuid not null references public.inventory_items(id) on delete restrict,
+  quantity numeric(14,4) not null check (quantity > 0),
+  wastage_percent numeric(7,4) not null default 0 check (wastage_percent >= 0 and wastage_percent <= 100),
+  sort_order integer not null default 0, unique (structure_id, component_item_id)
+);
+create index if not exists inventory_structure_lines_structure_idx on public.inventory_structure_lines(structure_id, sort_order, id);
+
+create table if not exists public.inventory_stock_movements (
+  id uuid primary key default gen_random_uuid(),
+  organisation_id uuid not null references public.organisations(id) on delete cascade,
+  inventory_item_id uuid not null references public.inventory_items(id) on delete restrict,
+  movement_type text not null check (movement_type in ('opening_balance', 'purchase', 'sale', 'adjustment', 'production', 'consumption')),
+  quantity numeric(14,4) not null check (quantity <> 0), unit_cost numeric(14,4) check (unit_cost is null or unit_cost >= 0),
+  occurred_on date not null default current_date, reference text, notes text,
+  created_by uuid references auth.users(id) on delete set null, created_at timestamptz not null default now()
+);
+create index if not exists inventory_movements_item_date_idx on public.inventory_stock_movements(organisation_id, inventory_item_id, occurred_on desc, created_at desc);
+
+do $$
+declare table_name text;
+begin
+  foreach table_name in array array['inventory_items','inventory_structures','inventory_structure_lines','inventory_stock_movements'] loop
+    execute format('alter table public.%I enable row level security', table_name);
+    execute format('revoke all privileges on table public.%I from public, anon', table_name);
+    execute format('grant all privileges on table public.%I to service_role', table_name);
+    execute format('create policy %I on public.%I for select to authenticated using (public.is_org_member(organisation_id))', table_name || '_select_member', table_name);
+    execute format('create policy %I on public.%I for all to authenticated using (public.has_org_role(organisation_id, array[''owner'',''admin'',''accountant'']::public.organisation_role[])) with check (public.has_org_role(organisation_id, array[''owner'',''admin'',''accountant'']::public.organisation_role[]))', table_name || '_write_accountants', table_name);
+  end loop;
+exception when duplicate_object then null;
+end $$;

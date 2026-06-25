@@ -53,6 +53,7 @@ def preview_bank_journal(line_id: str, payload: DraftJournalRequest, auth: UserA
         tracking=payload.tracking,
         vat_rate=payload.vat_rate,
         vat_account_id=str(payload.vat_account_id) if payload.vat_account_id else None,
+        description_override=payload.description_override,
     )
     return {
         "success": True,
@@ -89,7 +90,7 @@ def draft_bank_journal(line_id: str, payload: DraftJournalRequest, auth: UserAut
         )
         return {"success": True, "journal": journal, "lines": journal_preview_lines(db, organisation_id, existing_lines)}
     journal_id = new_uuid()
-    description = line.get("description") or "Bank transaction"
+    description = (payload.description_override or "").strip() or line.get("description") or "Bank transaction"
     journal_lines = build_journal_rows_for_line(
         db,
         organisation_id=organisation_id,
@@ -98,6 +99,7 @@ def draft_bank_journal(line_id: str, payload: DraftJournalRequest, auth: UserAut
         tracking=payload.tracking,
         vat_rate=payload.vat_rate,
         vat_account_id=str(payload.vat_account_id) if payload.vat_account_id else None,
+        description_override=payload.description_override,
     )
     total_debit = sum(money(row["debit_amount"]) for row in journal_lines)
     total_credit = sum(money(row["credit_amount"]) for row in journal_lines)

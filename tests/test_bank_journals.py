@@ -114,7 +114,41 @@ def test_draft_bank_journal_creates_journal(monkeypatch):
     assert result["success"] is True
     assert "journal" in result
     assert db.tables["gl_journals"], "Journal should have been inserted"
+    assert db.tables["gl_journals"][0]["description"] == "Test txn"
     assert db.tables["gl_journal_lines"], "Journal lines should have been inserted"
+
+
+def test_draft_bank_journal_uses_description_override(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line()],
+        "gl_journals": [],
+        "gl_journal_lines": [],
+    })
+    captured_kwargs = {}
+
+    def fake_build_rows(_db, **kwargs):
+        captured_kwargs.update(kwargs)
+        return [
+            {"account_id": "acc-1", "debit_amount": 100.0, "credit_amount": 0, "sort_order": 0},
+            {"account_id": "bank-gl-1", "debit_amount": 0, "credit_amount": 100.0, "sort_order": 1},
+        ]
+
+    monkeypatch.setattr(bj, "_auth", _fake_auth(db))
+    monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bj, "build_journal_rows_for_line", fake_build_rows)
+    monkeypatch.setattr(bj, "journal_preview_lines", lambda _db, _org, rows: rows)
+    monkeypatch.setattr(bj, "log_bank_event", lambda *_a, **_kw: None)
+
+    payload = bj.DraftJournalRequest(
+        organisation_id=ORG_UUID,
+        gl_account_id=GL_UUID,
+        description_override="Detailed narration",
+    )
+    result = bj.draft_bank_journal("line-1", payload, auth=("user-1", None))
+
+    assert result["success"] is True
+    assert db.tables["gl_journals"][0]["description"] == "Detailed narration"
+    assert captured_kwargs["description_override"] == "Detailed narration"
 
 
 def test_draft_bank_journal_returns_existing_draft(monkeypatch):

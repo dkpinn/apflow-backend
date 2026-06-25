@@ -21,6 +21,7 @@ from app.services.bank_statement_service import (
     extract_statement,
     line_to_insert,
     validate_balances,
+    validate_running_balance,
 )
 from app.services.extraction_foundation import file_sha256
 
@@ -38,6 +39,7 @@ from app.routers.bank import (
     lookup_parsing_hint,
     now_iso,
 )
+from app.services.bank_statement_extraction.vlm_bank_router import identify_bank
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +122,20 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             or []
         )
 
+        if not account.get("institution_name") or account.get("account_type") == "bank":
+            _mime_for_router = upload.get("mime_type") or "application/octet-stream"
+            _detected_name, _detected_type = identify_bank(file_bytes, _mime_for_router)
+            _updates: dict = {}
+            if _detected_name and not account.get("institution_name"):
+                _updates["institution_name"] = _detected_name
+                account["institution_name"] = _detected_name
+            if _detected_type and account.get("account_type") == "bank":
+                _updates["account_type"] = _detected_type
+                account["account_type"] = _detected_type
+            if _updates:
+                db.table("bank_accounts").update(_updates).eq("id", account["id"]).execute()
+                logger.info("[ROUTER] Auto-detected for account %s: %r", account["id"], _updates)
+
         parsing_hint = lookup_parsing_hint(
             db,
             organisation_id=organisation_id,
@@ -143,6 +159,13 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             parsing_hint=parsing_hint,
         )
         correct_amounts_from_balance(lines, bank_account_id=account["id"])
+        running_balance_result = validate_running_balance(lines, header)
+        if running_balance_result["balance_walk_mismatches"]:
+            logger.warning(
+                "[BALANCE] Running balance walk failed for upload %s: %d mismatches",
+                upload_id,
+                running_balance_result["balance_walk_mismatches"],
+            )
         # Refresh the DB connection after the long extraction call (Gemini VLM can take
         # 30-60s) — the persistent HTTP/2 connection may have gone stale while waiting.
         db = get_fresh_supabase_client()
@@ -217,6 +240,7 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
                 "line_count": len(inserts),
                 "warnings": header.get("extraction_warnings") or [],
                 "validation": validation_result,
+                "running_balance": running_balance_result,
             },
             "extraction_status": "extracted" if validation_result["can_allocate"] else "needs_review",
             "extracted_at": now_iso(),

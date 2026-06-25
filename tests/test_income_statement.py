@@ -1,3 +1,7 @@
+import pytest
+from fastapi import HTTPException
+
+from app.routers import reports
 from app.services.income_statement import generate_income_statement
 
 
@@ -198,3 +202,31 @@ def test_special_items_bypass_operating_grouping_and_ifrs_excludes_extraordinary
     assert report["sections"]["extraordinary_items"] == []
     assert report["subtotals"]["net_income"] == 900.0
     assert any(warning["code"] == "extraordinary_items_prohibited" for warning in report["warnings"])
+
+
+def test_income_statement_route_uses_reports_view_permission(monkeypatch):
+    tables = _base_tables()
+    tables["organisation_users"] = [
+        {
+            "organisation_id": "org-1",
+            "user_id": "viewer-1",
+            "status": "active",
+            "role": "viewer",
+            "permissions": {},
+        }
+    ]
+
+    def _fail_if_called(*_args, **_kwargs):
+        raise AssertionError("income statement generation should not run without reports permission")
+
+    monkeypatch.setattr(reports, "generate_income_statement", _fail_if_called)
+
+    with pytest.raises(HTTPException) as exc:
+        reports.income_statement_report(
+            auth=("viewer-1", _DB(tables)),
+            organisation_id="org-1",
+            date_from="2026-01-01",
+            date_to="2026-01-31",
+        )
+
+    assert exc.value.status_code == 403

@@ -9,7 +9,7 @@ from typing import Any, Literal, Optional
 logger = logging.getLogger(__name__)
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from app.db.supabase_client import get_fresh_supabase_client, get_supabase_client
@@ -38,15 +38,22 @@ from app.services.organisation_module_settings import (
     validate_bank_allocation_tracking,
 )
 from app.services.sales_invoices import post_customer_receipt
+from app.services.bank_statement_export import (
+    generate_bank_statement_report,
+    bank_statement_csv,
+    bank_statement_xlsx,
+)
 
 router = APIRouter(prefix="/api/bank", tags=["bank"])
 
 _BANK_COST_PER_MILLION: dict[str, dict[str, float]] = {
     "gemini-2.5-flash": {"input": 0.15, "output": 0.60},
     "gemini-2.5-pro":   {"input": 1.25, "output": 10.00},
+    "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
     "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
-    "gpt-4o":           {"input": 5.00, "output": 15.00},
-    "gpt-4.1-mini":     {"input": 0.40, "output": 1.60},
+    "gpt-4o":                    {"input": 5.00, "output": 15.00},
+    "gpt-4.1-mini":              {"input": 0.40, "output":  1.60},
+    "claude-3-5-haiku-20241022": {"input": 0.80, "output":  4.00},
 }
 
 def _calc_bank_cost(model: str | None, input_tokens: int | None, output_tokens: int | None) -> float | None:
@@ -102,6 +109,7 @@ class DraftJournalRequest(BaseModel):
     tracking: dict[str, Any] = Field(default_factory=dict)
     vat_rate: Optional[float] = None
     vat_account_id: Optional[UUID] = None
+    description_override: Optional[str] = Field(default=None, max_length=2000)
 
 
 class PostJournalRequest(BaseModel):
@@ -324,6 +332,7 @@ def build_journal_rows_for_line(
     tracking: dict[str, Any],
     vat_rate: Optional[float] = None,
     vat_account_id: Optional[str] = None,
+    description_override: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     try:
         validate_bank_allocation_tracking(
@@ -349,7 +358,7 @@ def build_journal_rows_for_line(
         bank_account_gl_id=str(bank_gl),
         allocation_account_id=str(gl_account_id),
         amount=money(line.get("signed_amount")),
-        description=line.get("description") or "Bank transaction",
+        description=(description_override or "").strip() or line.get("description") or "Bank transaction",
         tracking=tracking,
     )
     if vat_rate and vat_account_id and len(rows) >= 2:
@@ -386,10 +395,16 @@ def lookup_parsing_hint(db, *, organisation_id: str, institution_name: Optional[
     institution = (institution_name or "").strip().lower()
     acct_type = (account_type or "").strip().lower()
 
+    def _inst_match(rule_inst: str, acct_inst: str) -> bool:
+        """Match if one name is a substring of the other (handles 'STANDARD' vs 'Standard Bank')."""
+        if not rule_inst or not acct_inst:
+            return False
+        return rule_inst == acct_inst or rule_inst in acct_inst or acct_inst in rule_inst
+
     def specificity(rule: dict[str, Any]) -> int:
         rule_institution = (rule.get("institution_name") or "").strip().lower()
         rule_account_type = (rule.get("account_type") or "").strip().lower()
-        institution_match = bool(rule_institution) and rule_institution == institution
+        institution_match = _inst_match(rule_institution, institution)
         account_type_match = bool(rule_account_type) and rule_account_type == acct_type
         if institution_match and account_type_match:
             return 3
@@ -531,6 +546,53 @@ def list_bank_account_unreconciled_lines(account_id: str, organisation_id: str, 
         "lines": enriched,
         "balances": balances.model_dump(),
     }
+
+
+@router.get("/accounts/{account_id}/statement/export")
+def export_bank_statement(
+    account_id: str,
+    organisation_id: str,
+    auth: UserAuth,
+    date_from: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
+    export_format: str = Query(..., alias="format", pattern="^(xlsx|csv)$"),
+):
+    user_id, db = _auth(auth)
+    ensure_org_read(user_id, organisation_id)
+    try:
+        report = generate_bank_statement_report(
+            db,
+            account_id=account_id,
+            organisation_id=organisation_id,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    acct_slug = report["account_name"].replace(" ", "-").lower() or account_id[:8]
+    if date_from and date_to:
+        filename_base = f"bank-statement-{acct_slug}-{date_from}-to-{date_to}"
+    else:
+        filename_base = f"bank-statement-{acct_slug}-all"
+
+    if export_format == "csv":
+        content = bank_statement_csv(report)
+        media_type = "text/csv; charset=utf-8"
+        extension = "csv"
+    else:
+        try:
+            content = bank_statement_xlsx(report)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        extension = "xlsx"
+
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename_base}.{extension}"'},
+    )
 
 
 @router.post("/accounts")

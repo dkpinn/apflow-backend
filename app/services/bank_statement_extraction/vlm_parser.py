@@ -96,6 +96,14 @@ def _parse_vlm_json_payload(response_text: str | None, *, provider: str) -> dict
     ) from last_exc
 
 
+_RETRYABLE_PATTERNS = ("503", "500", "unavailable", "429", "resource_exhausted", "quota", "overloaded")
+
+
+def _is_retryable(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(p in msg for p in _RETRYABLE_PATTERNS)
+
+
 _STATEMENT_PERIOD_RE = re.compile(
     r"statement\s+period\s*:\s*"
     r"(?P<date_from>\d{1,2}\s+[A-Za-z]+\s+\d{4})\s+to\s+"
@@ -187,6 +195,52 @@ def _call_openrouter_bank_vlm(
     return resp.json()["choices"][0]["message"]["content"] or "{}"
 
 
+def _call_anthropic_bank_vlm(
+    page_parts: list[tuple[bytes, str]],
+    *,
+    prompt: str,
+    pdf_text_block: "str | None",
+    model: str,
+    api_key: str,
+    timeout: int = 90,
+) -> str:
+    """Call Anthropic Messages API and return raw JSON text."""
+    import base64
+    import httpx as _httpx
+
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    if pdf_text_block:
+        content.append({
+            "type": "text",
+            "text": (
+                "SUPPLEMENTARY TEXT extracted from this PDF — use to verify descriptions, "
+                f"dates, and reference numbers only:\n\n{pdf_text_block}"
+            ),
+        })
+    for image_bytes, image_mime in page_parts:
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": image_mime, "data": encoded},
+        })
+    resp = _httpx.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "max_tokens": 8192,
+            "messages": [{"role": "user", "content": content}],
+        },
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()["content"][0]["text"] or "{}"
+
+
 def parse_vlm_statement(
     file_bytes: bytes,
     *,
@@ -227,136 +281,133 @@ def parse_vlm_statement(
             pass  # scanned / locked PDF — fall back to image-only
 
     client = genai.Client(api_key=api_key)
+    _currency_hint = currency or "ZAR"
+    from app.services.bank_extraction_prompt import get_active_vlm_prompt as _get_prompt
+    _instructions = parsing_hint.strip() if parsing_hint else _get_prompt()
     prompt = (
-        "Extract bank statement header fields and transaction rows. "
-        "Return strict JSON only. Debits are money out; credits are money in. "
-        "Every transaction date must be returned as YYYY-MM-DD. If the statement prints only day and month "
-        "on a transaction, take its year from the Statement Period. "
-        "Preserve continuation lines, beneficiary names, transaction labels, bank references, and raw row text. "
-        "Do not drop rows with fees, stop orders, transfers, card purchases, credits, interest, or charges. "
-        "For each transaction, set page_number to the 1-based index of the page image it appears on "
-        "(matching the order the page images are provided in). "
-        f"Use this schema as the contract: {json.dumps(bank_statement_vlm_json_schema())}"
+        _instructions
+        + f" If currency is not shown on the statement, use: {_currency_hint}. "
+        + f"Use this schema as the contract: {json.dumps(bank_statement_vlm_json_schema())}"
     )
-    if parsing_hint:
-        prompt += f" Bank-specific layout guidance for this statement: {parsing_hint.strip()}"
+    logger.info(
+        "[VLM] Prompt assembled: source=%s (%d chars), supplementary_text=%s",
+        "bank_hint" if parsing_hint else "core_default",
+        len(_instructions),
+        "YES" if pdf_text_block else "NO (image-only)",
+    )
     contents: list[Any] = [prompt]
     if pdf_text_block:
         contents.append(
-            "EXACT TEXT EXTRACTED FROM PDF — use this for accuracy when reading dates, "
-            "descriptions, amounts and references. Do not guess from the image where the "
-            f"text below is available:\n\n{pdf_text_block}"
+            "SUPPLEMENTARY TEXT extracted from this PDF. Column alignment in this text is unreliable "
+            "for multi-column tabular statements — do NOT use it for transaction descriptions or "
+            "counterparty/beneficiary names. Use this text ONLY to verify exact reference numbers, "
+            "sort codes, or account number digits that are ambiguous in the images. "
+            "All descriptions, names, amounts, dates, debits, credits, and balances MUST be read "
+            f"from the page images:\n\n{pdf_text_block}"
         )
     for image_bytes, image_mime in page_parts:
         contents.append(types.Part.from_bytes(data=image_bytes, mime_type=image_mime))
 
     _primary_model = os.getenv("GEMINI_VLM_MODEL") or "gemini-2.5-flash"
+    _secondary_model = os.getenv("GEMINI_VLM_SECONDARY_MODEL") or "gemini-2.0-flash"
     _lite_model = "gemini-2.5-flash-lite"
-    _or_key = os.getenv("OPENROUTER_API_KEY")
-    _or_model_name = os.getenv("OPENROUTER_VLM_MODEL") or "google/gemini-2.5-flash"
 
     response = None
     payload = None
     _final_exc: Exception | None = None
     _model = _primary_model
 
-    # Step 1 — primary Gemini model
-    for _attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=_model,
-                contents=contents,
-                config=types.GenerateContentConfig(response_mime_type="application/json"),
-            )
-            break
-        except Exception as _exc:
-            _retryable = "503" in str(_exc) or "UNAVAILABLE" in str(_exc) or "429" in str(_exc)
-            if _retryable:
-                _final_exc = _exc
-                if _attempt < 2:
-                    _wait = 5 * (_attempt + 1)
-                    logger.warning("[VLM] %s attempt %d/3 failed, retrying in %ds", _model, _attempt + 1, _wait)
-                    time.sleep(_wait)
-                else:
-                    logger.warning("[VLM] %s exhausted all 3 attempts", _model)
-            else:
-                raise
-
-    # Step 2 — OpenRouter (if primary Gemini failed and key is available)
-    if response is None and _or_key:
-        logger.info("[VLM] Falling back from %s to OpenRouter model=%r", _model, _or_model_name)
-        try:
-            _or_text = _call_openrouter_bank_vlm(
-                page_parts,
-                prompt=prompt,
-                pdf_text_block=pdf_text_block,
-                model=_or_model_name,
-                api_key=_or_key,
-            )
-            payload = _parse_vlm_json_payload(_or_text, provider="OpenRouter VLM")
-            _model = _or_model_name
-        except Exception as _or_exc:
-            logger.exception("[VLM] OpenRouter failed")
-            _final_exc = _or_exc
-
-    # Step 3 — LlamaParse → Gemini lite text-only (if LLAMA_CLOUD_API_KEY is set)
-    _llp_key = os.getenv("LLAMA_CLOUD_API_KEY")
-    if response is None and payload is None and _llp_key:
-        logger.info("[VLM] Falling back to LlamaParse")
-        try:
-            import io as _io
-            from llama_parse import LlamaParse as _LlamaParse
-            _lp = _LlamaParse(api_key=_llp_key, result_type="markdown", verbose=False)
-            _lp_docs = _lp.load_data(
-                _io.BytesIO(file_bytes),
-                extra_info={"file_name": "statement.pdf"},
-            )
-            _lp_text = "\n\n".join(d.text for d in _lp_docs)
-            if _lp_text.strip():
-                _lp_contents: list[Any] = [
-                    prompt,
-                    (
-                        "DOCUMENT TEXT EXTRACTED BY LLAMAPARSE — use this as the primary source "
-                        f"for all dates, amounts, and descriptions:\n\n{_lp_text}"
-                    ),
-                ]
-                response = client.models.generate_content(
-                    model=_lite_model,
-                    contents=_lp_contents,
-                    config=types.GenerateContentConfig(response_mime_type="application/json"),
-                )
-                _model = f"llamaparse+{_lite_model}"
-            else:
-                logger.info("[VLM] LlamaParse returned empty text — skipping")
-        except Exception:
-            logger.exception("[VLM] LlamaParse step failed")
-            _final_exc = _lp_exc
-            response = None  # ensure fall-through to Gemini lite with images
-
-    # Step 4 — lite Gemini with images (if still no result and model differs from primary)
-    if response is None and payload is None and _lite_model != _primary_model:
-        logger.info("[VLM] Falling back to %r", _lite_model)
-        _model = _lite_model
+    def _run_gemini_step(model_name: str) -> Any:
+        """Run one Gemini model with 3 retries. Returns response or raises."""
+        _resp = None
         for _attempt in range(3):
             try:
-                response = client.models.generate_content(
-                    model=_model,
+                _resp = client.models.generate_content(
+                    model=model_name,
                     contents=contents,
                     config=types.GenerateContentConfig(response_mime_type="application/json"),
                 )
-                break
+                return _resp
             except Exception as _exc:
-                _retryable = "503" in str(_exc) or "UNAVAILABLE" in str(_exc) or "429" in str(_exc)
-                if _retryable:
-                    _final_exc = _exc
+                if _is_retryable(_exc):
                     if _attempt < 2:
                         _wait = 5 * (_attempt + 1)
-                        logger.warning("[VLM] %s attempt %d/3 failed, retrying in %ds", _model, _attempt + 1, _wait)
+                        logger.warning("[VLM] %s attempt %d/3 failed, retrying in %ds", model_name, _attempt + 1, _wait)
                         time.sleep(_wait)
                     else:
-                        logger.warning("[VLM] %s exhausted all 3 attempts", _model)
+                        logger.warning("[VLM] %s exhausted all 3 attempts", model_name)
+                        raise
                 else:
                     raise
+        return _resp
+
+    # Step 1 — primary Gemini model
+    try:
+        response = _run_gemini_step(_model)
+    except Exception as _step_exc:
+        logger.warning("[VLM] %s failed, trying next model: %s", _model, _step_exc)
+        _final_exc = _step_exc
+        response = None
+
+    # Step 2 — secondary Gemini model (free fallback, same API key)
+    if response is None and _secondary_model != _primary_model:
+        _model = _secondary_model
+        logger.info("[VLM] Falling back from primary to secondary model %r", _model)
+        try:
+            response = _run_gemini_step(_model)
+        except Exception as _step_exc:
+            logger.warning("[VLM] %s failed, trying lite model: %s", _model, _step_exc)
+            _final_exc = _step_exc
+            response = None
+
+    # Step 3 — lite Gemini (last resort, image-only)
+    if response is None and payload is None and _lite_model != _primary_model:
+        _model = _lite_model
+        logger.info("[VLM] Falling back to lite model %r", _model)
+        try:
+            response = _run_gemini_step(_model)
+        except Exception as _step_exc:
+            logger.warning("[VLM] %s failed: %s", _model, _step_exc)
+            _final_exc = _step_exc
+            response = None
+
+    # Step 4 — Anthropic Claude (opt-in: only if ANTHROPIC_API_KEY is set)
+    _anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+    _anthropic_model = os.getenv("ANTHROPIC_VLM_MODEL") or "claude-3-5-haiku-20241022"
+    if response is None and payload is None and _anthropic_key:
+        logger.info("[VLM] Falling back to Anthropic model %r", _anthropic_model)
+        try:
+            _text = _call_anthropic_bank_vlm(
+                page_parts,
+                prompt=prompt,
+                pdf_text_block=pdf_text_block,
+                model=_anthropic_model,
+                api_key=_anthropic_key,
+            )
+            payload = _parse_vlm_json_payload(_text, provider="Anthropic VLM")
+            _model = _anthropic_model
+        except Exception as _step_exc:
+            logger.warning("[VLM] Anthropic %s failed: %s", _anthropic_model, _step_exc)
+            _final_exc = _step_exc
+
+    # Step 5 — OpenRouter (opt-in: only if OPENROUTER_API_KEY is set)
+    _or_key = os.getenv("OPENROUTER_API_KEY")
+    _or_model = os.getenv("OPENROUTER_VLM_MODEL") or "meta-llama/llama-3.2-11b-vision-instruct:free"
+    if response is None and payload is None and _or_key:
+        logger.info("[VLM] Falling back to OpenRouter model %r", _or_model)
+        try:
+            _text = _call_openrouter_bank_vlm(
+                page_parts,
+                prompt=prompt,
+                pdf_text_block=pdf_text_block,
+                model=_or_model,
+                api_key=_or_key,
+            )
+            payload = _parse_vlm_json_payload(_text, provider="OpenRouter VLM")
+            _model = _or_model
+        except Exception as _step_exc:
+            logger.warning("[VLM] OpenRouter %s failed: %s", _or_model, _step_exc)
+            _final_exc = _step_exc
 
     if response is None and payload is None:
         raise _final_exc or RuntimeError("All VLM providers exhausted")
@@ -434,6 +485,12 @@ def parse_vlm_statement(
             description=parsed.description,
         )
         lines.append(parsed)
+
+    # Drop zero-amount placeholder rows (VLM sometimes returns blank continuation lines)
+    _before = len(lines)
+    lines = [ln for ln in lines if ln.debit_amount or ln.credit_amount or len(ln.description or "") >= 3]
+    if len(lines) < _before:
+        logger.debug("[VLM] Dropped %d zero-amount placeholder rows from %s", _before - len(lines), _model)
 
     extraction_warnings = [
         item

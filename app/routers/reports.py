@@ -4,7 +4,12 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Response
 
-from app.dependencies import UserAuth, ensure_org_read
+from app.dependencies import UserAuth
+from app.services.aged_payables import generate_aged_payables
+from app.services.aged_receivables import generate_aged_receivables
+from app.services.balance_sheet import generate_balance_sheet
+from app.services.cash_flow import generate_cash_flow
+from app.services.general_ledger import generate_general_ledger
 from app.services.income_statement import generate_income_statement
 from app.services.transaction_report import (
     generate_transaction_report,
@@ -142,7 +147,7 @@ def income_statement_report(
     presentation: Optional[str] = Query(default=None),
 ):
     user_id, db = auth
-    ensure_org_read(user_id, organisation_id)
+    _ensure_reports_view(db, user_id, organisation_id)
     try:
         return {
             "success": True,
@@ -153,6 +158,119 @@ def income_statement_report(
                 date_to=date_to,
                 reporting_standard=reporting_standard,
                 presentation=presentation,
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/balance-sheet")
+def balance_sheet_report(
+    auth: UserAuth,
+    organisation_id: str,
+    as_at_date: str = Query(..., description="Snapshot date in YYYY-MM-DD format."),
+    financial_year_end: Optional[str] = Query(default=None, description="Override the organisation's financial year-end month."),
+):
+    user_id, db = auth
+    _ensure_reports_view(db, user_id, organisation_id)
+    try:
+        return {
+            "success": True,
+            "report": generate_balance_sheet(
+                db,
+                organisation_id=organisation_id,
+                as_at_date=as_at_date,
+                financial_year_end=financial_year_end,
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/general-ledger")
+def general_ledger_report(
+    auth: UserAuth,
+    organisation_id: str,
+    date_from: str = Query(..., description="Start date in YYYY-MM-DD format."),
+    date_to: str = Query(..., description="End date in YYYY-MM-DD format."),
+    account_id: Optional[str] = Query(default=None),
+):
+    user_id, db = auth
+    _ensure_reports_view(db, user_id, organisation_id)
+    try:
+        return {
+            "success": True,
+            "report": generate_general_ledger(
+                db,
+                organisation_id=organisation_id,
+                date_from=date_from,
+                date_to=date_to,
+                account_id=account_id,
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/aged-payables")
+def aged_payables_report(
+    auth: UserAuth,
+    organisation_id: str,
+    as_at_date: str = Query(..., description="Snapshot date in YYYY-MM-DD format."),
+):
+    user_id, db = auth
+    _ensure_reports_view(db, user_id, organisation_id)
+    try:
+        return {
+            "success": True,
+            "report": generate_aged_payables(
+                db,
+                organisation_id=organisation_id,
+                as_at_date=as_at_date,
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/aged-receivables")
+def aged_receivables_report(
+    auth: UserAuth,
+    organisation_id: str,
+    as_at_date: str = Query(..., description="Snapshot date in YYYY-MM-DD format."),
+):
+    user_id, db = auth
+    _ensure_reports_view(db, user_id, organisation_id)
+    try:
+        return {
+            "success": True,
+            "report": generate_aged_receivables(
+                db,
+                organisation_id=organisation_id,
+                as_at_date=as_at_date,
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/cash-flow")
+def cash_flow_report(
+    auth: UserAuth,
+    organisation_id: str,
+    date_from: str = Query(..., description="Start date in YYYY-MM-DD format."),
+    date_to: str = Query(..., description="End date in YYYY-MM-DD format."),
+):
+    user_id, db = auth
+    _ensure_reports_view(db, user_id, organisation_id)
+    try:
+        return {
+            "success": True,
+            "report": generate_cash_flow(
+                db,
+                organisation_id=organisation_id,
+                date_from=date_from,
+                date_to=date_to,
             ),
         }
     except ValueError as exc:

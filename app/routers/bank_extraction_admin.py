@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from app.db.supabase_client import get_supabase_client
 from app.dependencies import UserAuth, ensure_platform_owner
+from app.services.bank_extraction_prompt import DEFAULT_VLM_PROMPT, upsert_vlm_prompt, reset_vlm_prompt
 from app.services.bank_extraction_validation import build_extracted_document, evaluate_extracted_against_gold
 from app.services.bank_statement_service import extract_statement
 
@@ -20,6 +21,11 @@ router = APIRouter(prefix="/api/admin/bank-extraction", tags=["admin-bank-extrac
 
 DUMMY_BANK_ACCOUNT_ID = "00000000-0000-0000-0000-000000000000"
 GOLD_BUCKET = "bank-extraction-gold"
+
+
+class VLMPromptUpdate(BaseModel):
+    prompt_text: str
+    notes: Optional[str] = None
 
 
 class GoldFileCreate(BaseModel):
@@ -47,6 +53,43 @@ def _one(res, detail: str) -> dict[str, Any]:
     if not res.data:
         raise HTTPException(status_code=404, detail=detail)
     return res.data[0] if isinstance(res.data, list) else res.data
+
+
+@router.get("/vlm-prompt")
+def get_vlm_prompt(auth: UserAuth):
+    _user_id, db = _platform_db(auth)
+    res = (
+        db.table("bank_vlm_prompt_config")
+        .select("prompt_text, updated_by, updated_at")
+        .order("created_at", desc=False)
+        .limit(1)
+        .execute()
+    )
+    row = res.data[0] if res.data else None
+    return {
+        "success": True,
+        "is_default": row is None,
+        "prompt_text": row["prompt_text"] if row else DEFAULT_VLM_PROMPT,
+        "updated_at": row.get("updated_at") if row else None,
+        "updated_by": row.get("updated_by") if row else None,
+        "default_prompt": DEFAULT_VLM_PROMPT,
+    }
+
+
+@router.put("/vlm-prompt")
+def update_vlm_prompt(payload: VLMPromptUpdate, auth: UserAuth):
+    user_id, db = _platform_db(auth)
+    if not payload.prompt_text.strip():
+        raise HTTPException(status_code=422, detail="prompt_text cannot be empty")
+    row = upsert_vlm_prompt(db, prompt_text=payload.prompt_text.strip(), user_id=user_id)
+    return {"success": True, "prompt": row}
+
+
+@router.delete("/vlm-prompt")
+def delete_vlm_prompt(auth: UserAuth):
+    _user_id, db = _platform_db(auth)
+    reset_vlm_prompt(db)
+    return {"success": True, "prompt_text": DEFAULT_VLM_PROMPT, "is_default": True}
 
 
 @router.post("/gold-files")
