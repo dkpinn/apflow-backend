@@ -244,6 +244,52 @@ def test_issue_and_receipt_services_use_atomic_rpcs():
     ]
 
 
+def test_sales_invoice_issue_and_receipt_respect_accounting_lock_date():
+    db = _DB(
+        {
+            "sales_invoices": [{
+                "id": "sales-1",
+                "organisation_id": "org-1",
+                "issue_date": "2026-05-31",
+            }],
+            "organisation_accounting_periods": [{
+                "organisation_id": "org-1",
+                "status": "locked",
+                "lock_date": "2026-05-31",
+            }],
+        },
+        rpc_results={
+            "issue_sales_invoice_atomic": {"journal_id": "journal-1"},
+            "post_customer_receipt_atomic": {"receipt_id": "receipt-1"},
+        },
+    )
+
+    with pytest.raises(ValueError, match="accounting lock date"):
+        issue_sales_invoice(
+            db,
+            organisation_id="org-1",
+            sales_invoice_id="sales-1",
+            actor_user_id="user-1",
+        )
+
+    with pytest.raises(ValueError, match="accounting lock date"):
+        post_customer_receipt(
+            db,
+            organisation_id="org-1",
+            customer_id="customer-1",
+            bank_account_id="bank-1",
+            receipt_date="2026-05-31",
+            amount=50,
+            currency="ZAR",
+            reference=None,
+            notes=None,
+            allocations=[],
+            actor_user_id="user-1",
+        )
+
+    assert db.calls == []
+
+
 def test_bank_receipt_suggestion_matches_open_sales_invoice():
     db = _DB(
         {

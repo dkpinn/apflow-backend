@@ -2,15 +2,19 @@ import json
 from decimal import Decimal
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
+import app.routers.inventory as inventory_router
 from app.routers.inventory import (
     InventoryItemInput,
     InventoryStructureInput,
     StockMovementInput,
+    create_stock_movement,
     _item_row,
     _json_payload,
 )
+from tests.conftest import MemoryDB
 
 
 def test_inventory_item_normalizes_core_master_data():
@@ -85,3 +89,34 @@ def test_inventory_write_payloads_are_json_safe_and_preserve_decimal_strings():
     assert structure_header["output_quantity"] == "2.5"
     assert component_row["quantity"] == "1.25"
     assert movement_row["quantity"] == "-1.75"
+
+
+def test_stock_movement_blocks_locked_period(monkeypatch):
+    db = MemoryDB({
+        "inventory_items": [{
+            "id": "item-1",
+            "organisation_id": "org-1",
+            "item_type": "stock_item",
+        }],
+        "organisation_accounting_periods": [{
+            "organisation_id": "org-1",
+            "status": "locked",
+            "lock_date": "2026-05-31",
+        }],
+    })
+    monkeypatch.setattr(inventory_router, "ensure_org_write", lambda *_args: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        create_stock_movement(
+            StockMovementInput(
+                organisation_id="org-1",
+                inventory_item_id="item-1",
+                movement_type="adjustment",
+                quantity=Decimal("1"),
+                occurred_on="2026-05-31",
+            ),
+            auth=("user-1", db),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "accounting lock date" in exc_info.value.detail

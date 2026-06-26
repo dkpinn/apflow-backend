@@ -17,6 +17,11 @@ from app.services.integration_service import (
     get_published_extraction_criteria,
     get_system_policy,
 )
+from app.services.lm_studio_vlm import (
+    DEFAULT_LM_STUDIO_MODEL,
+    env_truthy,
+    lm_studio_vision_text,
+)
 from app.services.invoice_extraction.vlm_parser import (
     DEFAULT_EXTRACTION_PROMPT,
     extract_with_gemini_diagnostic,
@@ -31,6 +36,7 @@ DEFAULT_MODELS = {
     "openai": "gpt-4.1-mini",
     "anthropic": "claude-3-5-sonnet-latest",
     "openrouter": "google/gemini-2.5-flash",
+    "lm_studio": DEFAULT_LM_STUDIO_MODEL,
 }
 
 
@@ -310,6 +316,81 @@ def _run_openrouter_provider(
         }
 
 
+def _run_lm_studio_provider(
+    *,
+    integration: dict,
+    api_key: str,
+    file_bytes: bytes,
+    mime_type: Optional[str],
+    prompt: Optional[str],
+) -> dict:
+    effective_mime = (mime_type or "application/pdf").lower()
+    page_parts = preprocess_for_vlm(file_bytes, effective_mime)
+    schema = vlm_invoice_json_schema()
+    text_prompt = (
+        f"{prompt or DEFAULT_EXTRACTION_PROMPT}\n\n"
+        "Return only JSON matching this schema. No markdown.\n"
+        f"Schema: {json.dumps(schema)}"
+    ).strip()
+    try:
+        response = lm_studio_vision_text(
+            prompt=text_prompt,
+            page_parts=page_parts,
+            integration=integration,
+            api_key=api_key,
+        )
+        return {
+            "data": _normalise_provider_json(response["text"]),
+            "reason": None,
+            "error": None,
+            "model": response["model"],
+        }
+    except Exception as exc:
+        return {
+            "data": None,
+            "reason": "invalid_schema",
+            "error_type": exc.__class__.__name__,
+            "error": str(exc)[:1000],
+            "model": integration.get("model") or os.getenv("LM_STUDIO_VLM_MODEL") or DEFAULT_MODELS["lm_studio"],
+        }
+
+
+def _env_lm_studio_fallback(file_bytes: bytes, mime_type: Optional[str], prompt: Optional[str] = None) -> dict:
+    api_key = os.getenv("LM_STUDIO_API_KEY", "lm-studio")
+    model = os.getenv("LM_STUDIO_VLM_MODEL") or DEFAULT_MODELS["lm_studio"]
+    try:
+        result = _run_lm_studio_provider(
+            integration={"provider": "lm_studio", "model": os.getenv("LM_STUDIO_VLM_MODEL"), "config": {}},
+            api_key=api_key,
+            file_bytes=file_bytes,
+            mime_type=mime_type,
+            prompt=prompt,
+        )
+    except Exception as exc:
+        result = {
+            "data": None,
+            "reason": "provider_exception",
+            "error_type": exc.__class__.__name__,
+            "error": str(exc)[:1000],
+        }
+    result.setdefault("provider", "lm_studio")
+    result["provider"] = "lm_studio"
+    result["model"] = result.get("model") or model
+    result["source"] = "env"
+    result["attempts"] = [
+        {
+            "provider": "lm_studio",
+            "model": result["model"],
+            "source": "env",
+            "reason": result.get("reason"),
+            "error": result.get("error"),
+            "error_type": result.get("error_type"),
+            "success": result.get("data") is not None,
+        }
+    ]
+    return result
+
+
 def _provider_not_implemented(**_kwargs) -> dict:
     return {
         "data": None,
@@ -324,6 +405,7 @@ PROVIDER_RUNNERS: dict[str, Callable[..., dict]] = {
     "anthropic": _run_anthropic_provider,
     "openrouter": _run_openrouter_provider,
     "openai_compatible": _run_openrouter_provider,
+    "lm_studio": _run_lm_studio_provider,
 }
 
 
@@ -368,9 +450,8 @@ def extract_with_vlm_fallback(
     """
     Run platform-configured VLM providers in fallback order.
 
-    If no database integration is available, keep the current env-backed Gemini
-    behavior. That preserves existing deployments while the platform dashboard is
-    being rolled out.
+    If LM Studio is enabled, try the local model first. The old Gemini/OpenRouter
+    path remains behind it as the backup procedure.
     """
     try:
         db = supabase or get_supabase_client()
@@ -384,12 +465,31 @@ def extract_with_vlm_fallback(
             }
         integrations = _ordered_integrations(_active_system_integrations(db), policy)
     except Exception as exc:
+        if env_truthy("LM_STUDIO_VLM_ENABLED"):
+            lm_result = _env_lm_studio_fallback(file_bytes, mime_type)
+            lm_result["config_error"] = str(exc)[:500]
+            if lm_result.get("data") is not None:
+                return lm_result
         env_result = _env_gemini_fallback(file_bytes, mime_type)
         env_result["config_error"] = str(exc)[:500]
+        if env_truthy("LM_STUDIO_VLM_ENABLED"):
+            env_result["attempts"] = (lm_result.get("attempts") or []) + (env_result.get("attempts") or [])
+            env_result["lm_studio_error"] = lm_result.get("error")
         return env_result
+
+    prompt = _criteria_prompt(db, task)
+    pre_attempts: list[dict] = []
+    if env_truthy("LM_STUDIO_VLM_ENABLED"):
+        lm_result = _env_lm_studio_fallback(file_bytes, mime_type, prompt=prompt)
+        pre_attempts = lm_result.get("attempts") or []
+        if lm_result.get("data") is not None:
+            return lm_result
 
     if not integrations:
         env_result = _env_gemini_fallback(file_bytes, mime_type)
+        if env_truthy("LM_STUDIO_VLM_ENABLED"):
+            env_result["attempts"] = pre_attempts + (env_result.get("attempts") or [])
+            env_result["lm_studio_error"] = lm_result.get("error")
         if env_result.get("data") is not None:
             return env_result
         or_key = os.getenv("OPENROUTER_API_KEY")
@@ -410,7 +510,6 @@ def extract_with_vlm_fallback(
                 env_result["openrouter_error"] = str(exc)[:500]
         return env_result
 
-    prompt = _criteria_prompt(db, task)
     attempts: list[dict] = []
     last_result: dict = {
         "data": None,
@@ -425,7 +524,7 @@ def extract_with_vlm_fallback(
         started = time.monotonic()
         try:
             api_key = decrypt_secret(integration.get("encrypted_api_key"))
-            if not api_key:
+            if not api_key and provider != "lm_studio":
                 result = {
                     "data": None,
                     "reason": "missing_api_key",
@@ -434,7 +533,7 @@ def extract_with_vlm_fallback(
             else:
                 result = runner(
                     integration=integration,
-                    api_key=api_key,
+                    api_key=api_key or os.getenv("LM_STUDIO_API_KEY", "lm-studio"),
                     file_bytes=file_bytes,
                     mime_type=mime_type,
                     prompt=prompt,
@@ -467,10 +566,10 @@ def extract_with_vlm_fallback(
                 "model": model,
                 "source": "system_integration",
                 "integration_id": integration.get("id"),
-                "attempts": attempts,
+                "attempts": pre_attempts + attempts,
             })
             return last_result
 
     last_result.setdefault("provider", attempts[-1]["provider"] if attempts else None)
-    last_result["attempts"] = attempts
+    last_result["attempts"] = pre_attempts + attempts
     return last_result

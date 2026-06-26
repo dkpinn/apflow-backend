@@ -26,6 +26,7 @@ from app.routers import admin_accounts
 from app.routers import integrations
 from app.routers import bank
 from app.routers import bank_journals
+from app.routers import bank_rules
 from app.routers import bank_uploads
 from app.routers import bank_lines
 from app.routers import bank_extraction_benchmark
@@ -40,6 +41,12 @@ from app.routers import customer_receipts
 from app.routers import inventory
 from app.routers import finance_leases
 from app.routers import command_centre
+from app.routers import go_live_checklist
+from app.routers import accounting_periods
+from app.routers import opening_balances
+from app.routers import audit_trail
+from app.routers import customer_collections
+from app.routers import supplier_payment_runs
 
 logger = logging.getLogger("apflow.sweep")
 
@@ -379,6 +386,7 @@ app.include_router(admin_accounts.router)
 app.include_router(integrations.router)
 app.include_router(bank.router)
 app.include_router(bank_journals.router)
+app.include_router(bank_rules.router)
 app.include_router(bank_uploads.router)
 app.include_router(bank_lines.router)
 app.include_router(bank_extraction_benchmark.router)
@@ -393,6 +401,12 @@ app.include_router(customer_receipts.router)
 app.include_router(inventory.router)
 app.include_router(finance_leases.router)
 app.include_router(command_centre.router)
+app.include_router(go_live_checklist.router)
+app.include_router(accounting_periods.router)
+app.include_router(opening_balances.router)
+app.include_router(audit_trail.router)
+app.include_router(customer_collections.router)
+app.include_router(supplier_payment_runs.router)
 
 
 @app.get("/")

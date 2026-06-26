@@ -14,6 +14,11 @@ import re
 import time
 from typing import Any
 
+from app.services.lm_studio_vlm import (
+    lm_studio_enabled as shared_lm_studio_enabled,
+    lm_studio_vision_text,
+)
+
 logger = logging.getLogger(__name__)
 
 # ── JSON schema for the extracted payload ─────────────────────────────────────
@@ -160,6 +165,71 @@ def _call_anthropic(
     return resp.json()["content"][0]["text"] or "{}"
 
 
+def _lm_studio_enabled() -> bool:
+    return shared_lm_studio_enabled()
+
+
+def _resolve_lm_studio_model(base_url: str, timeout: int) -> str:
+    configured_model = os.getenv("LM_STUDIO_VLM_MODEL")
+    if configured_model:
+        return configured_model
+    try:
+        import httpx as _httpx
+
+        resp = _httpx.get(f"{base_url}/models", timeout=min(timeout, 5))
+        resp.raise_for_status()
+        models = resp.json().get("data") or []
+        first_model = next((row.get("id") for row in models if row.get("id")), None)
+        if first_model:
+            return str(first_model)
+    except Exception:
+        pass
+    return "local-model"
+
+
+def _call_lm_studio(
+    page_parts: list[tuple[bytes, str]],
+    *,
+    pdf_text_block: str | None,
+) -> str:
+    response = lm_studio_vision_text(
+        prompt=LEASE_EXTRACTION_PROMPT,
+        page_parts=page_parts,
+        pdf_text_block=pdf_text_block,
+    )
+    return response["text"]
+
+    import base64
+    import httpx as _httpx
+
+    base_url = os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1").rstrip("/")
+    timeout = int(os.getenv("LM_STUDIO_TIMEOUT_SECONDS", "120"))
+    model = _resolve_lm_studio_model(base_url, timeout)
+    api_key = os.getenv("LM_STUDIO_API_KEY", "lm-studio")
+    content: list[dict] = [{"type": "text", "text": LEASE_EXTRACTION_PROMPT}]
+    if pdf_text_block:
+        content.append({"type": "text", "text": f"PDF TEXT:\n\n{pdf_text_block}"})
+    for img_bytes, img_mime in page_parts:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{img_mime};base64,{base64.b64encode(img_bytes).decode()}"},
+        })
+    resp = _httpx.post(
+        f"{base_url}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0,
+            "max_tokens": int(os.getenv("LM_STUDIO_MAX_TOKENS", "8192")),
+        },
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"] or "{}"
+
+
 def extract_lease_document(
     file_bytes: bytes,
     *,
@@ -172,8 +242,6 @@ def extract_lease_document(
     Raises ValueError if all providers fail.
     """
     try:
-        from google import genai  # type: ignore
-        from google.genai import types  # type: ignore
         from app.services.invoice_extraction.vlm_parser import preprocess_for_vlm
     except Exception as exc:
         raise ValueError("VLM lease extraction is not available in this environment") from exc
@@ -196,8 +264,21 @@ def extract_lease_document(
             pass
 
     # ── Provider 1: Gemini ────────────────────────────────────────────────────
+    if _lm_studio_enabled():
+        try:
+            text = _call_lm_studio(page_parts, pdf_text_block=pdf_text_block)
+            payload = _parse_json(text, provider="LM Studio")
+            payload["_provider"] = f"lm_studio/{os.getenv('LM_STUDIO_VLM_MODEL') or 'local-model'}"
+            logger.info("[LeaseExtract] LM Studio succeeded (conf=%.2f)", payload.get("confidence_score", 0))
+            return payload
+        except Exception as exc:
+            logger.warning("[LeaseExtract] LM Studio failed, falling back to backup providers: %s", exc)
+
     google_api_key = os.getenv("GOOGLE_API_KEY")
     if google_api_key:
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
+
         primary_model   = os.getenv("GEMINI_VLM_MODEL", "gemini-2.5-flash")
         secondary_model = os.getenv("GEMINI_VLM_SECONDARY_MODEL", "gemini-2.0-flash")
         client = genai.Client(api_key=google_api_key)

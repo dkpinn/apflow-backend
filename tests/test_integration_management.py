@@ -9,10 +9,12 @@ from app.routers.admin_integrations import (
     ExtractionCriteriaRequest,
     SystemIntegrationCreateRequest,
     add_system_integration,
+    get_lm_studio_health,
+    get_platform_settings,
     get_platform_extraction_criteria,
     put_platform_extraction_criteria,
 )
-from app.services import ai_provider_fallback
+from app.services import ai_provider_fallback, lm_studio_vlm
 from app.services.integration_secrets import decrypt_secret
 from app.services.integration_service import (
     ORG_INTEGRATIONS_TABLE,
@@ -119,8 +121,11 @@ class IntegrationManagementTests(unittest.TestCase):
     def setUp(self):
         self.old_secret = os.environ.get("INTEGRATION_SECRET_KEY")
         self.old_owner = os.environ.get("PLATFORM_OWNER_USER_IDS")
+        self.old_lm_studio_enabled = os.environ.get("LM_STUDIO_VLM_ENABLED")
+        self.old_lm_studio_model = os.environ.get("LM_STUDIO_VLM_MODEL")
         os.environ["INTEGRATION_SECRET_KEY"] = "test-secret-for-integrations"
         os.environ["PLATFORM_OWNER_USER_IDS"] = "owner-user"
+        os.environ["LM_STUDIO_VLM_ENABLED"] = "false"
         self.db = _FakeDB()
         self.old_get_supabase_client = admin_integrations.get_supabase_client
         self.old_dependencies_get_supabase_client = dependencies.get_supabase_client
@@ -136,6 +141,14 @@ class IntegrationManagementTests(unittest.TestCase):
             os.environ.pop("PLATFORM_OWNER_USER_IDS", None)
         else:
             os.environ["PLATFORM_OWNER_USER_IDS"] = self.old_owner
+        if self.old_lm_studio_enabled is None:
+            os.environ.pop("LM_STUDIO_VLM_ENABLED", None)
+        else:
+            os.environ["LM_STUDIO_VLM_ENABLED"] = self.old_lm_studio_enabled
+        if self.old_lm_studio_model is None:
+            os.environ.pop("LM_STUDIO_VLM_MODEL", None)
+        else:
+            os.environ["LM_STUDIO_VLM_MODEL"] = self.old_lm_studio_model
         admin_integrations.get_supabase_client = self.old_get_supabase_client
         dependencies.get_supabase_client = self.old_dependencies_get_supabase_client
 
@@ -171,6 +184,40 @@ class IntegrationManagementTests(unittest.TestCase):
             )
 
         self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_platform_owner_can_check_lm_studio_health(self):
+        old_health = admin_integrations.lm_studio_health
+        try:
+            admin_integrations.lm_studio_health = lambda: {
+                "enabled": True,
+                "base_url": "http://127.0.0.1:1234/v1",
+                "detected_model": "local-test-model",
+                "ok": True,
+                "error": None,
+            }
+            result = get_lm_studio_health(("owner-user", object()))
+        finally:
+            admin_integrations.lm_studio_health = old_health
+
+        self.assertTrue(result["lm_studio"]["ok"])
+        self.assertEqual(result["lm_studio"]["detected_model"], "local-test-model")
+
+    def test_platform_settings_include_lm_studio_status(self):
+        old_health = admin_integrations.lm_studio_health
+        try:
+            admin_integrations.lm_studio_health = lambda: {
+                "enabled": True,
+                "base_url": "http://127.0.0.1:1234/v1",
+                "detected_model": "local-test-model",
+                "ok": True,
+                "error": None,
+            }
+            result = get_platform_settings(("owner-user", object()))
+        finally:
+            admin_integrations.lm_studio_health = old_health
+
+        self.assertTrue(result["lm_studio"]["ok"])
+        self.assertEqual(result["lm_studio"]["base_url"], "http://127.0.0.1:1234/v1")
 
     def test_extraction_criteria_are_versioned_and_latest_published_is_returned(self):
         put_platform_extraction_criteria(
@@ -257,6 +304,62 @@ class IntegrationManagementTests(unittest.TestCase):
         self.assertEqual(result["data"]["supplier_name_extracted"], "PRODEC PAINTS CC")
         self.assertEqual([attempt["provider"] for attempt in result["attempts"]], ["openai", "gemini"])
 
+    def test_lm_studio_env_provider_runs_before_configured_integrations(self):
+        from app.services.integration_secrets import encrypt_secret, secret_fingerprint
+
+        self.db.tables[SYSTEM_INTEGRATIONS_TABLE] = [
+            {
+                "id": "gemini-1",
+                "provider": "gemini",
+                "capability": "vlm",
+                "enabled": True,
+                "model": "gemini-test",
+                "encrypted_api_key": encrypt_secret("gemini-key"),
+                "api_key_fingerprint": secret_fingerprint("gemini-key"),
+            }
+        ]
+        self.db.tables[SYSTEM_POLICIES_TABLE] = [
+            {
+                "id": "policy-1",
+                "task": "invoice_vlm_extraction",
+                "enabled": True,
+                "ordered_integration_ids": ["gemini-1"],
+                "config": {},
+            }
+        ]
+
+        old_lm_runner = ai_provider_fallback._run_lm_studio_provider
+        old_runners = dict(ai_provider_fallback.PROVIDER_RUNNERS)
+        try:
+            os.environ["LM_STUDIO_VLM_ENABLED"] = "true"
+            os.environ["LM_STUDIO_VLM_MODEL"] = "local-test-model"
+            ai_provider_fallback._run_lm_studio_provider = lambda **_kwargs: {
+                "data": {"supplier_name_extracted": "LOCAL SUPPLIER", "confidence_score": 0.97},
+                "reason": None,
+                "error": None,
+                "model": "local-test-model",
+            }
+            ai_provider_fallback.PROVIDER_RUNNERS["gemini"] = lambda **_kwargs: {
+                "data": {"supplier_name_extracted": "GEMINI SUPPLIER", "confidence_score": 0.95},
+                "reason": None,
+                "error": None,
+            }
+
+            result = ai_provider_fallback.extract_with_vlm_fallback(
+                b"fake-pdf",
+                "application/pdf",
+                supabase=self.db,
+            )
+        finally:
+            ai_provider_fallback._run_lm_studio_provider = old_lm_runner
+            ai_provider_fallback.PROVIDER_RUNNERS.clear()
+            ai_provider_fallback.PROVIDER_RUNNERS.update(old_runners)
+
+        self.assertEqual(result["provider"], "lm_studio")
+        self.assertEqual(result["model"], "local-test-model")
+        self.assertEqual(result["data"]["supplier_name_extracted"], "LOCAL SUPPLIER")
+        self.assertEqual([attempt["provider"] for attempt in result["attempts"]], ["lm_studio"])
+
     def test_openai_adapter_normalises_response_to_invoice_schema(self):
         calls = []
 
@@ -319,6 +422,47 @@ class IntegrationManagementTests(unittest.TestCase):
         self.assertEqual(result["data"]["supplier_name_extracted"], "ANTHROPIC SUPPLIER")
         self.assertEqual(calls[0][0][0], "https://api.anthropic.com/v1/messages")
         self.assertEqual(calls[0][1]["json"]["messages"][0]["content"][1]["type"], "image")
+
+    def test_lm_studio_adapter_uses_local_openai_compatible_chat_endpoint(self):
+        calls = []
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"supplier_name_extracted":"LOCAL SUPPLIER","confidence_score":0.93}'
+                            }
+                        }
+                    ]
+                }
+
+        old_post = lm_studio_vlm.httpx.post
+        try:
+            lm_studio_vlm.httpx.post = lambda *args, **kwargs: calls.append((args, kwargs)) or _FakeResponse()
+            result = ai_provider_fallback._run_lm_studio_provider(
+                integration={
+                    "provider": "lm_studio",
+                    "model": "local-test-model",
+                    "base_url": "http://127.0.0.1:1234/v1",
+                    "config": {},
+                },
+                api_key="lm-studio",
+                file_bytes=b"fake-image",
+                mime_type="image/png",
+                prompt="Extract this invoice.",
+            )
+        finally:
+            lm_studio_vlm.httpx.post = old_post
+
+        self.assertEqual(result["data"]["supplier_name_extracted"], "LOCAL SUPPLIER")
+        self.assertEqual(calls[0][0][0], "http://127.0.0.1:1234/v1/chat/completions")
+        self.assertEqual(calls[0][1]["json"]["messages"][0]["content"][1]["type"], "image_url")
+        self.assertEqual(calls[0][1]["json"]["model"], "local-test-model")
 
 
 if __name__ == "__main__":

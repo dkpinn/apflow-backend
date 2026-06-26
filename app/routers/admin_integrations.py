@@ -23,6 +23,7 @@ from app.services.integration_service import (
     update_system_policy,
     upsert_extraction_criteria,
 )
+from app.services.lm_studio_vlm import lm_studio_health
 
 router = APIRouter(prefix="/api/admin", tags=["admin-integrations"])
 
@@ -128,7 +129,14 @@ def get_platform_settings(auth: UserAuth) -> dict:
         "extraction_criteria": {
             task: get_extraction_criteria(db, task),
         },
+        "lm_studio": lm_studio_health(),
     }
+
+
+@router.get("/lm-studio/health")
+def get_lm_studio_health(auth: UserAuth) -> dict:
+    _user_id, _db = _platform_db(auth)
+    return {"lm_studio": lm_studio_health()}
 
 
 @router.post("/system-integrations")

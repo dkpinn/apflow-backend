@@ -227,3 +227,31 @@ def test_persistence_uses_the_atomic_rpc_and_preserves_response_shape():
         "trade_payables_account": "2100",
         "vat_control_account": "8100",
     }
+
+
+def test_persistence_blocks_supplier_invoice_inside_locked_period():
+    prepared = prepare_invoice_gl_posting(
+        _DB(_tables()),
+        invoice_id="invoice-1",
+        org_id="org-1",
+    )
+    prepared["journal_date"] = "2026-05-31"
+    db = _DB(
+        {
+            "organisation_accounting_periods": [{
+                "organisation_id": "org-1",
+                "status": "locked",
+                "lock_date": "2026-05-31",
+            }],
+        },
+        rpc_result={"journal_id": "journal-1"},
+    )
+
+    with pytest.raises(ValueError, match="accounting lock date"):
+        persist_prepared_invoice_posting(
+            db,
+            prepared=prepared,
+            user_id="user-1",
+        )
+
+    assert db.rpc_call is None

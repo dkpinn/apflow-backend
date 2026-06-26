@@ -18,6 +18,35 @@ def amount_out(value: Decimal) -> float:
     return float(value.quantize(MONEY, rounding=ROUND_HALF_UP))
 
 
+def _warning(code: str, message: str, amount: Decimal | None = None) -> dict:
+    row = {"code": code, "message": message}
+    if amount is not None:
+        row["amount"] = amount_out(amount)
+    return row
+
+
+def _exception(
+    *,
+    code: str,
+    severity: str,
+    message: str,
+    amount: Decimal | None = None,
+    row: dict | None = None,
+) -> dict:
+    source = row or {}
+    return {
+        "code": code,
+        "severity": severity,
+        "date": source.get("date") or "",
+        "supplier": source.get("supplier") or "",
+        "supplier_vat_number": source.get("supplier_vat_number") or "",
+        "invoice_number": source.get("invoice_number") or "",
+        "description": source.get("description") or message,
+        "message": message,
+        "amount": amount_out(amount or ZERO),
+    }
+
+
 def allocate_amount_by_weights(total: Any, weights: list[Any]) -> list[Decimal]:
     amount = money(total)
     decimal_weights = [abs(money(weight)) for weight in weights]
@@ -312,6 +341,7 @@ def generate_vat_report(
     )
     historical_variance = ZERO
     warnings: list[dict] = []
+    exceptions: list[dict] = []
     period_rows: list[dict] = []
     invoice_vat_debits: dict[str, Decimal] = {}
     detailed_invoice_claimability: set[str] = set()
@@ -368,6 +398,8 @@ def generate_vat_report(
         period_rows.append({
             "id": line.get("id"),
             "journal_id": line.get("gl_journal_id"),
+            "source_type": journal.get("source_type") or "",
+            "source_id": journal.get("source_id") or "",
             "date": journal_date,
             "supplier": metadata.get("supplier") or "",
             "supplier_vat_number": metadata.get("supplier_vat_number") or "",
@@ -398,22 +430,107 @@ def generate_vat_report(
     calculated_vat_position = opening_balance + output_vat - allowable_input_vat
 
     if historical_variance > ZERO:
-        warnings.append({
-            "code": "historical_claimability_variance",
-            "message": (
-                "Historical invoice postings include VAT that is not currently claimable. "
-                "The adjusted calculated position differs from the VAT Control balance."
-            ),
-            "amount": amount_out(historical_variance),
-        })
+        message = (
+            "Historical invoice postings include VAT that is not currently claimable. "
+            "The adjusted calculated position differs from the VAT Control balance."
+        )
+        warnings.append(_warning("historical_claimability_variance", message, historical_variance))
+        exceptions.append(
+            _exception(
+                code="historical_claimability_variance",
+                severity="warning",
+                message=message,
+                amount=historical_variance,
+            )
+        )
     if not any(row.get("credit_amount") for row in period_rows):
-        warnings.append({
-            "code": "no_output_vat_detail",
-            "message": (
-                "No output VAT credits were posted in this period. Output VAT is limited "
-                "to transactions already posted to the VAT Control account."
-            ),
-        })
+        message = (
+            "No output VAT credits were posted in this period. Output VAT is limited "
+            "to transactions already posted to the VAT Control account."
+        )
+        warnings.append(_warning("no_output_vat_detail", message))
+        exceptions.append(
+            _exception(
+                code="no_output_vat_detail",
+                severity="info",
+                message=message,
+            )
+        )
+
+    for row in period_rows:
+        if money(row.get("blocked_input_vat")) > ZERO:
+            exceptions.append(
+                _exception(
+                    code="blocked_input_vat",
+                    severity="review",
+                    row=row,
+                    amount=money(row.get("blocked_input_vat")),
+                    message="Input VAT was blocked/non-claimable for this line.",
+                )
+            )
+        if money(row.get("claimability_variance")) > ZERO:
+            exceptions.append(
+                _exception(
+                    code="posted_input_exceeds_allowable",
+                    severity="warning",
+                    row=row,
+                    amount=money(row.get("claimability_variance")),
+                    message="Posted VAT Control debit exceeds the currently allowable input VAT.",
+                )
+            )
+        if (
+            row.get("source_type") == "invoice"
+            and money(row.get("debit_amount")) > ZERO
+            and not str(row.get("supplier_vat_number") or "").strip()
+        ):
+            exceptions.append(
+                _exception(
+                    code="missing_supplier_vat_number",
+                    severity="warning",
+                    row=row,
+                    amount=money(row.get("debit_amount")),
+                    message="Supplier invoice has input VAT activity but no supplier VAT number.",
+                )
+            )
+        if row.get("source_type") != "invoice" and money(row.get("debit_amount")) > ZERO:
+            exceptions.append(
+                _exception(
+                    code="manual_input_vat",
+                    severity="review",
+                    row=row,
+                    amount=money(row.get("debit_amount")),
+                    message="Input VAT debit is not linked to a supplier invoice source.",
+                )
+            )
+
+    warning_codes = {warning["code"] for warning in warnings}
+    for exception in exceptions:
+        if exception["severity"] in {"warning", "review"} and exception["code"] not in warning_codes:
+            warnings.append(_warning(exception["code"], exception["message"], money(exception["amount"])))
+            warning_codes.add(exception["code"])
+
+    exception_summary = {
+        "total": len(exceptions),
+        "warnings": sum(1 for row in exceptions if row["severity"] == "warning"),
+        "review": sum(1 for row in exceptions if row["severity"] == "review"),
+        "info": sum(1 for row in exceptions if row["severity"] == "info"),
+        "blocked_input_vat_count": sum(1 for row in exceptions if row["code"] == "blocked_input_vat"),
+        "missing_supplier_vat_count": sum(1 for row in exceptions if row["code"] == "missing_supplier_vat_number"),
+        "manual_input_vat_count": sum(1 for row in exceptions if row["code"] == "manual_input_vat"),
+        "variance_count": sum(
+            1
+            for row in exceptions
+            if row["code"] in {"historical_claimability_variance", "posted_input_exceeds_allowable"}
+        ),
+    }
+    sars_summary = {
+        "output_tax": amount_out(output_vat),
+        "input_tax_claimable": amount_out(allowable_input_vat),
+        "input_tax_blocked": amount_out(blocked_input_vat),
+        "net_vat_payable_refundable": amount_out(output_vat - allowable_input_vat),
+        "gl_control_closing_balance": amount_out(actual_closing_balance),
+        "review_exception_count": exception_summary["total"],
+    }
 
     return {
         "organisation_id": organisation_id,
@@ -432,6 +549,9 @@ def generate_vat_report(
             "calculated_vat_position": amount_out(calculated_vat_position),
             "historical_claimability_variance": amount_out(historical_variance),
         },
+        "sars_summary": sars_summary,
+        "exception_summary": exception_summary,
+        "exceptions": exceptions,
         "rows": period_rows,
         "warnings": warnings,
         "disclaimer": (
@@ -450,7 +570,22 @@ EXPORT_COLUMNS = [
     ("debit_amount", "Debit Amount"),
     ("credit_amount", "Credit Amount"),
     ("gross_amount", "Gross Amount"),
+    ("allowable_input_vat", "Allowable Input VAT"),
+    ("blocked_input_vat", "Blocked Input VAT"),
+    ("claimability_variance", "Claimability Variance"),
     ("running_total", "Running Total"),
+]
+
+EXCEPTION_COLUMNS = [
+    ("severity", "Severity"),
+    ("code", "Code"),
+    ("date", "Date"),
+    ("supplier", "Supplier"),
+    ("supplier_vat_number", "Supplier VAT Number"),
+    ("invoice_number", "Invoice Number"),
+    ("description", "Description / Details"),
+    ("message", "Review Message"),
+    ("amount", "Amount"),
 ]
 
 
@@ -473,11 +608,17 @@ def vat_report_text(report: dict) -> bytes:
     stream.write(f"Allowable input VAT\t{summary.get('allowable_input_vat', 0):.2f}\n")
     stream.write(f"Blocked input VAT\t{summary.get('blocked_input_vat', 0):.2f}\n")
     stream.write(f"Closing VAT Control balance\t{summary.get('closing_vat_control_balance', 0):.2f}\n")
+    stream.write(f"Review exceptions\t{(report.get('exception_summary') or {}).get('total', 0)}\n")
     stream.write(f"Notice\t{report.get('disclaimer', '')}\n\n")
     writer = csv.writer(stream, delimiter="\t", lineterminator="\n")
+    stream.write("VAT Detail\n")
     writer.writerow([label for _, label in EXPORT_COLUMNS])
     for row in report.get("rows") or []:
         writer.writerow([row.get(key, "") for key, _ in EXPORT_COLUMNS])
+    stream.write("\nReview Exceptions\n")
+    writer.writerow([label for _, label in EXCEPTION_COLUMNS])
+    for row in report.get("exceptions") or []:
+        writer.writerow([row.get(key, "") for key, _ in EXCEPTION_COLUMNS])
     return stream.getvalue().encode("utf-8")
 
 
@@ -518,6 +659,38 @@ def vat_report_xlsx(report: dict) -> bytes:
         if isinstance(cell.value, (int, float)):
             cell.number_format = '#,##0.00;[Red]-#,##0.00'
 
+    sars_sheet = workbook.create_sheet("SARS Review")
+    sars_sheet.append(["SARS-facing VAT Summary", ""])
+    sars_labels = {
+        "output_tax": "Output tax",
+        "input_tax_claimable": "Input tax claimable",
+        "input_tax_blocked": "Input tax blocked / non-claimable",
+        "net_vat_payable_refundable": "Net VAT payable / refundable",
+        "gl_control_closing_balance": "GL VAT Control closing balance",
+        "review_exception_count": "Review exception count",
+    }
+    for key, label in sars_labels.items():
+        sars_sheet.append([label, (report.get("sars_summary") or {}).get(key, 0)])
+    sars_sheet.append([])
+    sars_sheet.append(["Exception Summary", ""])
+    for key, label in {
+        "total": "Total exceptions",
+        "warnings": "Warnings",
+        "review": "Review items",
+        "info": "Information",
+        "blocked_input_vat_count": "Blocked input VAT lines",
+        "missing_supplier_vat_count": "Missing supplier VAT numbers",
+        "manual_input_vat_count": "Manual input VAT lines",
+        "variance_count": "Variance items",
+    }.items():
+        sars_sheet.append([label, (report.get("exception_summary") or {}).get(key, 0)])
+    sars_sheet["A1"].font = Font(bold=True, size=14)
+    sars_sheet.column_dimensions["A"].width = 36
+    sars_sheet.column_dimensions["B"].width = 22
+    for cell in sars_sheet["B"]:
+        if isinstance(cell.value, (int, float)):
+            cell.number_format = '#,##0.00;[Red]-#,##0.00'
+
     detail_sheet = workbook.create_sheet("VAT Detail")
     detail_sheet.append([label for _, label in EXPORT_COLUMNS])
     for row in report.get("rows") or []:
@@ -531,14 +704,34 @@ def vat_report_xlsx(report: dict) -> bytes:
     for cell in detail_sheet[1]:
         cell.font = Font(bold=True)
         cell.fill = header_fill
-    widths = [13, 25, 20, 18, 42, 16, 16, 16, 16]
+    widths = [13, 25, 20, 18, 42, 16, 16, 16, 18, 18, 20, 16]
     for index, width in enumerate(widths, start=1):
         detail_sheet.column_dimensions[chr(64 + index)].width = width
-    for row in detail_sheet.iter_rows(min_row=2, min_col=6, max_col=9):
+    for row in detail_sheet.iter_rows(min_row=2, min_col=6, max_col=12):
         for cell in row:
             cell.number_format = '#,##0.00;[Red]-#,##0.00'
     for cell in detail_sheet["A"][1:]:
         cell.number_format = "yyyy-mm-dd"
+
+    exception_sheet = workbook.create_sheet("Review Exceptions")
+    exception_sheet.append([label for _, label in EXCEPTION_COLUMNS])
+    for row in report.get("exceptions") or []:
+        values = [row.get(key, "") for key, _ in EXCEPTION_COLUMNS]
+        if values[2]:
+            values[2] = date.fromisoformat(str(values[2]))
+        exception_sheet.append(values)
+    exception_sheet.freeze_panes = "A2"
+    exception_sheet.auto_filter.ref = exception_sheet.dimensions
+    for cell in exception_sheet[1]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+    exception_widths = [12, 28, 13, 25, 20, 18, 42, 58, 16]
+    for index, width in enumerate(exception_widths, start=1):
+        exception_sheet.column_dimensions[chr(64 + index)].width = width
+    for cell in exception_sheet["C"][1:]:
+        cell.number_format = "yyyy-mm-dd"
+    for cell in exception_sheet["I"][1:]:
+        cell.number_format = '#,##0.00;[Red]-#,##0.00'
 
     output = io.BytesIO()
     workbook.save(output)

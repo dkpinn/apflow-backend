@@ -10,6 +10,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
+from app.services.accounting_locks import assert_accounting_period_unlocked
 from app.services.bank_statement_service import (
     dec_to_float,
     money,
@@ -142,6 +143,15 @@ def post_bank_journal(journal_id: str, payload: PostJournalRequest, auth: UserAu
     )
     if journal.get("status") != "draft":
         raise HTTPException(status_code=400, detail="Only draft journals can be posted")
+    try:
+        assert_accounting_period_unlocked(
+            db,
+            organisation_id=organisation_id,
+            transaction_date=journal.get("journal_date"),
+            action="Post bank journal",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     journal_lines = (
         db.table("gl_journal_lines")
         .select("account_id, tracking, sort_order")
@@ -227,6 +237,15 @@ def unpost_bank_journal(journal_id: str, payload: PostJournalRequest, auth: User
     )
     if journal.get("status") != "posted":
         raise HTTPException(status_code=400, detail="Only posted journals can be unposted")
+    try:
+        assert_accounting_period_unlocked(
+            db,
+            organisation_id=organisation_id,
+            transaction_date=journal.get("journal_date"),
+            action="Reverse bank journal",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     source_line_id = journal.get("source_id") if journal.get("source_type") == "bank_transaction" else None
     if not source_line_id:
         raise HTTPException(status_code=400, detail="Only bank transaction journals can be unposted here")

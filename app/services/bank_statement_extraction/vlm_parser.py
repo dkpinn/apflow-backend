@@ -10,6 +10,10 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 from app.services.extraction_foundation import extraction_metadata, warning
+from app.services.lm_studio_vlm import (
+    lm_studio_enabled as shared_lm_studio_enabled,
+    lm_studio_vision_text,
+)
 
 from .common import (
     clean_description,
@@ -195,6 +199,84 @@ def _call_openrouter_bank_vlm(
     return resp.json()["choices"][0]["message"]["content"] or "{}"
 
 
+def _lm_studio_enabled() -> bool:
+    return shared_lm_studio_enabled()
+
+
+def _resolve_lm_studio_model(base_url: str, timeout: int) -> str:
+    configured_model = os.getenv("LM_STUDIO_VLM_MODEL")
+    if configured_model:
+        return configured_model
+    try:
+        import httpx as _httpx
+
+        resp = _httpx.get(f"{base_url}/models", timeout=min(timeout, 5))
+        resp.raise_for_status()
+        models = resp.json().get("data") or []
+        first_model = next((row.get("id") for row in models if row.get("id")), None)
+        if first_model:
+            return str(first_model)
+    except Exception:
+        pass
+    return "local-model"
+
+
+def _call_lm_studio_bank_vlm(
+    page_parts: list[tuple[bytes, str]],
+    *,
+    prompt: str,
+    pdf_text_block: "str | None",
+) -> str:
+    response = lm_studio_vision_text(
+        prompt=prompt,
+        page_parts=page_parts,
+        pdf_text_block=pdf_text_block,
+        pdf_text_intro=(
+            "EXACT TEXT EXTRACTED FROM PDF - use this for accuracy when reading dates, "
+            "descriptions, amounts and references. Do not guess from the image where the text below is available:"
+        ),
+    )
+    return response["text"]
+
+    import base64
+    import httpx as _httpx
+
+    base_url = os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1").rstrip("/")
+    timeout = int(os.getenv("LM_STUDIO_TIMEOUT_SECONDS", "120"))
+    model = _resolve_lm_studio_model(base_url, timeout)
+    api_key = os.getenv("LM_STUDIO_API_KEY", "lm-studio")
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    if pdf_text_block:
+        content.append({
+            "type": "text",
+            "text": (
+                "EXACT TEXT EXTRACTED FROM PDF — use this for accuracy when reading dates, "
+                "descriptions, amounts and references. Do not guess from the image where the "
+                f"text below is available:\n\n{pdf_text_block}"
+            ),
+        })
+    for image_bytes, image_mime in page_parts:
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{image_mime};base64,{encoded}"},
+        })
+    resp = _httpx.post(
+        f"{base_url}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0,
+            "max_tokens": int(os.getenv("LM_STUDIO_MAX_TOKENS", "8192")),
+        },
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"] or "{}"
+
+
 def _call_anthropic_bank_vlm(
     page_parts: list[tuple[bytes, str]],
     *,
@@ -250,15 +332,9 @@ def parse_vlm_statement(
     parsing_hint: Optional[str] = None,
 ) -> tuple[dict[str, Any], list[ParsedBankLine]]:
     try:
-        from google import genai  # type: ignore
-        from google.genai import types  # type: ignore
         from app.services.invoice_extraction.vlm_parser import preprocess_for_vlm
     except Exception as exc:  # pragma: no cover - optional provider
         raise ValueError("VLM bank statement extraction is not available in this environment") from exc
-
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY is not configured for VLM bank statement extraction")
 
     page_parts = preprocess_for_vlm(file_bytes, mime_type)
     if not page_parts:
@@ -280,7 +356,6 @@ def parse_vlm_statement(
         except Exception:
             pass  # scanned / locked PDF — fall back to image-only
 
-    client = genai.Client(api_key=api_key)
     _currency_hint = currency or "ZAR"
     from app.services.bank_extraction_prompt import get_active_vlm_prompt as _get_prompt
     _instructions = parsing_hint.strip() if parsing_hint else _get_prompt()
@@ -295,7 +370,26 @@ def parse_vlm_statement(
         len(_instructions),
         "YES" if pdf_text_block else "NO (image-only)",
     )
-    contents: list[Any] = [prompt]
+    _primary_model = os.getenv("GEMINI_VLM_MODEL") or "gemini-2.5-flash"
+    _secondary_model = os.getenv("GEMINI_VLM_SECONDARY_MODEL") or "gemini-2.0-flash"
+    _lite_model = "gemini-2.5-flash-lite"
+
+    response = None
+    payload = None
+    _final_exc: Exception | None = None
+    _model = _primary_model
+    contents: list[Any] = []
+
+    class _DeferredPart:
+        @staticmethod
+        def from_bytes(**_kwargs):
+            return None
+
+    class _DeferredTypes:
+        Part = _DeferredPart
+
+    types = _DeferredTypes()
+
     if pdf_text_block:
         contents.append(
             "SUPPLEMENTARY TEXT extracted from this PDF. Column alignment in this text is unreliable "
@@ -308,17 +402,53 @@ def parse_vlm_statement(
     for image_bytes, image_mime in page_parts:
         contents.append(types.Part.from_bytes(data=image_bytes, mime_type=image_mime))
 
-    _primary_model = os.getenv("GEMINI_VLM_MODEL") or "gemini-2.5-flash"
-    _secondary_model = os.getenv("GEMINI_VLM_SECONDARY_MODEL") or "gemini-2.0-flash"
-    _lite_model = "gemini-2.5-flash-lite"
+    if _lm_studio_enabled():
+        try:
+            logger.info("[VLM] Trying LM Studio local model first")
+            _text = _call_lm_studio_bank_vlm(
+                page_parts,
+                prompt=prompt,
+                pdf_text_block=pdf_text_block,
+            )
+            payload = _parse_vlm_json_payload(_text, provider="LM Studio VLM")
+            _model = os.getenv("LM_STUDIO_VLM_MODEL") or "local-model"
+        except Exception as _step_exc:
+            logger.warning("[VLM] LM Studio failed, falling back to backup providers: %s", _step_exc)
+            _final_exc = _step_exc
 
-    response = None
-    payload = None
-    _final_exc: Exception | None = None
-    _model = _primary_model
+    if payload is None:
+        try:
+            from google import genai  # type: ignore
+            from google.genai import types  # type: ignore
+        except Exception as exc:  # pragma: no cover - optional provider
+            if _final_exc:
+                raise _final_exc
+            raise ValueError("Gemini VLM bank statement extraction is not available in this environment") from exc
+
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            if _final_exc:
+                raise _final_exc
+            raise ValueError("GOOGLE_API_KEY is not configured for VLM bank statement extraction")
+
+        client = genai.Client(api_key=api_key)
+        contents = [prompt]
+        if pdf_text_block:
+            contents.append(
+                "SUPPLEMENTARY TEXT extracted from this PDF. Column alignment in this text is unreliable "
+                "for multi-column tabular statements — do NOT use it for transaction descriptions or "
+                "counterparty/beneficiary names. Use this text ONLY to verify exact reference numbers, "
+                "sort codes, or account number digits that are ambiguous in the images. "
+                "All descriptions, names, amounts, dates, debits, credits, and balances MUST be read "
+                f"from the page images:\n\n{pdf_text_block}"
+            )
+        for image_bytes, image_mime in page_parts:
+            contents.append(types.Part.from_bytes(data=image_bytes, mime_type=image_mime))
 
     def _run_gemini_step(model_name: str) -> Any:
         """Run one Gemini model with 3 retries. Returns response or raises."""
+        if payload is not None:
+            return None
         _resp = None
         for _attempt in range(3):
             try:
@@ -350,7 +480,7 @@ def parse_vlm_statement(
         response = None
 
     # Step 2 — secondary Gemini model (free fallback, same API key)
-    if response is None and _secondary_model != _primary_model:
+    if payload is None and response is None and _secondary_model != _primary_model:
         _model = _secondary_model
         logger.info("[VLM] Falling back from primary to secondary model %r", _model)
         try:

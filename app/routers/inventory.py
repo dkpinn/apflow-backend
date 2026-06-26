@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
+from app.services.accounting_locks import assert_accounting_period_unlocked
 
 
 router = APIRouter(prefix="/api/inventory", tags=["inventory"])
@@ -379,6 +380,15 @@ def list_stock_movements(
 def create_stock_movement(payload: StockMovementInput, auth: UserAuth):
     user_id, db = auth
     ensure_org_write(str(user_id), payload.organisation_id)
+    try:
+        assert_accounting_period_unlocked(
+            db,
+            organisation_id=payload.organisation_id,
+            transaction_date=payload.occurred_on,
+            action="Record inventory stock movement",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     item = _load_item(db, payload.organisation_id, payload.inventory_item_id)
     if item.get("item_type") != "stock_item":
         raise HTTPException(status_code=400, detail="Stock movements can only be recorded for stock items")

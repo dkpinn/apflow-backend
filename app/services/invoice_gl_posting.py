@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from app.services.accounting_locks import assert_accounting_period_unlocked
 from app.services.organisation_module_settings import (
     required_tracking_dimensions,
     validate_supplier_allocations_tracking,
@@ -342,6 +343,12 @@ def persist_prepared_invoice_posting(
     prepared: dict,
     user_id: Optional[str] = None,
 ) -> dict:
+    assert_accounting_period_unlocked(
+        supabase,
+        organisation_id=prepared["organisation_id"],
+        transaction_date=prepared.get("journal_date"),
+        action="Post supplier invoice",
+    )
     try:
         rpc_result = supabase.rpc(
             "post_invoice_to_gl_atomic",

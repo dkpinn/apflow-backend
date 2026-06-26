@@ -484,6 +484,52 @@ def rule_criteria_rationale(rule: dict[str, Any]) -> str:
     return f"matched rule: {rule.get('name')} ({joined})"
 
 
+def bank_rule_matches(
+    rule: dict[str, Any],
+    *,
+    bank_account_id: str,
+    line: dict[str, Any],
+) -> bool:
+    rule_account = rule.get("bank_account_id")
+    if rule_account and str(rule_account) != str(bank_account_id):
+        return False
+    amount = money(line.get("signed_amount"))
+    direction = "money_in" if amount >= 0 else "money_out"
+    if rule.get("amount_direction") not in (None, "any", direction):
+        return False
+    min_amount = rule.get("min_amount")
+    max_amount = rule.get("max_amount")
+    absolute_amount = abs(amount)
+    if min_amount is not None and absolute_amount < money(min_amount):
+        return False
+    if max_amount is not None and absolute_amount > money(max_amount):
+        return False
+
+    if rule_matches_criteria(rule, line):
+        return True
+
+    fields = bank_rule_search_fields(line)
+    for field_value, pattern in [
+        (fields["description"], rule.get("description_pattern")),
+        (fields["reference"], rule.get("reference_pattern")),
+        (fields["counterparty"], rule.get("counterparty_pattern")),
+    ]:
+        pattern_text = normalize_text(pattern).lower()
+        if not pattern_text:
+            continue
+        if rule.get("match_type") == "exact" and field_value == pattern_text:
+            return True
+        if rule.get("match_type") == "regex":
+            try:
+                if re.search(pattern_text, field_value):
+                    return True
+            except re.error:
+                continue
+        elif pattern_text in field_value:
+            return True
+    return False
+
+
 def score_rule_suggestions(
     db,
     *,
@@ -508,43 +554,9 @@ def score_rule_suggestions(
         logger.exception("score_rule_suggestions DB query failed for org=%s", organisation_id)
         return []
 
-    fields = bank_rule_search_fields(line)
-    amount = money(line.get("signed_amount"))
-    direction = "money_in" if amount >= 0 else "money_out"
     suggestions: list[dict[str, Any]] = []
     for rule in rules:
-        rule_account = rule.get("bank_account_id")
-        if rule_account and str(rule_account) != bank_account_id:
-            continue
-        if rule.get("amount_direction") not in (None, "any", direction):
-            continue
-        min_amount = rule.get("min_amount")
-        max_amount = rule.get("max_amount")
-        absolute_amount = abs(amount)
-        if min_amount is not None and absolute_amount < money(min_amount):
-            continue
-        if max_amount is not None and absolute_amount > money(max_amount):
-            continue
-        matched = rule_matches_criteria(rule, line)
-        if not matched:
-            for field_value, pattern in [
-                (fields["description"], rule.get("description_pattern")),
-                (fields["reference"], rule.get("reference_pattern")),
-                (fields["counterparty"], rule.get("counterparty_pattern")),
-            ]:
-                pattern_text = normalize_text(pattern).lower()
-                if not pattern_text:
-                    continue
-                if rule.get("match_type") == "exact" and field_value == pattern_text:
-                    matched = True
-                elif rule.get("match_type") == "regex":
-                    try:
-                        matched = bool(re.search(pattern_text, field_value))
-                    except re.error:
-                        matched = False
-                elif pattern_text in field_value:
-                    matched = True
-        if matched:
+        if bank_rule_matches(rule, bank_account_id=bank_account_id, line=line):
             suggestions.append(
                 {
                     "suggestion_type": "rule",

@@ -34,6 +34,7 @@ def _journal(journal_id="journal-1", status="draft", source_id="line-1"):
         "status": status,
         "source_type": "bank_transaction",
         "source_id": source_id,
+        "journal_date": "2026-06-01",
         "description": "Test journal",
         "total_debit": 100.0,
         "total_credit": 100.0,
@@ -221,6 +222,25 @@ def test_post_bank_journal_400_when_not_draft(monkeypatch):
     assert "draft" in exc_info.value.detail.lower()
 
 
+def test_post_bank_journal_400_when_period_locked(monkeypatch):
+    db = MemoryDB({
+        "gl_journals": [{**_journal(status="draft", source_id=None), "journal_date": "2026-05-31"}],
+        "organisation_accounting_periods": [{
+            "organisation_id": ORG_ID,
+            "status": "locked",
+            "lock_date": "2026-05-31",
+        }],
+    })
+    monkeypatch.setattr(bj, "_auth", _fake_auth(db))
+    monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bj.post_bank_journal("journal-1", _post_payload(), auth=("user-1", None))
+
+    assert exc_info.value.status_code == 400
+    assert "accounting lock date" in exc_info.value.detail
+
+
 # ── unpost_bank_journal ──────────────────────────────────────────────────────
 
 def test_unpost_bank_journal_creates_reversal(monkeypatch):
@@ -259,6 +279,25 @@ def test_unpost_bank_journal_400_when_not_posted(monkeypatch):
 
     assert exc_info.value.status_code == 400
     assert "posted" in exc_info.value.detail.lower()
+
+
+def test_unpost_bank_journal_400_when_period_locked(monkeypatch):
+    db = MemoryDB({
+        "gl_journals": [{**_journal(status="posted"), "journal_date": "2026-05-31"}],
+        "organisation_accounting_periods": [{
+            "organisation_id": ORG_ID,
+            "status": "locked",
+            "lock_date": "2026-05-31",
+        }],
+    })
+    monkeypatch.setattr(bj, "_auth", _fake_auth(db))
+    monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bj.unpost_bank_journal("journal-1", _post_payload(), auth=("user-1", None))
+
+    assert exc_info.value.status_code == 400
+    assert "accounting lock date" in exc_info.value.detail
 
 
 def test_unpost_bank_journal_400_when_already_reversed(monkeypatch):

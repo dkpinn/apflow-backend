@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.db.supabase_client import get_supabase_client
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
+from app.services.accounting_locks import assert_accounting_period_unlocked
 from app.services.finance_lease_amortization import (
     build_amortization_schedule,
     compute_present_value,
@@ -186,6 +187,16 @@ def _post_gl_journal(
     created_by: str,
 ) -> str:
     """Insert a balanced GL journal and its lines; return the journal ID."""
+    try:
+        assert_accounting_period_unlocked(
+            db,
+            organisation_id=organisation_id,
+            transaction_date=journal_date,
+            action="Post finance lease journal",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     assert_balanced(lines)
     total = round(sum(float(l.get("debit_amount", 0)) for l in lines), 2)
     journal_id = str(_uuid.uuid4())
@@ -381,6 +392,17 @@ def create_finance_lease(payload: CreateLeaseRequest, auth: UserAuth):
     inception_lines = build_inception_lines(lease_dict)
     j_date = (payload.journal_date or payload.commencement_date).isoformat()
     description = f"Finance Lease Inception – {payload.lessor_name} / {payload.asset_description}"
+    try:
+        assert_accounting_period_unlocked(
+            db,
+            organisation_id=payload.organisation_id,
+            transaction_date=j_date,
+            action="Post finance lease inception",
+        )
+    except ValueError as exc:
+        db.table("finance_lease_schedule").delete().eq("lease_id", lease_id).execute()
+        db.table("finance_leases").delete().eq("id", lease_id).execute()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         rpc_result = db.rpc(
@@ -711,6 +733,15 @@ def post_period_end_reclassification(
     ensure_org_write(user_id, payload.organisation_id)
 
     _get_lease(db, lease_id=lease_id, organisation_id=payload.organisation_id)
+    try:
+        assert_accounting_period_unlocked(
+            db,
+            organisation_id=payload.organisation_id,
+            transaction_date=payload.period_end_date,
+            action="Post finance lease period-end reclassification",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         result = db.rpc(

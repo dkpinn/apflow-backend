@@ -245,6 +245,20 @@ def test_vat_report_reconciles_opening_running_total_and_claimability():
     assert report["rows"][0]["running_total"] == 35.0
     assert report["rows"][1]["running_total"] == 75.0
     assert report["warnings"][0]["code"] == "historical_claimability_variance"
+    assert report["sars_summary"] == {
+        "output_tax": 40.0,
+        "input_tax_claimable": 10.5,
+        "input_tax_blocked": 4.5,
+        "net_vat_payable_refundable": 29.5,
+        "gl_control_closing_balance": 75.0,
+        "review_exception_count": 3,
+    }
+    assert report["exception_summary"]["total"] == 3
+    assert {row["code"] for row in report["exceptions"]} == {
+        "historical_claimability_variance",
+        "blocked_input_vat",
+        "posted_input_exceeds_allowable",
+    }
 
 
 def test_vat_allocation_handles_mixed_treatments_and_non_vat_supplier():
@@ -287,10 +301,13 @@ def test_vat_report_exports_match_detail_rows():
 
     csv_text = vat_report_csv(report).decode("utf-8-sig")
     assert "Supplier VAT Number" in csv_text
+    assert "Blocked Input VAT" in csv_text
     assert "Example Supplier" in csv_text
 
     text = vat_report_text(report).decode("utf-8")
     assert "Calculated VAT position\t79.50" in text
+    assert "Review exceptions\t3" in text
+    assert "Review Exceptions" in text
     assert "INV-1" in text
 
     workbook_bytes = vat_report_xlsx(report)
@@ -300,6 +317,8 @@ def test_vat_report_exports_match_detail_rows():
 
     workbook = load_workbook(io.BytesIO(workbook_bytes))
     assert workbook["Summary"]["B2"].number_format == "yyyy-mm-dd"
+    assert "SARS Review" in workbook.sheetnames
+    assert "Review Exceptions" in workbook.sheetnames
     assert workbook["VAT Detail"]["A2"].number_format == "yyyy-mm-dd"
 
 

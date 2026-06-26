@@ -4,6 +4,7 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterable
 
+from app.services.accounting_locks import assert_accounting_period_unlocked
 from app.services.money import money
 from app.services.organisation_module_settings import (
     missing_tracking_dimensions,
@@ -217,6 +218,23 @@ def issue_sales_invoice(
     sales_invoice_id: str,
     actor_user_id: str,
 ) -> dict[str, Any]:
+    invoice_rows = (
+        db.table("sales_invoices")
+        .select("issue_date")
+        .eq("id", sales_invoice_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    issue_date = invoice_rows[0].get("issue_date") if invoice_rows else None
+    assert_accounting_period_unlocked(
+        db,
+        organisation_id=organisation_id,
+        transaction_date=issue_date,
+        action="Issue sales invoice",
+    )
     result = db.rpc(
         "issue_sales_invoice_atomic",
         {
@@ -244,6 +262,12 @@ def post_customer_receipt(
     bank_statement_line_id: str | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
+    assert_accounting_period_unlocked(
+        db,
+        organisation_id=organisation_id,
+        transaction_date=receipt_date,
+        action="Post customer receipt",
+    )
     result = db.rpc(
         "post_customer_receipt_atomic",
         {
@@ -262,4 +286,3 @@ def post_customer_receipt(
         },
     ).execute()
     return rpc_object(result)
-
