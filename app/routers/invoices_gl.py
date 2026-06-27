@@ -372,7 +372,7 @@ def post_invoice_to_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: U
 
     try:
         prepared = prepare_invoice_gl_posting(
-            db,
+            supabase,
             invoice_id=invoice_id,
             org_id=org_id,
         )

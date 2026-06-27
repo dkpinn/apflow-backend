@@ -207,7 +207,7 @@ def prepare_invoice_gl_posting(
     )
     line_items = li_res.data or []
     if not line_items:
-        raise ValueError("Invoice has no line items to post")
+        raise ValueError("Invoice has no line items to post. Open the invoice, assign expense accounts to each line, and save before posting.")
 
     supplier_vat_number = invoice.get("vat_number_extracted")
     if invoice.get("supplier_id"):

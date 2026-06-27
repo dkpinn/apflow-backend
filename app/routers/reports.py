@@ -9,6 +9,7 @@ from app.services.aged_payables import generate_aged_payables
 from app.services.aged_receivables import generate_aged_receivables
 from app.services.balance_sheet import generate_balance_sheet
 from app.services.cash_flow import generate_cash_flow
+from app.services.cash_flow_forecast import generate_cash_flow_forecast
 from app.services.general_ledger import generate_general_ledger
 from app.services.income_statement import generate_income_statement
 from app.services.transaction_report import (
@@ -271,6 +272,29 @@ def cash_flow_report(
                 organisation_id=organisation_id,
                 date_from=date_from,
                 date_to=date_to,
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/cash-flow-forecast")
+def cash_flow_forecast_report(
+    auth: UserAuth,
+    organisation_id: str,
+    as_at_date: str = Query(default_factory=lambda: __import__("datetime").date.today().isoformat()),
+    forecast_days: int = Query(default=90, ge=7, le=365),
+):
+    user_id, db = auth
+    _ensure_reports_view(db, user_id, organisation_id)
+    try:
+        return {
+            "success": True,
+            "report": generate_cash_flow_forecast(
+                db,
+                organisation_id=organisation_id,
+                as_at_date=as_at_date,
+                forecast_days=forecast_days,
             ),
         }
     except ValueError as exc:

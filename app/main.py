@@ -48,6 +48,13 @@ from app.routers import audit_trail
 from app.routers import customer_collections
 from app.routers import customer_statements
 from app.routers import supplier_payment_runs
+from app.routers import receipt_inbox
+from app.routers import recurring_transactions
+from app.routers import budgets
+from app.routers import review_queue
+from app.routers import notifications
+from app.routers import suspense_clearing
+from app.routers import global_search
 
 logger = logging.getLogger("apflow.sweep")
 
@@ -62,6 +69,12 @@ def _rescue_pending_invoices(supabase_client) -> None:
     """
     from app.services.document_jobs import create_processing_job, safe_update_invoice_raw_status
     from app.services.audit_log import log_invoice_event
+    from app.services.recurring_transactions import generate_due_drafts
+
+    try:
+        generate_due_drafts(supabase_client)
+    except Exception:
+        logger.exception("Error generating recurring transaction drafts")
 
     sweep_start = datetime.now(timezone.utc)
     logger.info("=== Sweep start ===")
@@ -409,6 +422,13 @@ app.include_router(audit_trail.router)
 app.include_router(customer_collections.router)
 app.include_router(customer_statements.router)
 app.include_router(supplier_payment_runs.router)
+app.include_router(receipt_inbox.router)
+app.include_router(recurring_transactions.router)
+app.include_router(budgets.router)
+app.include_router(review_queue.router)
+app.include_router(notifications.router)
+app.include_router(suspense_clearing.router)
+app.include_router(global_search.router)
 
 
 @app.get("/")
