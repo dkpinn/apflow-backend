@@ -25,7 +25,6 @@ from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
 from app.models.schemas import BulkAllocateRequest, LineSkipRequest
 from app.schemas.bank import (
     BankAccountCreate,
-    BankBalanceSummary,
     BankUploadCreate,
     BulkDeleteLinesRequest,
     BulkDeleteUploadsRequest,
@@ -53,7 +52,14 @@ from app.services.bank_statement_service import (
     score_rule_suggestions,
     validate_balances,
 )
-from app.services.bank_account_summary import build_bank_balance_summary
+from app.services.bank.accounts import (
+    bank_line_sort_key,
+    create_bank_account_record,
+    create_bank_supplier_if_missing,
+    get_unreconciled_lines_payload,
+    is_unreconciled_bank_line,
+    list_accounts as list_bank_account_records,
+)
 from app.services.organisation_module_settings import (
     required_tracking_dimensions,
     validate_bank_allocation_tracking,
@@ -221,127 +227,23 @@ def lookup_parsing_hint(db, *, organisation_id: str, institution_name: Optional[
     return best_rule.get("parsing_hint") or None
 
 
-def is_unreconciled_bank_line(line: dict[str, Any]) -> bool:
-    posting_status = str(line.get("posting_status") or "unposted").lower()
-    allocation_status = str(line.get("allocation_status") or "unallocated").lower()
-    review_status = str(line.get("review_status") or "pending").lower()
-    if review_status in {"ignored", "deferred"}:
-        return False
-    return (
-        posting_status != "posted"
-        or allocation_status not in {"allocated", "split"}
-        or review_status != "reviewed"
-    )
-
-
-def bank_line_sort_key(line: dict[str, Any]) -> tuple[str, int, str]:
-    row_index = line.get("source_row_index")
-    try:
-        row_order = int(row_index) if row_index is not None else 999999
-    except (TypeError, ValueError):
-        row_order = 999999
-    return (str(line.get("line_date") or ""), row_order, str(line.get("id") or ""))
-
-
 @router.get("/accounts")
 def list_bank_accounts(organisation_id: str, auth: UserAuth):
     user_id, db = _auth(auth)
     ensure_org_read(user_id, organisation_id)
-    res = (
-        db.table("bank_accounts")
-        .select("*")
-        .eq("organisation_id", organisation_id)
-        .order("name")
-        .execute()
-    )
-    return {"success": True, "accounts": res.data or []}
+    return {"success": True, "accounts": list_bank_account_records(db, organisation_id=organisation_id)}
 
 
 @router.get("/accounts/{account_id}/unreconciled-lines")
 def list_bank_account_unreconciled_lines(account_id: str, organisation_id: str, auth: UserAuth):
     user_id, db = _auth(auth)
     ensure_org_read(user_id, organisation_id)
-    account = _one(
-        db.table("bank_accounts").select("*").eq("id", account_id).eq("organisation_id", organisation_id).limit(1).execute(),
-        "Bank account not found",
+    payload = get_unreconciled_lines_payload(
+        db,
+        organisation_id=organisation_id,
+        account_id=account_id,
     )
-    rows = (
-        db.table("bank_statement_lines")
-        .select("*")
-        .eq("organisation_id", organisation_id)
-        .eq("bank_account_id", account_id)
-        .limit(5000)
-        .execute()
-        .data
-        or []
-    )
-    lines = sorted((row for row in rows if is_unreconciled_bank_line(row)), key=bank_line_sort_key)
-
-    try:
-        upload_rows = (
-            db.table("bank_statement_uploads")
-            .select("*")
-            .eq("organisation_id", organisation_id)
-            .eq("bank_account_id", account_id)
-            .execute()
-            .data
-            or []
-        )
-    except Exception:
-        upload_rows = []
-    uploads_by_id = {str(row.get("id")): row for row in upload_rows if row.get("id")}
-
-    # Batch-fetch open suggestions to enrich lines with confidence + account hints
-    top_suggestion: dict[str, dict] = {}
-    if lines:
-        line_id_strs = [str(l["id"]) for l in lines[:500]]
-        sug_rows = (
-            db.table("bank_transaction_suggestions")
-            .select("bank_statement_line_id, confidence_score, suggested_account_id, suggested_tax_treatment, matched_invoice_number")
-            .eq("organisation_id", organisation_id)
-            .in_("bank_statement_line_id", line_id_strs)
-            .eq("status", "open")
-            .order("confidence_score", desc=True)
-            .limit(5000)
-            .execute()
-            .data
-            or []
-        )
-        for s in sug_rows:
-            lid = str(s.get("bank_statement_line_id") or "")
-            if lid and lid not in top_suggestion:
-                top_suggestion[lid] = s
-
-    enriched = []
-    for line in lines:
-        upload = uploads_by_id.get(str(line.get("bank_statement_upload_id"))) or {}
-        sug = top_suggestion.get(str(line.get("id") or ""), {})
-        confidence = float(sug.get("confidence_score") or (0.75 if line.get("match_status") == "suggested" else 0.5))
-        enriched.append({
-            **line,
-            "upload_original_filename": upload.get("original_filename"),
-            "upload_uploaded_at": upload.get("uploaded_at"),
-            "recon_confidence": confidence,
-            "recon_suggested_account_id": sug.get("suggested_account_id"),
-            "recon_suggested_tax": sug.get("suggested_tax_treatment"),
-            "recon_matched_invoice_ref": sug.get("matched_invoice_number") or line.get("matched_invoice_number"),
-        })
-
-    balances = BankBalanceSummary.model_validate(
-        build_bank_balance_summary(
-            db,
-            organisation_id=organisation_id,
-            account=account,
-            lines=rows,
-            uploads=upload_rows,
-        )
-    )
-    return {
-        "success": True,
-        "account": account,
-        "lines": enriched,
-        "balances": balances.model_dump(),
-    }
+    return {"success": True, **payload}
 
 
 @router.get("/accounts/{account_id}/statement/export")
@@ -396,75 +298,13 @@ def create_bank_account(payload: BankAccountCreate, auth: UserAuth):
     user_id, db = _auth(auth)
     organisation_id = str(payload.organisation_id)
     ensure_org_write(user_id, organisation_id)
-    opening = float(money(payload.opening_balance))
-
-    # Auto-create GL account in the 6200xxx range when none is provided
-    gl_account_id: str | None = str(payload.gl_account_id) if payload.gl_account_id else None
-    if not gl_account_id:
-        code_rows = (
-            db.table("accounts")
-            .select("code")
-            .eq("organisation_id", organisation_id)
-            .like("code", "6200%")
-            .execute()
-            .data
-            or []
-        )
-        used: set[int] = set()
-        for r in code_rows:
-            try:
-                used.add(int(r["code"]))
-            except (TypeError, ValueError):
-                pass
-        next_code = 6200001
-        while next_code in used:
-            next_code += 1
-        if next_code > 6200999:
-            raise HTTPException(status_code=400, detail="No bank GL codes available in range 6200001–6200999")
-        gl_res = (
-            db.table("accounts")
-            .insert({
-                "organisation_id": organisation_id,
-                "code": str(next_code),
-                "name": payload.name,
-                "type": "asset",
-                "group_name": "Bank",
-                "vat_treatment": "full",
-                "is_system": False,
-                "active": True,
-            })
-            .execute()
-        )
-        if not gl_res.data:
-            raise HTTPException(status_code=500, detail="Failed to create GL account for bank account")
-        gl_account_id = str(gl_res.data[0]["id"])
-
-    row = {
-        "organisation_id": organisation_id,
-        "name": payload.name,
-        "institution_name": payload.institution_name,
-        "account_type": payload.account_type,
-        "currency": payload.currency,
-        "account_number_mask": payload.account_number_mask,
-        "account_number_hash": payload.account_number_hash,
-        "gl_account_id": gl_account_id,
-        "opening_balance": opening,
-        "current_reconciled_balance": opening,
-        "active": True,
-    }
-    res = db.table("bank_accounts").insert(row).execute()
-    account = _one(res, "Bank account create failed")
+    account = create_bank_account_record(
+        db,
+        payload=payload,
+        organisation_id=organisation_id,
+    )
     log_bank_event(db, organisation_id=organisation_id, event_type="bank_account_created", actor_user_id=user_id, bank_account_id=account["id"])
-    try:
-        db.table("suppliers").insert({
-            "organisation_id": organisation_id,
-            "supplier_name": payload.institution_name or payload.name,
-            "bank_name": payload.institution_name,
-            "active": True,
-            "line_items_include_vat": True,
-        }).execute()
-    except Exception:
-        pass  # non-fatal
+    create_bank_supplier_if_missing(db, organisation_id=organisation_id, payload=payload)
     return {"success": True, "account": account}
 
 
