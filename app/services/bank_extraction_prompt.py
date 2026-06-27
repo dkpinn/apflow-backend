@@ -17,21 +17,21 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_VLM_PROMPT: str = (
-    "Extract bank statement header fields and transaction rows. "
+    "Extract bank statement header fields and all account activity rows. "
     "Return strict JSON only. Debits are money out; credits are money in. "
-    "Every transaction date must be returned as YYYY-MM-DD. If the statement prints only day and month "
-    "on a transaction, take its year from the Statement Period. "
-    "Include every transaction row exactly once — fees, stop orders, interest, card purchases, "
+    "Every activity date must be returned as YYYY-MM-DD. If the statement prints only day and month "
+    "on an activity line, take its year from the Statement Period. "
+    "Include every activity row exactly once — fees, stop orders, interest, card purchases, "
     "internal transfers, and charges must all be present. Do not skip, merge, or deduplicate rows. "
-    "Multi-line descriptions: a transaction's description may wrap across 2–3 printed lines in the Details column. "
-    "Only append a continuation line to the current transaction if that line has NO value in ANY of the Debits, Credits, Date, or Balance columns — those cells must be completely blank. "
-    "A printed line that has any value in Debits, Credits, or Balance is ALWAYS a new, independent transaction — never append it to the previous description, even if it appears visually indented or continued. "
-    "'FEE-ELECTRONIC ACCOUNT PAYMENT' rows with a debit amount (and often marked ## in a Service Fee column) are ALWAYS separate transactions; emit them as their own row. "
+    "Multi-line descriptions: an activity's description may wrap across 2–3 printed lines in the Details column. "
+    "Only append a continuation line to the current activity if that line has NO value in ANY of the Debits, Credits, Date, or Balance columns — those cells must be completely blank. "
+    "A printed line that has any value in Debits, Credits, or Balance is ALWAYS a new, independent activity — never append it to the previous description, even if it appears visually indented or continued. "
+    "'FEE-ELECTRONIC ACCOUNT PAYMENT' rows with a debit amount (and often marked ## in a Service Fee column) are ALWAYS separate activities; emit them as their own row. "
     "A reference number line (e.g. '10193786875') below a fee row with no amounts belongs to that fee row's description, not the salary row above it. "
     "Do not emit any row where both debit_amount and credit_amount are 0. "
-    "Preserve beneficiary names, transaction labels, bank references, and raw row text. "
-    "For each transaction, set page_number to the 1-based index of the page image it appears on "
-    "(matching the order the page images are provided in)."
+    "Preserve beneficiary names, activity labels, bank references, and raw row text. "
+    "For each activity row, set page_number to the 1-based index of the page it appears on "
+    "(matching the order the pages are provided in)."
 )
 
 _CACHE_TTL = 60.0  # seconds

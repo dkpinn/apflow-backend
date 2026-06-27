@@ -227,54 +227,23 @@ def _call_lm_studio_bank_vlm(
     prompt: str,
     pdf_text_block: "str | None",
 ) -> str:
-    response = lm_studio_vision_text(
-        prompt=prompt,
-        page_parts=page_parts,
-        pdf_text_block=pdf_text_block,
-        pdf_text_intro=(
-            "EXACT TEXT EXTRACTED FROM PDF - use this for accuracy when reading dates, "
-            "descriptions, amounts and references. Do not guess from the image where the text below is available:"
-        ),
+    from app.services.lm_studio_vlm import lm_studio_chat_text, lm_studio_timeout_seconds, lm_studio_max_tokens
+
+    _pdf_text_limit = int(os.getenv("LM_STUDIO_PDF_TEXT_LIMIT", "6000"))
+    user_text = prompt
+    if pdf_text_block:
+        _truncated = pdf_text_block[:_pdf_text_limit]
+        user_text += (
+            "\n\nEXACT TEXT EXTRACTED FROM PDF - use this for accuracy when reading dates, "
+            "descriptions, amounts and references. Do not guess from context where the "
+            f"text below is available:\n\n{_truncated}"
+        )
+    response = lm_studio_chat_text(
+        messages=[{"role": "user", "content": user_text}],
+        timeout=lm_studio_timeout_seconds(),
+        max_tokens=lm_studio_max_tokens(),
     )
     return response["text"]
-
-    import base64
-    import httpx as _httpx
-
-    base_url = os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1").rstrip("/")
-    timeout = int(os.getenv("LM_STUDIO_TIMEOUT_SECONDS", "120"))
-    model = _resolve_lm_studio_model(base_url, timeout)
-    api_key = os.getenv("LM_STUDIO_API_KEY", "lm-studio")
-    content: list[dict] = [{"type": "text", "text": prompt}]
-    if pdf_text_block:
-        content.append({
-            "type": "text",
-            "text": (
-                "EXACT TEXT EXTRACTED FROM PDF — use this for accuracy when reading dates, "
-                "descriptions, amounts and references. Do not guess from the image where the "
-                f"text below is available:\n\n{pdf_text_block}"
-            ),
-        })
-    for image_bytes, image_mime in page_parts:
-        encoded = base64.b64encode(image_bytes).decode("ascii")
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{image_mime};base64,{encoded}"},
-        })
-    resp = _httpx.post(
-        f"{base_url}/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": content}],
-            "response_format": {"type": "json_object"},
-            "temperature": 0,
-            "max_tokens": int(os.getenv("LM_STUDIO_MAX_TOKENS", "8192")),
-        },
-        timeout=timeout,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"] or "{}"
 
 
 def _call_anthropic_bank_vlm(
@@ -410,11 +379,22 @@ def parse_vlm_statement(
                 prompt=prompt,
                 pdf_text_block=pdf_text_block,
             )
-            payload = _parse_vlm_json_payload(_text, provider="LM Studio VLM")
-            _model = os.getenv("LM_STUDIO_VLM_MODEL") or "local-model"
+            logger.info("[VLM] LM Studio raw response (first 500 chars): %r", (_text or "")[:500])
+            _lm_payload = _parse_vlm_json_payload(_text, provider="LM Studio VLM")
+            if _lm_payload.get("transactions"):
+                payload = _lm_payload
+                _model = os.getenv("LM_STUDIO_VLM_MODEL") or "local-model"
+            else:
+                logger.warning(
+                    "[VLM] LM Studio returned no transactions (payload keys: %s), falling back to next provider",
+                    list(_lm_payload.keys()),
+                )
         except Exception as _step_exc:
             logger.warning("[VLM] LM Studio failed, falling back to backup providers: %s", _step_exc)
             _final_exc = _step_exc
+
+    if payload is None and _lm_studio_enabled():
+        raise _final_exc or RuntimeError("LM Studio returned no transactions")
 
     if payload is None:
         try:

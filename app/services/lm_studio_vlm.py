@@ -4,8 +4,10 @@ import base64
 import os
 from typing import Any, Optional
 
+import logging
 import httpx
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_LM_STUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_LM_STUDIO_MODEL = "local-model"
@@ -91,17 +93,18 @@ def lm_studio_chat_text(
         json={
             "model": effective_model,
             "messages": messages,
-            "response_format": {"type": "json_object"},
             "temperature": 0,
             "max_tokens": max_tokens,
         },
         timeout=timeout,
     )
     response.raise_for_status()
+    logger.info("[LM Studio] HTTP %d, body preview: %r", response.status_code, response.text[:300])
     payload = response.json()
     try:
         text = payload["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError):
+        logger.warning("[LM Studio] Unexpected response shape, keys=%s, error=%r", list(payload.keys()), str(payload.get("error", ""))[:300])
         text = ""
     return {
         "text": text,
