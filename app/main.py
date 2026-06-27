@@ -46,6 +46,7 @@ from app.routers import accounting_periods
 from app.routers import opening_balances
 from app.routers import audit_trail
 from app.routers import customer_collections
+from app.routers import customer_statements
 from app.routers import supplier_payment_runs
 
 logger = logging.getLogger("apflow.sweep")
@@ -406,6 +407,7 @@ app.include_router(accounting_periods.router)
 app.include_router(opening_balances.router)
 app.include_router(audit_trail.router)
 app.include_router(customer_collections.router)
+app.include_router(customer_statements.router)
 app.include_router(supplier_payment_runs.router)
 
 

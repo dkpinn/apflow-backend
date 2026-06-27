@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import date
+import csv
+import io
+from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 from uuid import uuid4
@@ -435,3 +437,129 @@ def create_supplier_payment_run_draft(
             },
         }
     }
+
+
+def list_supplier_payment_run_drafts(db, organisation_id: str) -> list[dict]:
+    return _fetch_rows(
+        db.table("supplier_payment_runs")
+        .select(
+            "id, status, pay_on_date, due_within_days, currency, invoice_count, "
+            "selected_total, notes, created_by, approved_by, approved_at, created_at, updated_at"
+        )
+        .eq("organisation_id", organisation_id)
+        .order("created_at", desc=True)
+        .limit(100)
+    )
+
+
+def get_supplier_payment_run_draft(db, draft_id: str, organisation_id: str) -> dict:
+    rows = _fetch_rows(
+        db.table("supplier_payment_runs")
+        .select("*")
+        .eq("id", draft_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+    )
+    if not rows:
+        raise ValueError("Payment run draft not found")
+    items = _fetch_rows(
+        db.table("supplier_payment_run_items")
+        .select("*")
+        .eq("payment_run_id", draft_id)
+        .order("priority")
+    )
+    return {**rows[0], "items": items}
+
+
+def approve_supplier_payment_run_draft(
+    db, draft_id: str, organisation_id: str, approved_by: str
+) -> dict:
+    rows = _fetch_rows(
+        db.table("supplier_payment_runs")
+        .select("id, status")
+        .eq("id", draft_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+    )
+    if not rows:
+        raise ValueError("Payment run draft not found")
+    if rows[0]["status"] != "draft":
+        raise ValueError(
+            f"Only draft payment runs can be approved (current status: {rows[0]['status']})"
+        )
+    now = datetime.now(timezone.utc).isoformat()
+    result = (
+        db.table("supplier_payment_runs")
+        .update({"status": "approved", "approved_by": approved_by, "approved_at": now})
+        .eq("id", draft_id)
+        .execute()
+    )
+    return (result.data or [{}])[0]
+
+
+def cancel_supplier_payment_run_draft(db, draft_id: str, organisation_id: str) -> dict:
+    rows = _fetch_rows(
+        db.table("supplier_payment_runs")
+        .select("id, status")
+        .eq("id", draft_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+    )
+    if not rows:
+        raise ValueError("Payment run draft not found")
+    status = rows[0]["status"]
+    if status in ("cancelled", "exported"):
+        raise ValueError(f"Cannot cancel a payment run with status '{status}'")
+    result = (
+        db.table("supplier_payment_runs")
+        .update({"status": "cancelled"})
+        .eq("id", draft_id)
+        .execute()
+    )
+    return (result.data or [{}])[0]
+
+
+def export_supplier_payment_run_draft_csv(
+    db, draft_id: str, organisation_id: str
+) -> tuple[str, bytes]:
+    draft = get_supplier_payment_run_draft(db, draft_id, organisation_id)
+    if draft.get("status") == "cancelled":
+        raise ValueError("Cannot export a cancelled payment run")
+    items = draft.get("items", [])
+    if not items:
+        raise ValueError("Payment run has no items to export")
+
+    supplier_ids = _dedupe([str(item["supplier_id"]) for item in items if item.get("supplier_id")])
+    suppliers_by_id = _fetch_suppliers(db, organisation_id, supplier_ids) if supplier_ids else {}
+
+    pay_date = str(draft.get("pay_on_date") or "")
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "Supplier Name",
+        "Bank Name",
+        "Branch Code",
+        "Account Number",
+        "Account Name",
+        "Amount",
+        "Currency",
+        "Invoice Reference",
+        "Pay Date",
+    ])
+    for item in items:
+        sid = str(item.get("supplier_id") or "")
+        sup = suppliers_by_id.get(sid)
+        writer.writerow([
+            item.get("supplier_name") or "",
+            (sup or {}).get("bank_name") or "",
+            (sup or {}).get("bank_branch_code") or "",
+            (sup or {}).get("bank_account_number") or "",
+            (sup or {}).get("bank_account_name") or "",
+            item.get("outstanding_amount") or 0,
+            item.get("currency") or "ZAR",
+            item.get("invoice_number") or "",
+            pay_date,
+        ])
+
+    filename = f"payment_run_{draft_id[:8]}_{pay_date}.csv"
+    return filename, buf.getvalue().encode("utf-8")
