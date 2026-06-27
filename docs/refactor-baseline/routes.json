@@ -1,0 +1,2794 @@
+[
+  {
+    "endpoint": "app.main.root",
+    "methods": [
+      "GET"
+    ],
+    "name": "root",
+    "path": "/",
+    "tags": []
+  },
+  {
+    "endpoint": "app.routers.accounting_periods.accounting_periods",
+    "methods": [
+      "GET"
+    ],
+    "name": "accounting_periods",
+    "path": "/api/accounting-periods",
+    "tags": [
+      "accounting-periods"
+    ]
+  },
+  {
+    "endpoint": "app.routers.accounting_periods.save_period",
+    "methods": [
+      "PUT"
+    ],
+    "name": "save_period",
+    "path": "/api/accounting-periods",
+    "tags": [
+      "accounting-periods"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_integrations.get_ai_policy",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_ai_policy",
+    "path": "/api/admin/ai-policies/{task}",
+    "tags": [
+      "admin-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_integrations.put_ai_policy",
+    "methods": [
+      "PUT"
+    ],
+    "name": "put_ai_policy",
+    "path": "/api/admin/ai-policies/{task}",
+    "tags": [
+      "admin-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_admin.generate_draft",
+    "methods": [
+      "POST"
+    ],
+    "name": "generate_draft",
+    "path": "/api/admin/bank-extraction/draft",
+    "tags": [
+      "admin-bank-extraction"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_admin.list_gold_files",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_gold_files",
+    "path": "/api/admin/bank-extraction/gold-files",
+    "tags": [
+      "admin-bank-extraction"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_admin.create_gold_file",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_gold_file",
+    "path": "/api/admin/bank-extraction/gold-files",
+    "tags": [
+      "admin-bank-extraction"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_admin.delete_gold_file",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "delete_gold_file",
+    "path": "/api/admin/bank-extraction/gold-files/{gold_file_id}",
+    "tags": [
+      "admin-bank-extraction"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_admin.update_gold_file",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "update_gold_file",
+    "path": "/api/admin/bank-extraction/gold-files/{gold_file_id}",
+    "tags": [
+      "admin-bank-extraction"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_admin.run_gold_file_benchmark",
+    "methods": [
+      "POST"
+    ],
+    "name": "run_gold_file_benchmark",
+    "path": "/api/admin/bank-extraction/gold-files/{gold_file_id}/run",
+    "tags": [
+      "admin-bank-extraction"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_admin.list_test_runs",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_test_runs",
+    "path": "/api/admin/bank-extraction/test-runs",
+    "tags": [
+      "admin-bank-extraction"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_admin.delete_vlm_prompt",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "delete_vlm_prompt",
+    "path": "/api/admin/bank-extraction/vlm-prompt",
+    "tags": [
+      "admin-bank-extraction"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_admin.get_vlm_prompt",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_vlm_prompt",
+    "path": "/api/admin/bank-extraction/vlm-prompt",
+    "tags": [
+      "admin-bank-extraction"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_admin.update_vlm_prompt",
+    "methods": [
+      "PUT"
+    ],
+    "name": "update_vlm_prompt",
+    "path": "/api/admin/bank-extraction/vlm-prompt",
+    "tags": [
+      "admin-bank-extraction"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_integrations.get_platform_extraction_criteria",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_platform_extraction_criteria",
+    "path": "/api/admin/extraction-criteria/{task}",
+    "tags": [
+      "admin-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_integrations.put_platform_extraction_criteria",
+    "methods": [
+      "PUT"
+    ],
+    "name": "put_platform_extraction_criteria",
+    "path": "/api/admin/extraction-criteria/{task}",
+    "tags": [
+      "admin-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_integrations.get_lm_studio_health",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_lm_studio_health",
+    "path": "/api/admin/lm-studio/health",
+    "tags": [
+      "admin-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_integrations.get_admin_identity",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_admin_identity",
+    "path": "/api/admin/me",
+    "tags": [
+      "admin-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_integrations.get_platform_settings",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_platform_settings",
+    "path": "/api/admin/platform-settings",
+    "tags": [
+      "admin-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_accounts.list_standard_accounts",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_standard_accounts",
+    "path": "/api/admin/standard-accounts",
+    "tags": [
+      "admin-accounts"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_accounts.create_standard_account",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_standard_account",
+    "path": "/api/admin/standard-accounts",
+    "tags": [
+      "admin-accounts"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_accounts.import_standard_accounts",
+    "methods": [
+      "POST"
+    ],
+    "name": "import_standard_accounts",
+    "path": "/api/admin/standard-accounts/import",
+    "tags": [
+      "admin-accounts"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_accounts.download_template",
+    "methods": [
+      "GET"
+    ],
+    "name": "download_template",
+    "path": "/api/admin/standard-accounts/template",
+    "tags": [
+      "admin-accounts"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_accounts.deactivate_standard_account",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "deactivate_standard_account",
+    "path": "/api/admin/standard-accounts/{account_id}",
+    "tags": [
+      "admin-accounts"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_accounts.update_standard_account",
+    "methods": [
+      "PUT"
+    ],
+    "name": "update_standard_account",
+    "path": "/api/admin/standard-accounts/{account_id}",
+    "tags": [
+      "admin-accounts"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_integrations.get_system_integrations",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_system_integrations",
+    "path": "/api/admin/system-integrations",
+    "tags": [
+      "admin-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_integrations.add_system_integration",
+    "methods": [
+      "POST"
+    ],
+    "name": "add_system_integration",
+    "path": "/api/admin/system-integrations",
+    "tags": [
+      "admin-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_integrations.remove_system_integration",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "remove_system_integration",
+    "path": "/api/admin/system-integrations/{integration_id}",
+    "tags": [
+      "admin-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_integrations.patch_system_integration",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "patch_system_integration",
+    "path": "/api/admin/system-integrations/{integration_id}",
+    "tags": [
+      "admin-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.admin_integrations.run_system_integration_test",
+    "methods": [
+      "POST"
+    ],
+    "name": "run_system_integration_test",
+    "path": "/api/admin/system-integrations/{integration_id}/test",
+    "tags": [
+      "admin-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.asset_types.list_asset_type_settings",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_asset_type_settings",
+    "path": "/api/asset-types",
+    "tags": [
+      "asset-types"
+    ]
+  },
+  {
+    "endpoint": "app.routers.asset_types.create_asset_type_setting",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_asset_type_setting",
+    "path": "/api/asset-types",
+    "tags": [
+      "asset-types"
+    ]
+  },
+  {
+    "endpoint": "app.routers.asset_types.remove_asset_type_setting",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "remove_asset_type_setting",
+    "path": "/api/asset-types/{asset_type_id}",
+    "tags": [
+      "asset-types"
+    ]
+  },
+  {
+    "endpoint": "app.routers.asset_types.update_asset_type_setting",
+    "methods": [
+      "PUT"
+    ],
+    "name": "update_asset_type_setting",
+    "path": "/api/asset-types/{asset_type_id}",
+    "tags": [
+      "asset-types"
+    ]
+  },
+  {
+    "endpoint": "app.routers.asset_types.preview_asset_type_setting_removal",
+    "methods": [
+      "POST"
+    ],
+    "name": "preview_asset_type_setting_removal",
+    "path": "/api/asset-types/{asset_type_id}/removal-preview",
+    "tags": [
+      "asset-types"
+    ]
+  },
+  {
+    "endpoint": "app.routers.asset_types.restore_asset_type_setting",
+    "methods": [
+      "POST"
+    ],
+    "name": "restore_asset_type_setting",
+    "path": "/api/asset-types/{asset_type_id}/restore",
+    "tags": [
+      "asset-types"
+    ]
+  },
+  {
+    "endpoint": "app.routers.audit_trail.audit_trail",
+    "methods": [
+      "GET"
+    ],
+    "name": "audit_trail",
+    "path": "/api/audit-trail",
+    "tags": [
+      "audit-trail"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_benchmark.compare_extraction_to_gold_json",
+    "methods": [
+      "POST"
+    ],
+    "name": "compare_extraction_to_gold_json",
+    "path": "/api/bank-extraction/compare-json",
+    "tags": [
+      "bank-extraction-benchmark"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_benchmark.create_gold_file",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_gold_file",
+    "path": "/api/bank-extraction/gold-files",
+    "tags": [
+      "bank-extraction-benchmark"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_benchmark.list_gold_files",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_gold_files",
+    "path": "/api/bank-extraction/gold-files/{organisation_id}",
+    "tags": [
+      "bank-extraction-benchmark"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_benchmark.save_extraction_test_run",
+    "methods": [
+      "POST"
+    ],
+    "name": "save_extraction_test_run",
+    "path": "/api/bank-extraction/save-test-run",
+    "tags": [
+      "bank-extraction-benchmark"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_extraction_benchmark.list_extraction_test_runs",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_extraction_test_runs",
+    "path": "/api/bank-extraction/test-runs/{organisation_id}",
+    "tags": [
+      "bank-extraction-benchmark"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank.list_bank_accounts",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_bank_accounts",
+    "path": "/api/bank/accounts",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank.create_bank_account",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_bank_account",
+    "path": "/api/bank/accounts",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_journals.list_posted_bank_lines",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_posted_bank_lines",
+    "path": "/api/bank/accounts/{account_id}/posted-lines",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank.export_bank_statement",
+    "methods": [
+      "GET"
+    ],
+    "name": "export_bank_statement",
+    "path": "/api/bank/accounts/{account_id}/statement/export",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank.list_bank_account_unreconciled_lines",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_bank_account_unreconciled_lines",
+    "path": "/api/bank/accounts/{account_id}/unreconciled-lines",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_journals.list_bank_journal_lines",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_bank_journal_lines",
+    "path": "/api/bank/journals/{journal_id}/lines",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_journals.post_bank_journal",
+    "methods": [
+      "POST"
+    ],
+    "name": "post_bank_journal",
+    "path": "/api/bank/journals/{journal_id}/post",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_journals.unpost_bank_journal",
+    "methods": [
+      "POST"
+    ],
+    "name": "unpost_bank_journal",
+    "path": "/api/bank/journals/{journal_id}/unpost",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_lines.delete_bank_lines",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "delete_bank_lines",
+    "path": "/api/bank/lines",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_lines.bulk_allocate_bank_lines",
+    "methods": [
+      "POST"
+    ],
+    "name": "bulk_allocate_bank_lines",
+    "path": "/api/bank/lines/bulk-allocate",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_lines.bulk_delete_bank_lines",
+    "methods": [
+      "POST"
+    ],
+    "name": "bulk_delete_bank_lines",
+    "path": "/api/bank/lines/bulk-delete",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_journals.draft_bank_journal",
+    "methods": [
+      "POST"
+    ],
+    "name": "draft_bank_journal",
+    "path": "/api/bank/lines/{line_id}/draft-journal",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_journals.preview_bank_journal",
+    "methods": [
+      "POST"
+    ],
+    "name": "preview_bank_journal",
+    "path": "/api/bank/lines/{line_id}/journal-preview",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_lines.review_bank_line",
+    "methods": [
+      "POST"
+    ],
+    "name": "review_bank_line",
+    "path": "/api/bank/lines/{line_id}/review",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_lines.skip_bank_line",
+    "methods": [
+      "POST"
+    ],
+    "name": "skip_bank_line",
+    "path": "/api/bank/lines/{line_id}/skip",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_lines.suggest_bank_line",
+    "methods": [
+      "POST"
+    ],
+    "name": "suggest_bank_line",
+    "path": "/api/bank/lines/{line_id}/suggest",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank.list_parsing_rules",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_parsing_rules",
+    "path": "/api/bank/parsing-rules",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank.create_parsing_rule",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_parsing_rule",
+    "path": "/api/bank/parsing-rules",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank.delete_parsing_rule",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "delete_parsing_rule",
+    "path": "/api/bank/parsing-rules/{rule_id}",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank.update_parsing_rule",
+    "methods": [
+      "PUT"
+    ],
+    "name": "update_parsing_rule",
+    "path": "/api/bank/parsing-rules/{rule_id}",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_rules.list_rules",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_rules",
+    "path": "/api/bank/rules",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_rules.update_rule",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "update_rule",
+    "path": "/api/bank/rules/{rule_id}",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_rules.test_rule",
+    "methods": [
+      "POST"
+    ],
+    "name": "test_rule",
+    "path": "/api/bank/rules/{rule_id}/test",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_uploads.list_bank_uploads",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_bank_uploads",
+    "path": "/api/bank/uploads",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_uploads.create_bank_upload",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_bank_upload",
+    "path": "/api/bank/uploads",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_uploads.bulk_delete_bank_uploads",
+    "methods": [
+      "POST"
+    ],
+    "name": "bulk_delete_bank_uploads",
+    "path": "/api/bank/uploads/bulk-delete",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_uploads.delete_bank_upload",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "delete_bank_upload",
+    "path": "/api/bank/uploads/{upload_id}",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_uploads.get_bank_upload_audit_trail",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_bank_upload_audit_trail",
+    "path": "/api/bank/uploads/{upload_id}/audit-trail",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_uploads.extract_bank_upload",
+    "methods": [
+      "POST"
+    ],
+    "name": "extract_bank_upload",
+    "path": "/api/bank/uploads/{upload_id}/extract",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.bank_uploads.list_bank_lines",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_bank_lines",
+    "path": "/api/bank/uploads/{upload_id}/lines",
+    "tags": [
+      "bank"
+    ]
+  },
+  {
+    "endpoint": "app.routers.budgets.budget_grid",
+    "methods": [
+      "GET"
+    ],
+    "name": "budget_grid",
+    "path": "/api/budgets",
+    "tags": [
+      "budgets"
+    ]
+  },
+  {
+    "endpoint": "app.routers.budgets.upsert_entry",
+    "methods": [
+      "PUT"
+    ],
+    "name": "upsert_entry",
+    "path": "/api/budgets/entries",
+    "tags": [
+      "budgets"
+    ]
+  },
+  {
+    "endpoint": "app.routers.budgets.delete_entry",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "delete_entry",
+    "path": "/api/budgets/entries/{entry_id}",
+    "tags": [
+      "budgets"
+    ]
+  },
+  {
+    "endpoint": "app.routers.channels.channel_status",
+    "methods": [
+      "GET"
+    ],
+    "name": "channel_status",
+    "path": "/api/channels/status",
+    "tags": [
+      "channels"
+    ]
+  },
+  {
+    "endpoint": "app.routers.command_centre.command_centre",
+    "methods": [
+      "GET"
+    ],
+    "name": "command_centre",
+    "path": "/api/command-centre",
+    "tags": [
+      "command-centre"
+    ]
+  },
+  {
+    "endpoint": "app.routers.consolidation.post_consolidation_adjustment",
+    "methods": [
+      "POST"
+    ],
+    "name": "post_consolidation_adjustment",
+    "path": "/api/consolidation/adjustments/{adjustment_id}/post",
+    "tags": [
+      "consolidation"
+    ]
+  },
+  {
+    "endpoint": "app.routers.consolidation.get_reporting_groups",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_reporting_groups",
+    "path": "/api/consolidation/groups",
+    "tags": [
+      "consolidation"
+    ]
+  },
+  {
+    "endpoint": "app.routers.consolidation.create_group",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_group",
+    "path": "/api/consolidation/groups",
+    "tags": [
+      "consolidation"
+    ]
+  },
+  {
+    "endpoint": "app.routers.consolidation.add_account_mapping",
+    "methods": [
+      "POST"
+    ],
+    "name": "add_account_mapping",
+    "path": "/api/consolidation/groups/{reporting_group_id}/account-mappings",
+    "tags": [
+      "consolidation"
+    ]
+  },
+  {
+    "endpoint": "app.routers.consolidation.add_adjustment",
+    "methods": [
+      "POST"
+    ],
+    "name": "add_adjustment",
+    "path": "/api/consolidation/groups/{reporting_group_id}/adjustments",
+    "tags": [
+      "consolidation"
+    ]
+  },
+  {
+    "endpoint": "app.routers.consolidation.get_group_entities",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_group_entities",
+    "path": "/api/consolidation/groups/{reporting_group_id}/entities",
+    "tags": [
+      "consolidation"
+    ]
+  },
+  {
+    "endpoint": "app.routers.consolidation.add_group_entity",
+    "methods": [
+      "POST"
+    ],
+    "name": "add_group_entity",
+    "path": "/api/consolidation/groups/{reporting_group_id}/entities",
+    "tags": [
+      "consolidation"
+    ]
+  },
+  {
+    "endpoint": "app.routers.consolidation.add_exchange_rate",
+    "methods": [
+      "POST"
+    ],
+    "name": "add_exchange_rate",
+    "path": "/api/consolidation/groups/{reporting_group_id}/exchange-rates",
+    "tags": [
+      "consolidation"
+    ]
+  },
+  {
+    "endpoint": "app.routers.consolidation.add_period",
+    "methods": [
+      "POST"
+    ],
+    "name": "add_period",
+    "path": "/api/consolidation/groups/{reporting_group_id}/periods",
+    "tags": [
+      "consolidation"
+    ]
+  },
+  {
+    "endpoint": "app.routers.consolidation.trial_balance_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "trial_balance_report",
+    "path": "/api/consolidation/reports/trial-balance",
+    "tags": [
+      "consolidation"
+    ]
+  },
+  {
+    "endpoint": "app.routers.customer_collections.customer_collections_dashboard",
+    "methods": [
+      "GET"
+    ],
+    "name": "customer_collections_dashboard",
+    "path": "/api/customer-collections",
+    "tags": [
+      "customer-collections"
+    ]
+  },
+  {
+    "endpoint": "app.routers.customer_receipts.list_customer_receipts",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_customer_receipts",
+    "path": "/api/customer-receipts",
+    "tags": [
+      "customer-receipts"
+    ]
+  },
+  {
+    "endpoint": "app.routers.customer_receipts.create_customer_receipt",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_customer_receipt",
+    "path": "/api/customer-receipts",
+    "tags": [
+      "customer-receipts"
+    ]
+  },
+  {
+    "endpoint": "app.routers.customer_statements.list_statements",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_statements",
+    "path": "/api/customer-statements",
+    "tags": [
+      "customer-statements"
+    ]
+  },
+  {
+    "endpoint": "app.routers.customer_statements.get_statement",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_statement",
+    "path": "/api/customer-statements/{customer_id}",
+    "tags": [
+      "customer-statements"
+    ]
+  },
+  {
+    "endpoint": "app.routers.customer_statements.export_statement",
+    "methods": [
+      "GET"
+    ],
+    "name": "export_statement",
+    "path": "/api/customer-statements/{customer_id}/export",
+    "tags": [
+      "customer-statements"
+    ]
+  },
+  {
+    "endpoint": "app.routers.customers.list_customers",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_customers",
+    "path": "/api/customers",
+    "tags": [
+      "customers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.customers.create_customer",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_customer",
+    "path": "/api/customers",
+    "tags": [
+      "customers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.customers.get_customer",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_customer",
+    "path": "/api/customers/{customer_id}",
+    "tags": [
+      "customers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.customers.update_customer",
+    "methods": [
+      "PUT"
+    ],
+    "name": "update_customer",
+    "path": "/api/customers/{customer_id}",
+    "tags": [
+      "customers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.customers.archive_customer",
+    "methods": [
+      "POST"
+    ],
+    "name": "archive_customer",
+    "path": "/api/customers/{customer_id}/archive",
+    "tags": [
+      "customers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.customers.restore_customer",
+    "methods": [
+      "POST"
+    ],
+    "name": "restore_customer",
+    "path": "/api/customers/{customer_id}/restore",
+    "tags": [
+      "customers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.document_autofill.detect_fields",
+    "methods": [
+      "POST"
+    ],
+    "name": "detect_fields",
+    "path": "/api/document-autofill/detect-fields",
+    "tags": [
+      "document-autofill"
+    ]
+  },
+  {
+    "endpoint": "app.routers.finance_leases.list_finance_leases",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_finance_leases",
+    "path": "/api/finance-leases",
+    "tags": [
+      "finance-leases"
+    ]
+  },
+  {
+    "endpoint": "app.routers.finance_leases.create_finance_lease",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_finance_lease",
+    "path": "/api/finance-leases",
+    "tags": [
+      "finance-leases"
+    ]
+  },
+  {
+    "endpoint": "app.routers.finance_leases.get_finance_lease",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_finance_lease",
+    "path": "/api/finance-leases/{lease_id}",
+    "tags": [
+      "finance-leases"
+    ]
+  },
+  {
+    "endpoint": "app.routers.finance_leases.update_finance_lease",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "update_finance_lease",
+    "path": "/api/finance-leases/{lease_id}",
+    "tags": [
+      "finance-leases"
+    ]
+  },
+  {
+    "endpoint": "app.routers.finance_leases.post_period_end_reclassification",
+    "methods": [
+      "POST"
+    ],
+    "name": "post_period_end_reclassification",
+    "path": "/api/finance-leases/{lease_id}/period-end",
+    "tags": [
+      "finance-leases"
+    ]
+  },
+  {
+    "endpoint": "app.routers.finance_leases.post_payment_journal",
+    "methods": [
+      "POST"
+    ],
+    "name": "post_payment_journal",
+    "path": "/api/finance-leases/{lease_id}/post-payment/{period_number}",
+    "tags": [
+      "finance-leases"
+    ]
+  },
+  {
+    "endpoint": "app.routers.finance_leases.get_lease_schedule",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_lease_schedule",
+    "path": "/api/finance-leases/{lease_id}/schedule",
+    "tags": [
+      "finance-leases"
+    ]
+  },
+  {
+    "endpoint": "app.routers.finance_leases.update_schedule_row",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "update_schedule_row",
+    "path": "/api/finance-leases/{lease_id}/schedule/{period_number}",
+    "tags": [
+      "finance-leases"
+    ]
+  },
+  {
+    "endpoint": "app.routers.finance_leases.upload_lease_document",
+    "methods": [
+      "POST"
+    ],
+    "name": "upload_lease_document",
+    "path": "/api/finance-leases/{lease_id}/upload-document",
+    "tags": [
+      "finance-leases"
+    ]
+  },
+  {
+    "endpoint": "app.routers.go_live_checklist.go_live_checklist",
+    "methods": [
+      "GET"
+    ],
+    "name": "go_live_checklist",
+    "path": "/api/go-live-checklist",
+    "tags": [
+      "go-live-checklist"
+    ]
+  },
+  {
+    "endpoint": "app.routers.inventory.list_inventory_items",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_inventory_items",
+    "path": "/api/inventory/items",
+    "tags": [
+      "inventory"
+    ]
+  },
+  {
+    "endpoint": "app.routers.inventory.create_inventory_item",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_inventory_item",
+    "path": "/api/inventory/items",
+    "tags": [
+      "inventory"
+    ]
+  },
+  {
+    "endpoint": "app.routers.inventory.update_inventory_item",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "update_inventory_item",
+    "path": "/api/inventory/items/{item_id}",
+    "tags": [
+      "inventory"
+    ]
+  },
+  {
+    "endpoint": "app.routers.inventory.list_stock_movements",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_stock_movements",
+    "path": "/api/inventory/movements",
+    "tags": [
+      "inventory"
+    ]
+  },
+  {
+    "endpoint": "app.routers.inventory.create_stock_movement",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_stock_movement",
+    "path": "/api/inventory/movements",
+    "tags": [
+      "inventory"
+    ]
+  },
+  {
+    "endpoint": "app.routers.inventory.list_inventory_structures",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_inventory_structures",
+    "path": "/api/inventory/structures",
+    "tags": [
+      "inventory"
+    ]
+  },
+  {
+    "endpoint": "app.routers.inventory.create_inventory_structure",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_inventory_structure",
+    "path": "/api/inventory/structures",
+    "tags": [
+      "inventory"
+    ]
+  },
+  {
+    "endpoint": "app.routers.inventory.get_inventory_structure",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_inventory_structure",
+    "path": "/api/inventory/structures/{structure_id}",
+    "tags": [
+      "inventory"
+    ]
+  },
+  {
+    "endpoint": "app.routers.inventory.update_inventory_structure",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "update_inventory_structure",
+    "path": "/api/inventory/structures/{structure_id}",
+    "tags": [
+      "inventory"
+    ]
+  },
+  {
+    "endpoint": "app.routers.inventory.inventory_summary",
+    "methods": [
+      "GET"
+    ],
+    "name": "inventory_summary",
+    "path": "/api/inventory/summary",
+    "tags": [
+      "inventory"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_review.apply_agent_suggestion",
+    "methods": [
+      "POST"
+    ],
+    "name": "apply_agent_suggestion",
+    "path": "/api/invoices/agent-suggestions/{suggestion_id}/apply",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_review.check_agent_suggestion",
+    "methods": [
+      "POST"
+    ],
+    "name": "check_agent_suggestion",
+    "path": "/api/invoices/agent-suggestions/{suggestion_id}/checked",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_review.dismiss_agent_suggestion",
+    "methods": [
+      "POST"
+    ],
+    "name": "dismiss_agent_suggestion",
+    "path": "/api/invoices/agent-suggestions/{suggestion_id}/dismiss",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_queue.extract_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "extract_invoice",
+    "path": "/api/invoices/extract",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_queue.get_extract_status",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_extract_status",
+    "path": "/api/invoices/extract/{job_id}/status",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices.generate_invoice_preview",
+    "methods": [
+      "POST"
+    ],
+    "name": "generate_invoice_preview",
+    "path": "/api/invoices/generate-preview",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices.process_next_invoice_job",
+    "methods": [
+      "POST"
+    ],
+    "name": "process_next_invoice_job",
+    "path": "/api/invoices/jobs/process-next",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices.merge_invoices",
+    "methods": [
+      "POST"
+    ],
+    "name": "merge_invoices",
+    "path": "/api/invoices/merge",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices.process_page_groups",
+    "methods": [
+      "POST"
+    ],
+    "name": "process_page_groups",
+    "path": "/api/invoices/process-page-groups",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_queue.queue_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "queue_invoice",
+    "path": "/api/invoices/queue",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_queue.get_invoice_audit_events",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_invoice_audit_events",
+    "path": "/api/invoices/raw/{invoice_raw_id}/audit-events",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices.get_invoice_raw_file",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_invoice_raw_file",
+    "path": "/api/invoices/raw/{invoice_raw_id}/file",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices.get_invoice_preview_image",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_invoice_preview_image",
+    "path": "/api/invoices/raw/{invoice_raw_id}/preview-image",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_queue.re_extract_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "re_extract_invoice",
+    "path": "/api/invoices/re-extract",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_queue.get_re_extract_status",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_re_extract_status",
+    "path": "/api/invoices/re-extract/{job_id}/status",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices.reapply_supplier_rules_endpoint",
+    "methods": [
+      "POST"
+    ],
+    "name": "reapply_supplier_rules_endpoint",
+    "path": "/api/invoices/reapply-supplier-rules",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices.save_invoice_line_items",
+    "methods": [
+      "POST"
+    ],
+    "name": "save_invoice_line_items",
+    "path": "/api/invoices/save-line-items",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_review.get_invoice_agent_review",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_invoice_agent_review",
+    "path": "/api/invoices/{invoice_id}/agent-review",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_review.run_invoice_agent_review",
+    "methods": [
+      "POST"
+    ],
+    "name": "run_invoice_agent_review",
+    "path": "/api/invoices/{invoice_id}/agent-review",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_review.mark_agent_review_checked",
+    "methods": [
+      "POST"
+    ],
+    "name": "mark_agent_review_checked",
+    "path": "/api/invoices/{invoice_id}/agent-review/checked",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_gl.post_invoice_to_gl",
+    "methods": [
+      "POST"
+    ],
+    "name": "post_invoice_to_gl",
+    "path": "/api/invoices/{invoice_id}/post-to-gl",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_review.get_invoice_review_data",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_invoice_review_data",
+    "path": "/api/invoices/{invoice_id}/review-data",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_review.get_supplier_comparison_ignores",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_supplier_comparison_ignores",
+    "path": "/api/invoices/{invoice_id}/supplier-comparison-ignores",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_review.ignore_supplier_comparison_field",
+    "methods": [
+      "POST"
+    ],
+    "name": "ignore_supplier_comparison_field",
+    "path": "/api/invoices/{invoice_id}/supplier-comparison-ignores",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices_review.undo_supplier_comparison_ignore",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "undo_supplier_comparison_ignore",
+    "path": "/api/invoices/{invoice_id}/supplier-comparison-ignores/{field_key}",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.invoices.split_invoice_into_pages",
+    "methods": [
+      "POST"
+    ],
+    "name": "split_invoice_into_pages",
+    "path": "/api/invoices/{raw_id}/split-into-pages",
+    "tags": [
+      "invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.notifications.get_notifications",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_notifications",
+    "path": "/api/notifications",
+    "tags": [
+      "notifications"
+    ]
+  },
+  {
+    "endpoint": "app.routers.notifications.read_all_notifications",
+    "methods": [
+      "POST"
+    ],
+    "name": "read_all_notifications",
+    "path": "/api/notifications/read-all",
+    "tags": [
+      "notifications"
+    ]
+  },
+  {
+    "endpoint": "app.routers.notifications.read_notification",
+    "methods": [
+      "POST"
+    ],
+    "name": "read_notification",
+    "path": "/api/notifications/{notification_id}/read",
+    "tags": [
+      "notifications"
+    ]
+  },
+  {
+    "endpoint": "app.routers.opening_balances.post_opening_balances",
+    "methods": [
+      "POST"
+    ],
+    "name": "post_opening_balances",
+    "path": "/api/opening-balances/post",
+    "tags": [
+      "opening-balances"
+    ]
+  },
+  {
+    "endpoint": "app.routers.opening_balances.preview_opening_balances",
+    "methods": [
+      "POST"
+    ],
+    "name": "preview_opening_balances",
+    "path": "/api/opening-balances/preview",
+    "tags": [
+      "opening-balances"
+    ]
+  },
+  {
+    "endpoint": "app.routers.integrations.get_organisation_integrations",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_organisation_integrations",
+    "path": "/api/organisations/{organisation_id}/integrations",
+    "tags": [
+      "organisation-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.integrations.add_organisation_integration",
+    "methods": [
+      "POST"
+    ],
+    "name": "add_organisation_integration",
+    "path": "/api/organisations/{organisation_id}/integrations",
+    "tags": [
+      "organisation-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.integrations.remove_organisation_integration",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "remove_organisation_integration",
+    "path": "/api/organisations/{organisation_id}/integrations/{integration_id}",
+    "tags": [
+      "organisation-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.integrations.patch_organisation_integration",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "patch_organisation_integration",
+    "path": "/api/organisations/{organisation_id}/integrations/{integration_id}",
+    "tags": [
+      "organisation-integrations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.organisations.get_invoice_branding",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_invoice_branding",
+    "path": "/api/organisations/{organisation_id}/invoice-branding",
+    "tags": [
+      "organisations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.organisations.update_invoice_branding",
+    "methods": [
+      "PUT"
+    ],
+    "name": "update_invoice_branding",
+    "path": "/api/organisations/{organisation_id}/invoice-branding",
+    "tags": [
+      "organisations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.organisations.list_organisation_module_settings",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_organisation_module_settings",
+    "path": "/api/organisations/{organisation_id}/module-settings",
+    "tags": [
+      "organisations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.organisations.update_organisation_module_setting",
+    "methods": [
+      "PUT"
+    ],
+    "name": "update_organisation_module_setting",
+    "path": "/api/organisations/{organisation_id}/module-settings/{module_key}",
+    "tags": [
+      "organisations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.organisations.get_org_profile",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_org_profile",
+    "path": "/api/organisations/{organisation_id}/profile",
+    "tags": [
+      "organisations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.organisations.get_organisation_settings",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_organisation_settings",
+    "path": "/api/organisations/{organisation_id}/settings",
+    "tags": [
+      "organisations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.organisations.update_organisation_settings",
+    "methods": [
+      "PUT"
+    ],
+    "name": "update_organisation_settings",
+    "path": "/api/organisations/{organisation_id}/settings",
+    "tags": [
+      "organisations"
+    ]
+  },
+  {
+    "endpoint": "app.routers.receipt_inbox.list_receipts",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_receipts",
+    "path": "/api/receipt-inbox",
+    "tags": [
+      "receipt-inbox"
+    ]
+  },
+  {
+    "endpoint": "app.routers.receipt_inbox.unlink_bank_line",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "unlink_bank_line",
+    "path": "/api/receipt-inbox/{receipt_id}/link",
+    "tags": [
+      "receipt-inbox"
+    ]
+  },
+  {
+    "endpoint": "app.routers.receipt_inbox.link_bank_line",
+    "methods": [
+      "POST"
+    ],
+    "name": "link_bank_line",
+    "path": "/api/receipt-inbox/{receipt_id}/link",
+    "tags": [
+      "receipt-inbox"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reconciliation.run_reconciliation_route",
+    "methods": [
+      "POST"
+    ],
+    "name": "run_reconciliation_route",
+    "path": "/api/reconciliation/run",
+    "tags": [
+      "reconciliation"
+    ]
+  },
+  {
+    "endpoint": "app.routers.recurring_transactions.list_templates_route",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_templates_route",
+    "path": "/api/recurring-transactions",
+    "tags": [
+      "recurring-transactions"
+    ]
+  },
+  {
+    "endpoint": "app.routers.recurring_transactions.create_template_route",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_template_route",
+    "path": "/api/recurring-transactions",
+    "tags": [
+      "recurring-transactions"
+    ]
+  },
+  {
+    "endpoint": "app.routers.recurring_transactions.list_drafts_route",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_drafts_route",
+    "path": "/api/recurring-transactions/drafts",
+    "tags": [
+      "recurring-transactions"
+    ]
+  },
+  {
+    "endpoint": "app.routers.recurring_transactions.approve_draft_route",
+    "methods": [
+      "POST"
+    ],
+    "name": "approve_draft_route",
+    "path": "/api/recurring-transactions/drafts/{draft_id}/approve",
+    "tags": [
+      "recurring-transactions"
+    ]
+  },
+  {
+    "endpoint": "app.routers.recurring_transactions.skip_draft_route",
+    "methods": [
+      "POST"
+    ],
+    "name": "skip_draft_route",
+    "path": "/api/recurring-transactions/drafts/{draft_id}/skip",
+    "tags": [
+      "recurring-transactions"
+    ]
+  },
+  {
+    "endpoint": "app.routers.recurring_transactions.delete_template_route",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "delete_template_route",
+    "path": "/api/recurring-transactions/{template_id}",
+    "tags": [
+      "recurring-transactions"
+    ]
+  },
+  {
+    "endpoint": "app.routers.recurring_transactions.get_template_route",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_template_route",
+    "path": "/api/recurring-transactions/{template_id}",
+    "tags": [
+      "recurring-transactions"
+    ]
+  },
+  {
+    "endpoint": "app.routers.recurring_transactions.update_template_route",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "update_template_route",
+    "path": "/api/recurring-transactions/{template_id}",
+    "tags": [
+      "recurring-transactions"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reports.aged_payables_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "aged_payables_report",
+    "path": "/api/reports/aged-payables",
+    "tags": [
+      "reports"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reports.aged_receivables_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "aged_receivables_report",
+    "path": "/api/reports/aged-receivables",
+    "tags": [
+      "reports"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reports.balance_sheet_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "balance_sheet_report",
+    "path": "/api/reports/balance-sheet",
+    "tags": [
+      "reports"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reports.cash_flow_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "cash_flow_report",
+    "path": "/api/reports/cash-flow",
+    "tags": [
+      "reports"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reports.cash_flow_forecast_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "cash_flow_forecast_report",
+    "path": "/api/reports/cash-flow-forecast",
+    "tags": [
+      "reports"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reports.general_ledger_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "general_ledger_report",
+    "path": "/api/reports/general-ledger",
+    "tags": [
+      "reports"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reports.income_statement_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "income_statement_report",
+    "path": "/api/reports/income-statement",
+    "tags": [
+      "reports"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reports.transaction_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "transaction_report",
+    "path": "/api/reports/transactions",
+    "tags": [
+      "reports"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reports.export_transaction_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "export_transaction_report",
+    "path": "/api/reports/transactions/export",
+    "tags": [
+      "reports"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reports.trial_balance_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "trial_balance_report",
+    "path": "/api/reports/trial-balance",
+    "tags": [
+      "reports"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reports.export_trial_balance_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "export_trial_balance_report",
+    "path": "/api/reports/trial-balance/export",
+    "tags": [
+      "reports"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reports.vat_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "vat_report",
+    "path": "/api/reports/vat",
+    "tags": [
+      "reports"
+    ]
+  },
+  {
+    "endpoint": "app.routers.reports.export_vat_report",
+    "methods": [
+      "GET"
+    ],
+    "name": "export_vat_report",
+    "path": "/api/reports/vat/export",
+    "tags": [
+      "reports"
+    ]
+  },
+  {
+    "endpoint": "app.routers.review_queue.get_review_queue",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_review_queue",
+    "path": "/api/review-queue",
+    "tags": [
+      "review-queue"
+    ]
+  },
+  {
+    "endpoint": "app.routers.review_queue.approve_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "approve_invoice",
+    "path": "/api/review-queue/{invoice_id}/approve",
+    "tags": [
+      "review-queue"
+    ]
+  },
+  {
+    "endpoint": "app.routers.review_queue.flag_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "flag_invoice",
+    "path": "/api/review-queue/{invoice_id}/flag",
+    "tags": [
+      "review-queue"
+    ]
+  },
+  {
+    "endpoint": "app.routers.review_queue.ignore_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "ignore_invoice",
+    "path": "/api/review-queue/{invoice_id}/ignore",
+    "tags": [
+      "review-queue"
+    ]
+  },
+  {
+    "endpoint": "app.routers.sales_invoices.list_sales_invoices",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_sales_invoices",
+    "path": "/api/sales-invoices",
+    "tags": [
+      "sales-invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.sales_invoices.create_sales_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_sales_invoice",
+    "path": "/api/sales-invoices",
+    "tags": [
+      "sales-invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.sales_invoices.list_sales_invoice_item_codes",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_sales_invoice_item_codes",
+    "path": "/api/sales-invoices/item-codes",
+    "tags": [
+      "sales-invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.sales_invoices.list_rebill_bucket_items",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_rebill_bucket_items",
+    "path": "/api/sales-invoices/rebill-bucket",
+    "tags": [
+      "sales-invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.sales_invoices.get_sales_invoice",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_sales_invoice",
+    "path": "/api/sales-invoices/{invoice_id}",
+    "tags": [
+      "sales-invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.sales_invoices.update_sales_invoice",
+    "methods": [
+      "PUT"
+    ],
+    "name": "update_sales_invoice",
+    "path": "/api/sales-invoices/{invoice_id}",
+    "tags": [
+      "sales-invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.sales_invoices_actions.approve_sales_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "approve_sales_invoice",
+    "path": "/api/sales-invoices/{invoice_id}/approve",
+    "tags": [
+      "sales-invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.sales_invoices_actions.create_credit_note",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_credit_note",
+    "path": "/api/sales-invoices/{invoice_id}/credit-notes",
+    "tags": [
+      "sales-invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.sales_invoices_actions.issue_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "issue_invoice",
+    "path": "/api/sales-invoices/{invoice_id}/issue",
+    "tags": [
+      "sales-invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.sales_invoices_actions.download_invoice_pdf",
+    "methods": [
+      "GET"
+    ],
+    "name": "download_invoice_pdf",
+    "path": "/api/sales-invoices/{invoice_id}/pdf",
+    "tags": [
+      "sales-invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.sales_invoices.add_rebill_lines",
+    "methods": [
+      "POST"
+    ],
+    "name": "add_rebill_lines",
+    "path": "/api/sales-invoices/{invoice_id}/rebill-lines",
+    "tags": [
+      "sales-invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.sales_invoices_actions.send_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "send_invoice",
+    "path": "/api/sales-invoices/{invoice_id}/send",
+    "tags": [
+      "sales-invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.sales_invoices_actions.submit_sales_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "submit_sales_invoice",
+    "path": "/api/sales-invoices/{invoice_id}/submit",
+    "tags": [
+      "sales-invoices"
+    ]
+  },
+  {
+    "endpoint": "app.routers.global_search.global_search",
+    "methods": [
+      "GET"
+    ],
+    "name": "global_search",
+    "path": "/api/search",
+    "tags": [
+      "search"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_payment_runs.supplier_payment_run_preview",
+    "methods": [
+      "GET"
+    ],
+    "name": "supplier_payment_run_preview",
+    "path": "/api/supplier-payment-runs",
+    "tags": [
+      "supplier-payment-runs"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_payment_runs.list_drafts",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_drafts",
+    "path": "/api/supplier-payment-runs/drafts",
+    "tags": [
+      "supplier-payment-runs"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_payment_runs.create_supplier_payment_run_draft_route",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_supplier_payment_run_draft_route",
+    "path": "/api/supplier-payment-runs/drafts",
+    "tags": [
+      "supplier-payment-runs"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_payment_runs.get_draft",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_draft",
+    "path": "/api/supplier-payment-runs/drafts/{draft_id}",
+    "tags": [
+      "supplier-payment-runs"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_payment_runs.approve_draft",
+    "methods": [
+      "POST"
+    ],
+    "name": "approve_draft",
+    "path": "/api/supplier-payment-runs/drafts/{draft_id}/approve",
+    "tags": [
+      "supplier-payment-runs"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_payment_runs.cancel_draft",
+    "methods": [
+      "POST"
+    ],
+    "name": "cancel_draft",
+    "path": "/api/supplier-payment-runs/drafts/{draft_id}/cancel",
+    "tags": [
+      "supplier-payment-runs"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_payment_runs.export_draft",
+    "methods": [
+      "GET"
+    ],
+    "name": "export_draft",
+    "path": "/api/supplier-payment-runs/drafts/{draft_id}/export",
+    "tags": [
+      "supplier-payment-runs"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suppliers.list_suppliers",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_suppliers",
+    "path": "/api/suppliers",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suppliers.create_supplier",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_supplier",
+    "path": "/api/suppliers",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_allocation_rules.delete_supplier_allocation_rule",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "delete_supplier_allocation_rule",
+    "path": "/api/suppliers/allocation-rules/{rule_id}",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_allocation_rules.update_supplier_allocation_rule",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "update_supplier_allocation_rule",
+    "path": "/api/suppliers/allocation-rules/{rule_id}",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_branches.create_supplier_branch",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_supplier_branch",
+    "path": "/api/suppliers/branches",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_branches.create_supplier_branch_from_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_supplier_branch_from_invoice",
+    "path": "/api/suppliers/branches/from-invoice",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_branches.link_supplier_branch",
+    "methods": [
+      "POST"
+    ],
+    "name": "link_supplier_branch",
+    "path": "/api/suppliers/branches/link",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_branches.unlink_supplier_branch",
+    "methods": [
+      "POST"
+    ],
+    "name": "unlink_supplier_branch",
+    "path": "/api/suppliers/branches/unlink",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suppliers.create_supplier_from_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_supplier_from_invoice",
+    "path": "/api/suppliers/create-from-invoice",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suppliers.create_supplier_from_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_supplier_from_invoice",
+    "path": "/api/suppliers/from-invoice",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suppliers.get_supplier_profile_from_invoice",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_supplier_profile_from_invoice",
+    "path": "/api/suppliers/from-invoice/{invoice_extracted_id}",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_kyc.delete_supplier_kyc_document",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "delete_supplier_kyc_document",
+    "path": "/api/suppliers/kyc-documents/{document_id}",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_kyc.update_supplier_kyc_request",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "update_supplier_kyc_request",
+    "path": "/api/suppliers/kyc-requests/{request_id}",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_kyc.list_supplier_kyc_documents",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_supplier_kyc_documents",
+    "path": "/api/suppliers/kyc-requests/{request_id}/documents",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_kyc.create_supplier_kyc_document",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_supplier_kyc_document",
+    "path": "/api/suppliers/kyc-requests/{request_id}/documents",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suppliers.link_supplier",
+    "methods": [
+      "POST"
+    ],
+    "name": "link_supplier",
+    "path": "/api/suppliers/link",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suppliers.link_supplier",
+    "methods": [
+      "POST"
+    ],
+    "name": "link_supplier",
+    "path": "/api/suppliers/link-invoice",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suppliers.match_supplier_profile",
+    "methods": [
+      "POST"
+    ],
+    "name": "match_supplier_profile",
+    "path": "/api/suppliers/match-profile",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suppliers.suggest_supplier_match",
+    "methods": [
+      "GET"
+    ],
+    "name": "suggest_supplier_match",
+    "path": "/api/suppliers/match-suggest",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suppliers.create_supplier",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_supplier",
+    "path": "/api/suppliers/new",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_allocation_rules.list_supplier_allocation_rules",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_supplier_allocation_rules",
+    "path": "/api/suppliers/{supplier_id}/allocation-rules",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_allocation_rules.create_supplier_allocation_rule",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_supplier_allocation_rule",
+    "path": "/api/suppliers/{supplier_id}/allocation-rules",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_allocation_rules.create_supplier_allocation_rules_from_invoice",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_supplier_allocation_rules_from_invoice",
+    "path": "/api/suppliers/{supplier_id}/allocation-rules/from-invoice",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suppliers.get_supplier_allocation_settings",
+    "methods": [
+      "GET"
+    ],
+    "name": "get_supplier_allocation_settings",
+    "path": "/api/suppliers/{supplier_id}/allocation-settings",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suppliers.update_supplier_allocation_settings",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "update_supplier_allocation_settings",
+    "path": "/api/suppliers/{supplier_id}/allocation-settings",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_branches.list_supplier_branches",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_supplier_branches",
+    "path": "/api/suppliers/{supplier_id}/branches",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_kyc.list_supplier_kyc_requests",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_supplier_kyc_requests",
+    "path": "/api/suppliers/{supplier_id}/kyc-requests",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.supplier_kyc.create_supplier_kyc_request",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_supplier_kyc_request",
+    "path": "/api/suppliers/{supplier_id}/kyc-requests",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suppliers.update_supplier_stp_settings",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "update_supplier_stp_settings",
+    "path": "/api/suppliers/{supplier_id}/stp-settings",
+    "tags": [
+      "suppliers"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suspense_clearing.suspense_accounts",
+    "methods": [
+      "GET"
+    ],
+    "name": "suspense_accounts",
+    "path": "/api/suspense-clearing/accounts",
+    "tags": [
+      "suspense-clearing"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suspense_clearing.approved_unposted_invoices",
+    "methods": [
+      "GET"
+    ],
+    "name": "approved_unposted_invoices",
+    "path": "/api/suspense-clearing/approved-unposted",
+    "tags": [
+      "suspense-clearing"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suspense_clearing.unreconciled_bank_lines",
+    "methods": [
+      "GET"
+    ],
+    "name": "unreconciled_bank_lines",
+    "path": "/api/suspense-clearing/bank-lines",
+    "tags": [
+      "suspense-clearing"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suspense_clearing.extraction_failures",
+    "methods": [
+      "GET"
+    ],
+    "name": "extraction_failures",
+    "path": "/api/suspense-clearing/extraction-failures",
+    "tags": [
+      "suspense-clearing"
+    ]
+  },
+  {
+    "endpoint": "app.routers.suspense_clearing.suspense_summary",
+    "methods": [
+      "GET"
+    ],
+    "name": "suspense_summary",
+    "path": "/api/suspense-clearing/summary",
+    "tags": [
+      "suspense-clearing"
+    ]
+  },
+  {
+    "endpoint": "app.routers.themes.active_theme",
+    "methods": [
+      "GET"
+    ],
+    "name": "active_theme",
+    "path": "/api/themes/active",
+    "tags": [
+      "themes"
+    ]
+  },
+  {
+    "endpoint": "app.routers.themes.update_active_theme",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "update_active_theme",
+    "path": "/api/themes/active",
+    "tags": [
+      "themes"
+    ]
+  },
+  {
+    "endpoint": "app.routers.themes.purchased_themes",
+    "methods": [
+      "GET"
+    ],
+    "name": "purchased_themes",
+    "path": "/api/themes/purchased",
+    "tags": [
+      "themes"
+    ]
+  },
+  {
+    "endpoint": "app.routers.webhooks.email_inbound",
+    "methods": [
+      "POST"
+    ],
+    "name": "email_inbound",
+    "path": "/api/webhooks/email-inbound",
+    "tags": [
+      "webhooks"
+    ]
+  },
+  {
+    "endpoint": "app.routers.webhooks.mailgun_events",
+    "methods": [
+      "POST"
+    ],
+    "name": "mailgun_events",
+    "path": "/api/webhooks/mailgun-events",
+    "tags": [
+      "webhooks"
+    ]
+  },
+  {
+    "endpoint": "app.routers.webhooks.whatsapp_verify",
+    "methods": [
+      "GET"
+    ],
+    "name": "whatsapp_verify",
+    "path": "/api/webhooks/whatsapp",
+    "tags": [
+      "webhooks"
+    ]
+  },
+  {
+    "endpoint": "app.routers.webhooks.whatsapp_inbound",
+    "methods": [
+      "POST"
+    ],
+    "name": "whatsapp_inbound",
+    "path": "/api/webhooks/whatsapp",
+    "tags": [
+      "webhooks"
+    ]
+  }
+]
