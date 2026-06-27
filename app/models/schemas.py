@@ -22,6 +22,7 @@ class ReconciliationSummary(BaseModel):
     matched: int
     unmatched: int
     exceptions: int
+    missing_invoice_count: int = 0
 
 
 class ReconciliationLineResult(BaseModel):
@@ -41,6 +42,7 @@ class RunReconciliationResponse(BaseModel):
     status: str
     summary: ReconciliationSummary
     lines: list[ReconciliationLineResult]
+    missing_invoices: list[dict] = []
 
 
 class LineSkipRequest(BaseModel):
