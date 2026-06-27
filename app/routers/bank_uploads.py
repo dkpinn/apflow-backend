@@ -46,6 +46,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/bank", tags=["bank"])
 
 
+def _line_signed_amount(line) -> float:
+    if isinstance(line, dict):
+        return float(line.get("signed_amount") or 0)
+    return float(getattr(line, "signed_amount", 0) or 0)
+
+
 @router.get("/uploads")
 def list_bank_uploads(auth: UserAuth, organisation_id: str, bank_account_id: Optional[str] = None):
     user_id, db = _auth(auth)
@@ -191,11 +197,11 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
 
         nil_line_count = sum(
             1 for w in line_wrappers
-            if w["duplicate_status"] == "clear" and w["line"].signed_amount == 0
+            if w["duplicate_status"] == "clear" and _line_signed_amount(w["line"]) == 0
         )
         clearable = [
             w for w in line_wrappers
-            if w["duplicate_status"] == "clear" and w["line"].signed_amount != 0
+            if w["duplicate_status"] == "clear" and _line_signed_amount(w["line"]) != 0
         ]
         duplicate_summary["nil_line_count"] = nil_line_count
 

@@ -30,6 +30,9 @@ create index if not exists organisation_accounting_periods_org_idx
 
 alter table public.organisation_accounting_periods enable row level security;
 
+revoke all privileges on table public.organisation_accounting_periods from public, anon;
+grant all privileges on table public.organisation_accounting_periods to service_role;
+
 drop policy if exists "organisation_accounting_periods_select_member"
   on public.organisation_accounting_periods;
 create policy "organisation_accounting_periods_select_member"

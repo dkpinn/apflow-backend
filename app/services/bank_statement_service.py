@@ -34,6 +34,12 @@ from app.services.bank_statement_extraction import (
 )
 
 
+def _line_value(line: Any, key: str, default: Any = None) -> Any:
+    if isinstance(line, dict):
+        return line.get(key, default)
+    return getattr(line, key, default)
+
+
 def correct_amounts_from_balance(
     lines: list[ParsedBankLine],
     *,
@@ -53,7 +59,7 @@ def correct_amounts_from_balance(
         return lines
 
     # Require at least 60% of lines to have a balance before trusting it.
-    lines_with_balance = sum(1 for ln in lines if ln.balance_amount is not None)
+    lines_with_balance = sum(1 for ln in lines if _line_value(ln, "balance_amount") is not None)
     if lines_with_balance < max(2, len(lines) * 0.6):
         logger.debug("[BALANCE-CORRECT] Skipping: only %d/%d lines have balance_amount", lines_with_balance, len(lines))
         return lines
@@ -62,12 +68,13 @@ def correct_amounts_from_balance(
     previous_balance: Optional[Decimal] = None
     corrections_needed = 0
     for line in lines:
-        if line.balance_amount is not None and previous_balance is not None:
-            expected = money(line.balance_amount) - money(previous_balance)
-            if abs(expected - line.signed_amount) > Decimal("0.01"):
+        balance_amount = _line_value(line, "balance_amount")
+        if balance_amount is not None and previous_balance is not None:
+            expected = money(balance_amount) - money(previous_balance)
+            if abs(expected - _line_value(line, "signed_amount", MONEY_ZERO)) > Decimal("0.01"):
                 corrections_needed += 1
-        if line.balance_amount is not None:
-            previous_balance = line.balance_amount
+        if balance_amount is not None:
+            previous_balance = balance_amount
 
     # If more than half the lines need "correction" the balance column is suspect.
     if corrections_needed > lines_with_balance * 0.5:
@@ -80,9 +87,24 @@ def correct_amounts_from_balance(
     # Apply corrections.
     previous_balance = None
     for line in lines:
-        if line.balance_amount is not None and previous_balance is not None:
-            expected = money(line.balance_amount) - money(previous_balance)
-            if abs(expected - line.signed_amount) > Decimal("0.01"):
+        balance_amount = _line_value(line, "balance_amount")
+        if balance_amount is not None and previous_balance is not None:
+            expected = money(balance_amount) - money(previous_balance)
+            if abs(expected - _line_value(line, "signed_amount", MONEY_ZERO)) > Decimal("0.01"):
+                if isinstance(line, dict):
+                    line["signed_amount"] = expected
+                    line["debit_amount"] = abs(expected) if expected < MONEY_ZERO else MONEY_ZERO
+                    line["credit_amount"] = expected if expected >= MONEY_ZERO else MONEY_ZERO
+                    line["transaction_hash"] = transaction_fingerprint(
+                        bank_account_id=bank_account_id,
+                        line_date=line.get("line_date"),
+                        amount=expected,
+                        reference=line.get("reference"),
+                        counterparty=line.get("counterparty"),
+                        bank_reference=line.get("bank_reference"),
+                        description=line.get("description"),
+                    )
+                    continue
                 line.signed_amount = expected
                 line.debit_amount = abs(expected) if expected < MONEY_ZERO else MONEY_ZERO
                 line.credit_amount = expected if expected >= MONEY_ZERO else MONEY_ZERO
@@ -95,8 +117,8 @@ def correct_amounts_from_balance(
                     bank_reference=line.bank_reference,
                     description=line.description,
                 )
-        if line.balance_amount is not None:
-            previous_balance = line.balance_amount
+        if balance_amount is not None:
+            previous_balance = balance_amount
     if corrections_needed:
         logger.debug("[BALANCE-CORRECT] Applied %d corrections from running balance", corrections_needed)
     return lines
@@ -188,17 +210,22 @@ def validate_running_balance(lines: list[ParsedBankLine], header: dict[str, Any]
     )
 
     for i, line in enumerate(lines):
-        if line.balance_amount is None:
+        balance_amount = _line_value(line, "balance_amount")
+        if balance_amount is None:
             continue
-        curr = line.balance_amount
+        curr = money(balance_amount)
         if prev_balance is not None:
-            expected = prev_balance + line.credit_amount - line.debit_amount
+            expected = (
+                prev_balance
+                + money(_line_value(line, "credit_amount", MONEY_ZERO))
+                - money(_line_value(line, "debit_amount", MONEY_ZERO))
+            )
             diff = abs(expected - curr)
             if diff > Decimal("0.02"):
                 mismatches.append({
                     "row_index": i,
-                    "date": str(line.line_date or ""),
-                    "description": (line.description or "")[:60],
+                    "date": str(_line_value(line, "line_date") or ""),
+                    "description": (_line_value(line, "description", "") or "")[:60],
                     "expected_balance": dec_to_float(expected),
                     "actual_balance": dec_to_float(curr),
                     "diff": dec_to_float(diff),

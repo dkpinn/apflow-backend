@@ -4,10 +4,38 @@ import re
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
 
 from app.db.supabase_client import get_supabase_client
 from app.dependencies import UserAuth, ensure_org_admin, ensure_org_read, ensure_org_write
+from app.routers._supplier_common import (
+    _kyc_document,
+    _kyc_request,
+    _org_for_allocation_rule,
+    _org_for_branch,
+    _org_for_invoice_extracted,
+    _org_for_supplier,
+)
+from app.schemas.suppliers import (
+    SupplierAllocationRuleRequest,
+    SupplierAllocationRuleSplitRequest,
+    SupplierAllocationRuleUpdateRequest,
+    SupplierAllocationRulesFromInvoiceRequest,
+    SupplierAllocationSettingsRequest,
+    SupplierAllocationSettingsResponse,
+    SupplierBranchCreateRequest,
+    SupplierBranchFromInvoiceRequest,
+    SupplierBranchLinkRequest,
+    SupplierBranchUnlinkRequest,
+    SupplierCreateRequest,
+    SupplierFromInvoiceRequest,
+    SupplierKycDocumentCreate,
+    SupplierKycRequestCreate,
+    SupplierKycRequestUpdate,
+    SupplierLinkRequest,
+    SupplierMatchProfileRequest,
+    SupplierStpSettingsRequest,
+    SupplierStpSettingsResponse,
+)
 from app.services.audit_log import log_invoice_event
 from app.services.invoice_data_builders import utc_now_iso
 from app.services.invoice_supplier_rules import fetch_supplier_allocation_rules
@@ -29,281 +57,6 @@ router = APIRouter(prefix="/api/suppliers", tags=["suppliers"])
 supabase = get_supabase_client()
 
 
-# ---------------------------------------------------------------------------
-# Cross-entity org resolution (used for auth validation in branch endpoints)
-# ---------------------------------------------------------------------------
-
-def _org_for_supplier(supplier_id: str) -> Optional[str]:
-    """Return the organisation_id that owns this supplier, or None."""
-    try:
-        res = (
-            supabase.table("suppliers")
-            .select("organisation_id")
-            .eq("id", supplier_id)
-            .limit(1)
-            .execute()
-        )
-        return res.data[0]["organisation_id"] if res.data else None
-    except Exception:
-        return None
-
-
-def _org_for_branch(branch_id: str) -> Optional[str]:
-    """Return the organisation_id that owns this supplier branch, or None."""
-    try:
-        res = (
-            supabase.table("supplier_branches")
-            .select("organisation_id")
-            .eq("id", branch_id)
-            .limit(1)
-            .execute()
-        )
-        return res.data[0]["organisation_id"] if res.data else None
-    except Exception:
-        return None
-
-
-def _org_for_invoice_extracted(invoice_extracted_id: str) -> Optional[str]:
-    """Return the organisation_id of the extracted invoice, or None."""
-    try:
-        res = (
-            supabase.table("invoices_extracted")
-            .select("organisation_id")
-            .eq("id", invoice_extracted_id)
-            .limit(1)
-            .execute()
-        )
-        return res.data[0]["organisation_id"] if res.data else None
-    except Exception:
-        return None
-
-
-def _org_for_allocation_rule(rule_id: str) -> Optional[str]:
-    try:
-        res = (
-            supabase.table("supplier_line_item_allocation_rules")
-            .select("organisation_id")
-            .eq("id", rule_id)
-            .limit(1)
-            .execute()
-        )
-        return res.data[0]["organisation_id"] if res.data else None
-    except Exception:
-        return None
-
-
-def _kyc_request(request_id: str) -> Optional[dict]:
-    try:
-        res = (
-            supabase.table("supplier_kyc_requests")
-            .select("*")
-            .eq("id", request_id)
-            .limit(1)
-            .execute()
-        )
-        return res.data[0] if res.data else None
-    except Exception:
-        return None
-
-
-def _kyc_document(document_id: str) -> Optional[dict]:
-    try:
-        res = (
-            supabase.table("supplier_kyc_documents")
-            .select("*")
-            .eq("id", document_id)
-            .limit(1)
-            .execute()
-        )
-        return res.data[0] if res.data else None
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Request models
-# ---------------------------------------------------------------------------
-
-class SupplierCreateRequest(BaseModel):
-    organisation_id: str
-    supplier_name: str
-    supplier_code: Optional[str] = None
-    account_number: Optional[str] = None
-    tax_number: Optional[str] = None
-    registration_number: Optional[str] = None
-    currency: Optional[str] = None
-    default_email: Optional[str] = None
-    phone: Optional[str] = None
-    vat_number: Optional[str] = None
-    company_registration_number: Optional[str] = None
-    bank_account_name: Optional[str] = None
-    bank_name: Optional[str] = None
-    bank_account_number: Optional[str] = None
-    bank_branch_code: Optional[str] = None
-    bank_swift_code: Optional[str] = None
-    bank_country: Optional[str] = None
-    delivery_address: Optional[str] = None
-    postal_address: Optional[str] = None
-    accounting_email: Optional[str] = None
-    fax: Optional[str] = None
-    cell: Optional[str] = None
-    website: Optional[str] = None
-    parse_line_items: Optional[bool] = None
-    line_items_include_vat: Optional[bool] = None
-    track_inventory: Optional[bool] = None
-    use_uom_from_description: Optional[bool] = None
-    default_expense_account: Optional[str] = None
-    default_tracking: dict[str, str] = Field(default_factory=dict)
-    default_vat_rate: Optional[float] = None
-    invoice_extracted_id: Optional[str] = None
-    invoice_raw_id: Optional[str] = None
-    link_invoice: bool = True
-
-
-class SupplierFromInvoiceRequest(BaseModel):
-    invoice_extracted_id: str
-    organisation_id: Optional[str] = None
-    supplier_name: Optional[str] = None
-    parse_line_items: Optional[bool] = None
-    line_items_include_vat: Optional[bool] = None
-    track_inventory: Optional[bool] = None
-    use_uom_from_description: Optional[bool] = None
-    default_expense_account: Optional[str] = None
-    default_tracking: dict[str, str] = Field(default_factory=dict)
-    default_vat_rate: Optional[float] = None
-    link_invoice: bool = True
-
-
-class SupplierLinkRequest(BaseModel):
-    supplier_id: str
-    invoice_extracted_id: Optional[str] = None
-    invoice_raw_id: Optional[str] = None
-    organisation_id: Optional[str] = None
-
-
-class SupplierMatchProfileRequest(BaseModel):
-    organisation_id: str
-    invoice_total: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
-    supplier_name: Optional[str] = None
-    vat_number: Optional[str] = None
-    company_registration_number: Optional[str] = None
-    account_number: Optional[str] = None
-    bank_account_number: Optional[str] = None
-    phone: Optional[str] = None
-    default_email: Optional[str] = None
-    accounting_email: Optional[str] = None
-
-
-class SupplierStpSettingsRequest(BaseModel):
-    organisation_id: str
-    stp_enabled: bool
-    stp_max_amount: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
-
-
-class SupplierStpSettingsResponse(BaseModel):
-    supplier_id: str
-    organisation_id: str
-    stp_enabled: bool
-    stp_max_amount: Optional[float] = None
-
-
-class SupplierAllocationSettingsRequest(BaseModel):
-    organisation_id: str
-    default_expense_account: Optional[str] = None
-    default_tracking: Optional[dict[str, str]] = None
-
-
-class SupplierAllocationSettingsResponse(BaseModel):
-    supplier_id: str
-    organisation_id: str
-    default_expense_account: Optional[str] = None
-    default_tracking: dict[str, str] = Field(default_factory=dict)
-
-
-class SupplierBranchCreateRequest(BaseModel):
-    organisation_id: str
-    supplier_id: str
-    branch_name: str
-    branch_code: Optional[str] = None
-    vat_number: Optional[str] = None
-    tax_number: Optional[str] = None
-    company_registration_number: Optional[str] = None
-    phone: Optional[str] = None
-    default_email: Optional[str] = None
-    website: Optional[str] = None
-    delivery_address: Optional[str] = None
-    postal_address: Optional[str] = None
-    bank_account_name: Optional[str] = None
-    bank_name: Optional[str] = None
-    bank_account_number: Optional[str] = None
-    bank_branch_code: Optional[str] = None
-    bank_swift_code: Optional[str] = None
-    invoice_extracted_id: Optional[str] = None
-    link_invoice: bool = True
-
-
-class SupplierBranchFromInvoiceRequest(BaseModel):
-    invoice_extracted_id: str
-    supplier_id: str
-    branch_name: Optional[str] = None
-    link_invoice: bool = True
-
-
-class SupplierBranchLinkRequest(BaseModel):
-    invoice_extracted_id: str
-    supplier_branch_id: str
-    supplier_id: Optional[str] = None
-    organisation_id: Optional[str] = None
-
-
-class SupplierBranchUnlinkRequest(BaseModel):
-    invoice_extracted_id: str
-    supplier_id: Optional[str] = None
-
-
-class SupplierAllocationRuleSplitRequest(BaseModel):
-    expense_account: Optional[str] = None
-    tracking: dict[str, Any] = {}
-    percent: float = 100
-    note: Optional[str] = None
-    sort_order: int = 0
-
-
-class SupplierAllocationRuleRequest(BaseModel):
-    organisation_id: str
-    supplier_id: str
-    name: str
-    active: bool = True
-    priority: int = 100
-    document_scope: str = "all"
-    match_type: str = "all_lines"
-    match_field: str = "description"
-    pattern: Optional[str] = None
-    notes: Optional[str] = None
-    source_invoice_extracted_id: Optional[str] = None
-    splits: list[SupplierAllocationRuleSplitRequest] = []
-
-
-class SupplierAllocationRuleUpdateRequest(BaseModel):
-    name: Optional[str] = None
-    active: Optional[bool] = None
-    priority: Optional[int] = None
-    document_scope: Optional[str] = None
-    match_type: Optional[str] = None
-    match_field: Optional[str] = None
-    pattern: Optional[str] = None
-    notes: Optional[str] = None
-    splits: Optional[list[SupplierAllocationRuleSplitRequest]] = None
-
-
-class SupplierAllocationRulesFromInvoiceRequest(BaseModel):
-    invoice_extracted_id: str
-    supplier_id: str
-    line_item_ids: Optional[list[str]] = None
-    document_scope: str = "all"
-    priority: int = 100
-
-
 KYC_TRIGGER_TYPES = {"new_supplier", "bank_change", "info_change", "periodic_review", "other"}
 KYC_REQUEST_STATUSES = {"draft", "submitted", "approved", "rejected", "cancelled"}
 KYC_DOCUMENT_TYPES = {
@@ -315,31 +68,6 @@ KYC_DOCUMENT_TYPES = {
     "proof_of_address",
     "other",
 }
-
-
-class SupplierKycRequestCreate(BaseModel):
-    organisation_id: str
-    trigger_type: str = "new_supplier"
-    status: str = "draft"
-    notes: Optional[str] = None
-    submitted_at: Optional[str] = None
-
-
-class SupplierKycRequestUpdate(BaseModel):
-    status: Optional[str] = None
-    notes: Optional[str] = None
-    reviewer_notes: Optional[str] = None
-
-
-class SupplierKycDocumentCreate(BaseModel):
-    organisation_id: Optional[str] = None
-    document_type: str
-    document_label: Optional[str] = None
-    storage_path: str
-    file_name: str
-    file_size: Optional[int] = None
-    mime_type: Optional[str] = None
-    notes: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

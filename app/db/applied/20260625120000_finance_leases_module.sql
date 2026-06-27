@@ -154,6 +154,21 @@ create index if not exists finance_lease_gl_postings_lease_idx
 
 
 -- ── 5. RLS (identical pattern to inventory module) ───────────────────────────
+alter table public.finance_leases enable row level security;
+alter table public.finance_lease_schedule enable row level security;
+alter table public.finance_lease_documents enable row level security;
+alter table public.finance_lease_gl_postings enable row level security;
+
+revoke all privileges on table public.finance_leases from public, anon;
+revoke all privileges on table public.finance_lease_schedule from public, anon;
+revoke all privileges on table public.finance_lease_documents from public, anon;
+revoke all privileges on table public.finance_lease_gl_postings from public, anon;
+
+grant all privileges on table public.finance_leases to service_role;
+grant all privileges on table public.finance_lease_schedule to service_role;
+grant all privileges on table public.finance_lease_documents to service_role;
+grant all privileges on table public.finance_lease_gl_postings to service_role;
+
 do $$
 declare t text;
 begin

@@ -54,6 +54,21 @@ create table if not exists public.inventory_stock_movements (
 );
 create index if not exists inventory_movements_item_date_idx on public.inventory_stock_movements(organisation_id, inventory_item_id, occurred_on desc, created_at desc);
 
+alter table public.inventory_items enable row level security;
+alter table public.inventory_structures enable row level security;
+alter table public.inventory_structure_lines enable row level security;
+alter table public.inventory_stock_movements enable row level security;
+
+revoke all privileges on table public.inventory_items from public, anon;
+revoke all privileges on table public.inventory_structures from public, anon;
+revoke all privileges on table public.inventory_structure_lines from public, anon;
+revoke all privileges on table public.inventory_stock_movements from public, anon;
+
+grant all privileges on table public.inventory_items to service_role;
+grant all privileges on table public.inventory_structures to service_role;
+grant all privileges on table public.inventory_structure_lines to service_role;
+grant all privileges on table public.inventory_stock_movements to service_role;
+
 do $$
 declare table_name text;
 begin

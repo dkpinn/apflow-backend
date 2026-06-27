@@ -56,6 +56,9 @@ create trigger supplier_payment_runs_set_updated_at
 alter table public.supplier_payment_runs enable row level security;
 alter table public.supplier_payment_run_items enable row level security;
 
+revoke all privileges on table public.supplier_payment_runs from public, anon;
+revoke all privileges on table public.supplier_payment_run_items from public, anon;
+
 drop policy if exists "supplier_payment_runs_select_member" on public.supplier_payment_runs;
 create policy "supplier_payment_runs_select_member"
   on public.supplier_payment_runs for select to authenticated

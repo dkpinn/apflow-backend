@@ -99,7 +99,11 @@ def lm_studio_chat_text(
         timeout=timeout,
     )
     response.raise_for_status()
-    logger.info("[LM Studio] HTTP %d, body preview: %r", response.status_code, response.text[:300])
+    logger.info(
+        "[LM Studio] HTTP %s, body preview: %r",
+        getattr(response, "status_code", "?"),
+        str(getattr(response, "text", ""))[:300],
+    )
     payload = response.json()
     try:
         text = payload["choices"][0]["message"]["content"] or ""

@@ -8,22 +8,19 @@ Command:
 
 Result:
 
-- 441 passed
-- 3 failed
-- 4 warnings
+- 444 passed
+- 3 warnings
 
-Current failures:
+Stabilization fixes applied before refactoring:
 
 1. `tests/test_bank_uploads.py::test_extract_bank_upload_happy_path`
-   - `correct_amounts_from_balance()` received dict lines from the patched extractor path and expected objects with `balance_amount`.
-   - Failure surfaced as `HTTPException: 500: 'dict' object has no attribute 'balance_amount'`.
+   - Bank balance helpers now tolerate dict-shaped test doubles while preserving `ParsedBankLine` behavior.
 
 2. `tests/test_database_security_migrations.py::test_cli_public_table_migrations_declare_data_api_access`
-   - Several recent CLI migrations are missing expected RLS/revoke/service-role grant declarations.
-   - Affected migration files include inventory, finance leases, accounting periods, and supplier payment run drafts.
+   - Recent deploy migrations now declare explicit RLS, revoke, and service-role grants in addition to dynamic policy setup.
 
 3. `tests/test_integration_management.py::IntegrationManagementTests::test_lm_studio_adapter_uses_local_openai_compatible_chat_endpoint`
-   - `_run_lm_studio_provider()` returned `data=None`, so the test failed while reading `supplier_name_extracted`.
+   - LM Studio response logging now tolerates fake response objects used by adapter tests.
 
 Warnings:
 
@@ -32,4 +29,4 @@ Warnings:
 
 Refactor status:
 
-- Do not begin Step 2 until these baseline failures are either fixed or explicitly accepted as known pre-existing failures.
+- Step 2 may begin from this green baseline.
