@@ -60,6 +60,13 @@ from app.services.bank.accounts import (
     is_unreconciled_bank_line,
     list_accounts as list_bank_account_records,
 )
+from app.services.bank.parsing_rules import (
+    create_rule as create_bank_parsing_rule_record,
+    delete_rule as delete_bank_parsing_rule_record,
+    list_rules as list_bank_parsing_rule_records,
+    lookup_parsing_hint,
+    update_rule as update_bank_parsing_rule_record,
+)
 from app.services.organisation_module_settings import (
     required_tracking_dimensions,
     validate_bank_allocation_tracking,
@@ -180,53 +187,6 @@ def build_journal_rows_for_line(
     return rows
 
 
-def lookup_parsing_hint(db, *, organisation_id: str, institution_name: Optional[str], account_type: Optional[str]) -> Optional[str]:
-    try:
-        rules = (
-            db.table("bank_parsing_rules")
-            .select("institution_name, account_type, parsing_hint")
-            .eq("organisation_id", organisation_id)
-            .eq("active", True)
-            .execute()
-            .data
-            or []
-        )
-    except Exception:
-        return None
-
-    institution = (institution_name or "").strip().lower()
-    acct_type = (account_type or "").strip().lower()
-
-    def _inst_match(rule_inst: str, acct_inst: str) -> bool:
-        """Match if one name is a substring of the other (handles 'STANDARD' vs 'Standard Bank')."""
-        if not rule_inst or not acct_inst:
-            return False
-        return rule_inst == acct_inst or rule_inst in acct_inst or acct_inst in rule_inst
-
-    def specificity(rule: dict[str, Any]) -> int:
-        rule_institution = (rule.get("institution_name") or "").strip().lower()
-        rule_account_type = (rule.get("account_type") or "").strip().lower()
-        institution_match = _inst_match(rule_institution, institution)
-        account_type_match = bool(rule_account_type) and rule_account_type == acct_type
-        if institution_match and account_type_match:
-            return 3
-        if institution_match and not rule_account_type:
-            return 2
-        if account_type_match and not rule_institution:
-            return 1
-        if not rule_institution and not rule_account_type:
-            return 0
-        return -1
-
-    candidates = [(specificity(rule), rule) for rule in rules]
-    candidates = [(score, rule) for score, rule in candidates if score >= 0]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    _, best_rule = candidates[0]
-    return best_rule.get("parsing_hint") or None
-
-
 @router.get("/accounts")
 def list_bank_accounts(organisation_id: str, auth: UserAuth):
     user_id, db = _auth(auth)
@@ -312,14 +272,7 @@ def create_bank_account(payload: BankAccountCreate, auth: UserAuth):
 def list_parsing_rules(organisation_id: str, auth: UserAuth):
     user_id, db = _auth(auth)
     ensure_org_read(user_id, organisation_id)
-    res = (
-        db.table("bank_parsing_rules")
-        .select("*")
-        .eq("organisation_id", organisation_id)
-        .order("institution_name")
-        .execute()
-    )
-    return {"success": True, "rules": res.data or []}
+    return {"success": True, "rules": list_bank_parsing_rule_records(db, organisation_id=organisation_id)}
 
 
 @router.post("/parsing-rules")
@@ -327,16 +280,12 @@ def create_parsing_rule(payload: ParsingRuleCreate, auth: UserAuth):
     user_id, db = _auth(auth)
     organisation_id = str(payload.organisation_id)
     ensure_org_write(user_id, organisation_id)
-    row = {
-        "organisation_id": organisation_id,
-        "institution_name": payload.institution_name,
-        "account_type": payload.account_type,
-        "parsing_hint": payload.parsing_hint,
-        "active": payload.active,
-        "created_by": user_id,
-    }
-    res = db.table("bank_parsing_rules").insert(row).execute()
-    rule = _one(res, "Parsing rule create failed")
+    rule = create_bank_parsing_rule_record(
+        db,
+        payload=payload,
+        organisation_id=organisation_id,
+        user_id=user_id,
+    )
     return {"success": True, "rule": rule}
 
 
@@ -345,21 +294,13 @@ def update_parsing_rule(rule_id: str, payload: ParsingRuleUpdate, auth: UserAuth
     user_id, db = _auth(auth)
     organisation_id = str(payload.organisation_id)
     ensure_org_write(user_id, organisation_id)
-    _one(
-        db.table("bank_parsing_rules").select("id").eq("id", rule_id).eq("organisation_id", organisation_id).limit(1).execute(),
-        "Parsing rule not found",
+    rule = update_bank_parsing_rule_record(
+        db,
+        rule_id=rule_id,
+        payload=payload,
+        organisation_id=organisation_id,
+        updated_at=now_iso(),
     )
-    patch: dict[str, Any] = {"updated_at": now_iso()}
-    if payload.institution_name is not None:
-        patch["institution_name"] = payload.institution_name
-    if payload.account_type is not None:
-        patch["account_type"] = payload.account_type
-    if payload.parsing_hint is not None:
-        patch["parsing_hint"] = payload.parsing_hint
-    if payload.active is not None:
-        patch["active"] = payload.active
-    res = db.table("bank_parsing_rules").update(patch).eq("id", rule_id).eq("organisation_id", organisation_id).execute()
-    rule = _one(res, "Parsing rule update failed")
     return {"success": True, "rule": rule}
 
 
@@ -367,9 +308,5 @@ def update_parsing_rule(rule_id: str, payload: ParsingRuleUpdate, auth: UserAuth
 def delete_parsing_rule(rule_id: str, organisation_id: str, auth: UserAuth):
     user_id, db = _auth(auth)
     ensure_org_write(user_id, organisation_id)
-    _one(
-        db.table("bank_parsing_rules").select("id").eq("id", rule_id).eq("organisation_id", organisation_id).limit(1).execute(),
-        "Parsing rule not found",
-    )
-    db.table("bank_parsing_rules").delete().eq("id", rule_id).eq("organisation_id", organisation_id).execute()
+    delete_bank_parsing_rule_record(db, rule_id=rule_id, organisation_id=organisation_id)
     return {"success": True}
