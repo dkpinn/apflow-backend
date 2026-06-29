@@ -16,6 +16,27 @@ class UpsertEntryBody(BaseModel):
     amount: float = Field(..., ge=0)
 
 
+def _ensure_budget_view(db, user_id: str, organisation_id: str) -> None:
+    rows = (
+        db.table("organisation_users")
+        .select("role, permissions")
+        .eq("organisation_id", organisation_id)
+        .eq("user_id", user_id)
+        .eq("status", "active")
+        .limit(1)
+        .execute()
+        .data or []
+    )
+    if not rows:
+        raise HTTPException(status_code=403, detail="You do not have access to this organisation")
+
+    membership = rows[0]
+    role = membership.get("role")
+    permissions = membership.get("permissions") if isinstance(membership.get("permissions"), dict) else {}
+    if role not in {"owner", "admin", "accountant"} and not permissions.get("reports_view"):
+        raise HTTPException(status_code=403, detail="You do not have permission to view budgets")
+
+
 @router.get("")
 def budget_grid(
     auth: UserAuth,
@@ -24,7 +45,7 @@ def budget_grid(
     year_end: str = Query(...),
 ):
     user_id, db = auth
-    ensure_org_write(user_id, organisation_id)
+    _ensure_budget_view(db, user_id, organisation_id)
     try:
         return {"success": True, "grid": get_budget_grid(db, organisation_id, year_start, year_end)}
     except ValueError as exc:
