@@ -468,7 +468,13 @@ def get_supplier_payment_run_draft(db, draft_id: str, organisation_id: str) -> d
         .eq("payment_run_id", draft_id)
         .order("priority")
     )
-    return {**rows[0], "items": items}
+    remittances = _fetch_rows(
+        db.table("remittances")
+        .select("*")
+        .eq("payment_run_id", draft_id)
+        .order("supplier_name")
+    )
+    return {**rows[0], "items": items, "remittances": remittances}
 
 
 def approve_supplier_payment_run_draft(
@@ -563,3 +569,78 @@ def export_supplier_payment_run_draft_csv(
 
     filename = f"payment_run_{draft_id[:8]}_{pay_date}.csv"
     return filename, buf.getvalue().encode("utf-8")
+
+
+def generate_supplier_payment_run_remittances(
+    db,
+    draft_id: str,
+    organisation_id: str,
+    generated_by: str,
+) -> dict:
+    draft = get_supplier_payment_run_draft(db, draft_id, organisation_id)
+    status = str(draft.get("status") or "")
+    if status not in ("approved", "exported"):
+        raise ValueError("Remittances can only be generated for approved payment runs")
+
+    items = list(draft.get("items") or [])
+    if not items:
+        raise ValueError("Payment run has no invoice lines for remittance generation")
+
+    existing = list(draft.get("remittances") or [])
+    if existing:
+        return {
+            "remittances": existing,
+            "created_count": 0,
+            "reused_count": len(existing),
+        }
+
+    missing_supplier = [item for item in items if not item.get("supplier_id")]
+    if missing_supplier:
+        raise ValueError("All remittance lines must have a linked supplier")
+
+    supplier_ids = _dedupe([str(item["supplier_id"]) for item in items if item.get("supplier_id")])
+    suppliers_by_id = _fetch_suppliers(db, organisation_id, supplier_ids) if supplier_ids else {}
+    by_supplier: dict[str, list[dict]] = {}
+    for item in items:
+        by_supplier.setdefault(str(item["supplier_id"]), []).append(item)
+
+    remittance_payloads = []
+    remittance_date = str(draft.get("pay_on_date") or date.today().isoformat())
+    for supplier_id, supplier_items in by_supplier.items():
+        supplier = suppliers_by_id.get(supplier_id) or {}
+        currency = str(supplier_items[0].get("currency") or draft.get("currency") or "ZAR")
+        total = sum((money(item.get("outstanding_amount")) for item in supplier_items), ZERO)
+        references = [
+            {
+                "invoice_extracted_id": item.get("invoice_extracted_id"),
+                "invoice_number": item.get("invoice_number") or "",
+                "invoice_date": item.get("invoice_date"),
+                "due_date": item.get("due_date"),
+                "amount": item.get("outstanding_amount") or 0,
+                "currency": item.get("currency") or currency,
+            }
+            for item in supplier_items
+        ]
+        remittance_payloads.append({
+            "id": str(uuid4()),
+            "organisation_id": organisation_id,
+            "supplier_id": supplier_id,
+            "payment_run_id": draft_id,
+            "remittance_date": remittance_date,
+            "remittance_status": "draft",
+            "total_amount": amount_out(total),
+            "currency": currency,
+            "supplier_name": supplier.get("supplier_name") or supplier_items[0].get("supplier_name") or "Unknown supplier",
+            "supplier_email": _supplier_email(supplier),
+            "invoice_count": len(supplier_items),
+            "invoice_references": references,
+            "generated_by": generated_by,
+        })
+
+    result = db.table("remittances").insert(remittance_payloads).execute()
+    created = result.data or remittance_payloads
+    return {
+        "remittances": created,
+        "created_count": len(created),
+        "reused_count": 0,
+    }

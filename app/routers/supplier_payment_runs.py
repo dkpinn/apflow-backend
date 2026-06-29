@@ -13,6 +13,7 @@ from app.services.supplier_payment_runs import (
     cancel_supplier_payment_run_draft,
     create_supplier_payment_run_draft,
     export_supplier_payment_run_draft_csv,
+    generate_supplier_payment_run_remittances,
     get_supplier_payment_run_draft,
     list_supplier_payment_run_drafts,
 )
@@ -142,6 +143,28 @@ def cancel_draft(
             "success": True,
             "draft": cancel_supplier_payment_run_draft(
                 db, draft_id, payload.organisation_id
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/drafts/{draft_id}/remittances")
+def generate_remittances(
+    payload: DraftActionRequest,
+    auth: UserAuth,
+    draft_id: str,
+):
+    user_id, db = auth
+    ensure_org_write(str(user_id), payload.organisation_id)
+    try:
+        return {
+            "success": True,
+            **generate_supplier_payment_run_remittances(
+                db,
+                draft_id,
+                payload.organisation_id,
+                str(user_id),
             ),
         }
     except ValueError as exc:

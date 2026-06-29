@@ -5,6 +5,7 @@ from app.routers import supplier_payment_runs
 from app.services.supplier_payment_runs import (
     build_supplier_payment_run,
     create_supplier_payment_run_draft,
+    generate_supplier_payment_run_remittances,
 )
 
 
@@ -359,6 +360,98 @@ def test_supplier_payment_run_draft_route_uses_org_write_permission(monkeypatch)
         supplier_payment_runs.create_supplier_payment_run_draft_route(
             payload=payload,
             auth=("viewer-1", _DB(_base_tables())),
+        )
+
+    assert exc.value.status_code == 403
+
+
+def test_generate_supplier_payment_run_remittances_groups_by_supplier_and_is_idempotent():
+    db = _DB(_base_tables())
+    draft_result = create_supplier_payment_run_draft(
+        db,
+        organisation_id="org-1",
+        pay_on_date="2026-06-25",
+        due_within_days=7,
+        selected_invoice_ids=["inv-45", "inv-soon"],
+        created_by="viewer-1",
+    )
+    draft_id = draft_result["payment_run"]["id"]
+    db.tables["supplier_payment_runs"][0]["status"] = "approved"
+
+    first = generate_supplier_payment_run_remittances(
+        db,
+        draft_id,
+        "org-1",
+        generated_by="approver-1",
+    )
+
+    assert first["created_count"] == 1
+    assert first["reused_count"] == 0
+    remittance = first["remittances"][0]
+    assert remittance["payment_run_id"] == draft_id
+    assert remittance["supplier_id"] == "supplier-1"
+    assert remittance["supplier_name"] == "Acme Supplies"
+    assert remittance["supplier_email"] == "accounts@acme.test"
+    assert remittance["remittance_status"] == "draft"
+    assert remittance["total_amount"] == 650.0
+    assert remittance["invoice_count"] == 2
+    assert {ref["invoice_number"] for ref in remittance["invoice_references"]} == {
+        "OLD-45",
+        "SOON-1",
+    }
+
+    second = generate_supplier_payment_run_remittances(
+        db,
+        draft_id,
+        "org-1",
+        generated_by="approver-1",
+    )
+
+    assert second["created_count"] == 0
+    assert second["reused_count"] == 1
+    assert len(db.tables["remittances"]) == 1
+
+
+def test_generate_supplier_payment_run_remittances_requires_approved_run():
+    db = _DB(_base_tables())
+    draft_result = create_supplier_payment_run_draft(
+        db,
+        organisation_id="org-1",
+        pay_on_date="2026-06-25",
+        due_within_days=7,
+        selected_invoice_ids=["inv-45"],
+        created_by="viewer-1",
+    )
+
+    with pytest.raises(ValueError, match="approved"):
+        generate_supplier_payment_run_remittances(
+            db,
+            draft_result["payment_run"]["id"],
+            "org-1",
+            generated_by="approver-1",
+        )
+
+
+def test_supplier_payment_run_remittance_route_uses_org_write_permission(monkeypatch):
+    def _deny(*_args, **_kwargs):
+        raise HTTPException(status_code=403, detail="No write access")
+
+    def _fail_if_called(*_args, **_kwargs):
+        raise AssertionError("remittance service should not run without organisation write access")
+
+    monkeypatch.setattr(supplier_payment_runs, "ensure_org_write", _deny)
+    monkeypatch.setattr(
+        supplier_payment_runs,
+        "generate_supplier_payment_run_remittances",
+        _fail_if_called,
+    )
+
+    payload = supplier_payment_runs.DraftActionRequest(organisation_id="org-1")
+    with pytest.raises(HTTPException) as exc:
+        supplier_payment_runs.generate_remittances(
+            payload=payload,
+            auth=("viewer-1", _DB(_base_tables())),
+            draft_id="run-1",
         )
 
     assert exc.value.status_code == 403

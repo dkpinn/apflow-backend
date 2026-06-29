@@ -1,8 +1,9 @@
 import os
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
-from supabase import Client, create_client
+from supabase import Client, ClientOptions, create_client
 
 load_dotenv()
 _dev_env = Path(".env.development.local")
@@ -12,6 +13,10 @@ if _dev_env.exists():
 _service_client: Client | None = None
 
 
+def _client_options() -> ClientOptions:
+    return ClientOptions(httpx_client=httpx.Client(timeout=120, verify=True))
+
+
 def get_supabase_client() -> Client:
     global _service_client
     if _service_client is None:
@@ -19,7 +24,7 @@ def get_supabase_client() -> Client:
         key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
         if not url or not key:
             raise Exception("Supabase credentials missing")
-        _service_client = create_client(url, key)
+        _service_client = create_client(url, key, options=_client_options())
     return _service_client
 
 
@@ -33,7 +38,7 @@ def get_fresh_supabase_client() -> Client:
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
     if not url or not key:
         raise Exception("Supabase credentials missing")
-    return create_client(url, key)
+    return create_client(url, key, options=_client_options())
 
 
 def get_user_supabase_client(token: str) -> Client:
@@ -49,6 +54,6 @@ def get_user_supabase_client(token: str) -> Client:
         raise Exception("SUPABASE_URL is missing")
     if not anon_key:
         raise Exception("SUPABASE_ANON_KEY is missing — service-role fallback is not permitted to prevent RLS bypass")
-    client = create_client(url, anon_key)
+    client = create_client(url, anon_key, options=_client_options())
     client.postgrest.auth(token)
     return client
