@@ -16,6 +16,7 @@ from app.services.supplier_payment_runs import (
     generate_supplier_payment_run_remittances,
     get_supplier_payment_run_draft,
     list_supplier_payment_run_drafts,
+    mark_supplier_payment_run_paid,
 )
 
 
@@ -32,6 +33,11 @@ class SupplierPaymentRunDraftRequest(BaseModel):
 
 class DraftActionRequest(BaseModel):
     organisation_id: str
+
+
+class MarkPaidRequest(BaseModel):
+    organisation_id: str
+    payment_date: str | None = None
 
 
 @router.get("")
@@ -165,6 +171,29 @@ def generate_remittances(
                 draft_id,
                 payload.organisation_id,
                 str(user_id),
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/drafts/{draft_id}/mark-paid")
+def mark_paid(
+    payload: MarkPaidRequest,
+    auth: UserAuth,
+    draft_id: str,
+):
+    user_id, db = auth
+    ensure_org_write(str(user_id), payload.organisation_id)
+    try:
+        return {
+            "success": True,
+            **mark_supplier_payment_run_paid(
+                db,
+                draft_id,
+                payload.organisation_id,
+                str(user_id),
+                payload.payment_date,
             ),
         }
     except ValueError as exc:

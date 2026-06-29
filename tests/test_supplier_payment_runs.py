@@ -6,6 +6,7 @@ from app.services.supplier_payment_runs import (
     build_supplier_payment_run,
     create_supplier_payment_run_draft,
     generate_supplier_payment_run_remittances,
+    mark_supplier_payment_run_paid,
 )
 
 
@@ -23,12 +24,17 @@ class _Query:
         self.order_fields = []
         self._limit = None
         self.insert_payload = None
+        self.update_payload = None
 
     def select(self, *_args, **_kwargs):
         return self
 
     def insert(self, payload):
         self.insert_payload = payload
+        return self
+
+    def update(self, payload):
+        self.update_payload = payload
         return self
 
     def eq(self, field, value):
@@ -64,6 +70,10 @@ class _Query:
             rows = [row for row in rows if row.get(field) == value]
         for field, values in self.in_filters:
             rows = [row for row in rows if str(row.get(field)) in values]
+        if self.update_payload is not None:
+            for row in rows:
+                row.update(self.update_payload)
+            return _Response(rows)
         for field in reversed(self.order_fields):
             rows = sorted(rows, key=lambda row: (row.get(field) is None, row.get(field)))
         if self._limit is not None:
@@ -210,6 +220,8 @@ def _base_tables():
             {"id": "stmt-future", "organisation_id": "org-1", "line_date": "2026-07-01"},
         ],
         "payments": [],
+        "reconciliations": [],
+        "remittances": [],
     }
 
 
@@ -449,6 +461,124 @@ def test_supplier_payment_run_remittance_route_uses_org_write_permission(monkeyp
     payload = supplier_payment_runs.DraftActionRequest(organisation_id="org-1")
     with pytest.raises(HTTPException) as exc:
         supplier_payment_runs.generate_remittances(
+            payload=payload,
+            auth=("viewer-1", _DB(_base_tables())),
+            draft_id="run-1",
+        )
+
+    assert exc.value.status_code == 403
+
+
+def test_mark_supplier_payment_run_paid_creates_payments_and_reconciliation_lines():
+    db = _DB(_base_tables())
+    draft_result = create_supplier_payment_run_draft(
+        db,
+        organisation_id="org-1",
+        pay_on_date="2026-06-25",
+        due_within_days=7,
+        selected_invoice_ids=["inv-45", "inv-soon"],
+        created_by="viewer-1",
+    )
+    draft_id = draft_result["payment_run"]["id"]
+    db.tables["supplier_payment_runs"][0]["status"] = "approved"
+    generate_supplier_payment_run_remittances(
+        db,
+        draft_id,
+        "org-1",
+        generated_by="approver-1",
+    )
+
+    result = mark_supplier_payment_run_paid(
+        db,
+        draft_id,
+        "org-1",
+        paid_by="approver-1",
+        payment_date="2026-06-26",
+    )
+
+    assert result["created_payment_count"] == 1
+    assert result["reused_payment_count"] == 0
+    assert result["reconciliation_line_count"] == 2
+    assert db.tables["supplier_payment_runs"][0]["status"] == "exported"
+
+    payment = db.tables["payments"][0]
+    assert payment["payment_date"] == "2026-06-26"
+    assert payment["payment_reference"].startswith(f"PAYRUN-{draft_id[:8]}-")
+    assert payment["amount"] == 650.0
+    assert payment["payment_source"] == "supplier_payment_run"
+    assert payment["match_status"] == "matched"
+
+    assert len(db.tables["reconciliations"]) == 1
+    assert db.tables["reconciliations"][0]["reconciliation_status"] == "completed"
+    generated_lines = [
+        row
+        for row in db.tables["reconciliation_lines"]
+        if row.get("payment_id") == payment["id"]
+    ]
+    assert {row["invoice_extracted_id"] for row in generated_lines} == {
+        "inv-45",
+        "inv-soon",
+    }
+    assert db.tables["remittances"][0]["payment_id"] == payment["id"]
+
+
+def test_mark_supplier_payment_run_paid_is_idempotent():
+    db = _DB(_base_tables())
+    draft_result = create_supplier_payment_run_draft(
+        db,
+        organisation_id="org-1",
+        pay_on_date="2026-06-25",
+        due_within_days=7,
+        selected_invoice_ids=["inv-45"],
+        created_by="viewer-1",
+    )
+    draft_id = draft_result["payment_run"]["id"]
+    db.tables["supplier_payment_runs"][0]["status"] = "approved"
+
+    first = mark_supplier_payment_run_paid(
+        db,
+        draft_id,
+        "org-1",
+        paid_by="approver-1",
+        payment_date="2026-06-26",
+    )
+    second = mark_supplier_payment_run_paid(
+        db,
+        draft_id,
+        "org-1",
+        paid_by="approver-1",
+        payment_date="2026-06-26",
+    )
+
+    assert first["created_payment_count"] == 1
+    assert second["created_payment_count"] == 0
+    assert second["reused_payment_count"] == 1
+    assert len(db.tables["payments"]) == 1
+    generated_lines = [
+        row
+        for row in db.tables["reconciliation_lines"]
+        if row.get("payment_id") == db.tables["payments"][0]["id"]
+    ]
+    assert len(generated_lines) == 1
+
+
+def test_supplier_payment_run_mark_paid_route_uses_org_write_permission(monkeypatch):
+    def _deny(*_args, **_kwargs):
+        raise HTTPException(status_code=403, detail="No write access")
+
+    def _fail_if_called(*_args, **_kwargs):
+        raise AssertionError("mark-paid service should not run without organisation write access")
+
+    monkeypatch.setattr(supplier_payment_runs, "ensure_org_write", _deny)
+    monkeypatch.setattr(
+        supplier_payment_runs,
+        "mark_supplier_payment_run_paid",
+        _fail_if_called,
+    )
+
+    payload = supplier_payment_runs.MarkPaidRequest(organisation_id="org-1")
+    with pytest.raises(HTTPException) as exc:
+        supplier_payment_runs.mark_paid(
             payload=payload,
             auth=("viewer-1", _DB(_base_tables())),
             draft_id="run-1",

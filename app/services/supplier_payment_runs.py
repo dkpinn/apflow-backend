@@ -644,3 +644,130 @@ def generate_supplier_payment_run_remittances(
         "created_count": len(created),
         "reused_count": 0,
     }
+
+
+def _payment_reference(draft_id: str, supplier_id: str) -> str:
+    return f"PAYRUN-{draft_id[:8]}-{supplier_id[:8]}"
+
+
+def mark_supplier_payment_run_paid(
+    db,
+    draft_id: str,
+    organisation_id: str,
+    paid_by: str,
+    payment_date: str | None = None,
+) -> dict:
+    draft = get_supplier_payment_run_draft(db, draft_id, organisation_id)
+    status = str(draft.get("status") or "")
+    if status not in ("approved", "exported"):
+        raise ValueError("Only approved or exported payment runs can be marked paid")
+
+    paid_on = _validate_date(payment_date or str(draft.get("pay_on_date") or date.today().isoformat()), "payment_date")
+    items = list(draft.get("items") or [])
+    if not items:
+        raise ValueError("Payment run has no invoice lines to mark paid")
+
+    missing_supplier = [item for item in items if not item.get("supplier_id")]
+    if missing_supplier:
+        raise ValueError("All payment run lines must have a linked supplier")
+
+    by_supplier: dict[str, list[dict]] = {}
+    for item in items:
+        by_supplier.setdefault(str(item["supplier_id"]), []).append(item)
+
+    created_payments: list[dict] = []
+    reused_payments: list[dict] = []
+    reconciliation_rows: list[dict] = []
+    remittances_by_supplier = {
+        str(row.get("supplier_id")): row
+        for row in list(draft.get("remittances") or [])
+        if row.get("supplier_id")
+    }
+
+    for supplier_id, supplier_items in by_supplier.items():
+        reference = _payment_reference(draft_id, supplier_id)
+        total = sum((money(item.get("outstanding_amount")) for item in supplier_items), ZERO)
+        payment_amount = amount_out(total)
+        existing = _fetch_rows(
+            db.table("payments")
+            .select("*")
+            .eq("organisation_id", organisation_id)
+            .eq("supplier_id", supplier_id)
+            .eq("payment_reference", reference)
+            .limit(1)
+        )
+        if existing:
+            payment = existing[0]
+            reused_payments.append(payment)
+            payment_id = str(payment.get("id"))
+        else:
+            payment_payload = {
+                "id": str(uuid4()),
+                "organisation_id": organisation_id,
+                "supplier_id": supplier_id,
+                "payment_date": paid_on.isoformat(),
+                "payment_reference": reference,
+                "amount": payment_amount,
+                "currency": str(supplier_items[0].get("currency") or draft.get("currency") or "ZAR"),
+                "payment_source": "supplier_payment_run",
+                "match_status": "matched",
+            }
+            payment_result = db.table("payments").insert(payment_payload).execute()
+            payment = (payment_result.data or [payment_payload])[0]
+            created_payments.append(payment)
+            payment_id = str(payment.get("id") or payment_payload["id"])
+
+        existing_lines = _fetch_rows(
+            db.table("reconciliation_lines")
+            .select("id")
+            .eq("organisation_id", organisation_id)
+            .eq("payment_id", payment_id)
+            .limit(1)
+        )
+        if not existing_lines:
+            reconciliation_id = str(uuid4())
+            db.table("reconciliations").insert({
+                "id": reconciliation_id,
+                "organisation_id": organisation_id,
+                "supplier_id": supplier_id,
+                "reconciliation_date": paid_on.isoformat(),
+                "reconciliation_status": "completed",
+                "total_statement_amount": payment_amount,
+                "total_matched_amount": payment_amount,
+                "total_unmatched_amount": 0,
+                "notes": f"Payment run {draft_id} marked paid by {paid_by}.",
+                "created_by": paid_by,
+            }).execute()
+
+            for item in supplier_items:
+                amount = money(item.get("outstanding_amount"))
+                reconciliation_rows.append({
+                    "id": str(uuid4()),
+                    "organisation_id": organisation_id,
+                    "reconciliation_id": reconciliation_id,
+                    "invoice_extracted_id": item.get("invoice_extracted_id"),
+                    "payment_id": payment_id,
+                    "match_status": "matched",
+                    "expected_amount": amount_out(amount),
+                    "matched_amount": amount_out(amount),
+                    "variance_amount": 0,
+                    "notes": f"Matched from supplier payment run {draft_id}.",
+                })
+
+        remittance = remittances_by_supplier.get(supplier_id)
+        if remittance and not remittance.get("payment_id"):
+            db.table("remittances").update({"payment_id": payment_id}).eq("id", remittance["id"]).execute()
+
+    if reconciliation_rows:
+        db.table("reconciliation_lines").insert(reconciliation_rows).execute()
+
+    run_update = db.table("supplier_payment_runs").update({"status": "exported"}).eq("id", draft_id).execute()
+    updated_run = (run_update.data or [draft])[0]
+
+    return {
+        "draft": updated_run,
+        "payments": created_payments + reused_payments,
+        "created_payment_count": len(created_payments),
+        "reused_payment_count": len(reused_payments),
+        "reconciliation_line_count": len(reconciliation_rows),
+    }
