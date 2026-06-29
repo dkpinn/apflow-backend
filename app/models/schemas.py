@@ -33,6 +33,8 @@ class ReconciliationLineResult(BaseModel):
     variance_amount: Optional[float] = None
     matched_invoice_id: Optional[UUID] = None
     matched_invoice_number: Optional[str] = None
+    matched_payment_id: Optional[UUID] = None
+    matched_payment_reference: Optional[str] = None
     notes: Optional[str] = None
 
 
