@@ -7,6 +7,7 @@ from app.services.organisation_module_settings import (
     required_tracking_dimensions,
     validate_supplier_allocations_tracking,
 )
+from app.services.protected_accounts import protected_account_ids
 from app.services.vat_report import allocate_amount_by_weights, allocate_invoice_vat
 
 
@@ -267,7 +268,12 @@ def prepare_invoice_gl_posting(
             "Ensure the system accounts migration has been applied."
         )
 
-    postable_accts = [account for account in all_accts if not account.get("is_system")]
+    protected_ids = protected_account_ids(supabase, organisation_id=org_id)
+    postable_accts = [
+        account
+        for account in all_accts
+        if str(account.get("id")) not in protected_ids
+    ]
     _by_code = {a["code"]: a["id"] for a in postable_accts if a.get("code")}
     _by_name = {a["name"]: a["id"] for a in postable_accts if a.get("name")}
     _account_ids = {str(a["id"]) for a in postable_accts if a.get("id")}

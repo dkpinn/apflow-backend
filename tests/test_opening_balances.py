@@ -4,12 +4,21 @@ import pytest
 from fastapi import HTTPException
 
 import app.routers.opening_balances as ob_router
-from app.services.opening_balances import post_opening_balance, preview_opening_balance
+from app.services.opening_balances import (
+    get_account_opening_balance,
+    post_opening_balance,
+    preview_opening_balance,
+    sync_module_account_opening_balance,
+    upsert_account_opening_balance,
+)
 from tests.conftest import MemoryDB
 
 
 ORG_ID = "00000000-0000-0000-0000-000000000001"
 ORG_UUID = UUID(ORG_ID)
+ASSET_ID = "00000000-0000-0000-0000-000000000101"
+LIABILITY_ID = "00000000-0000-0000-0000-000000000201"
+RETAINED_ID = "00000000-0000-0000-0000-000000000301"
 
 
 def _tables():
@@ -31,9 +40,53 @@ def _tables():
                 "type": "equity",
                 "active": True,
             },
+            {
+                "id": "retained-1",
+                "organisation_id": ORG_ID,
+                "code": "7100",
+                "name": "Retained Earnings",
+                "type": "equity",
+                "active": True,
+                "system_key": "retained_earnings",
+            },
         ],
         "gl_journals": [],
         "gl_journal_lines": [],
+    }
+
+
+def _account_level_tables():
+    return {
+        "accounts": [
+            {
+                "id": ASSET_ID,
+                "organisation_id": ORG_ID,
+                "code": "1000",
+                "name": "Bank",
+                "type": "asset",
+                "active": True,
+            },
+            {
+                "id": LIABILITY_ID,
+                "organisation_id": ORG_ID,
+                "code": "2100",
+                "name": "Trade Creditors",
+                "type": "liability",
+                "active": True,
+            },
+            {
+                "id": RETAINED_ID,
+                "organisation_id": ORG_ID,
+                "code": "7100",
+                "name": "Retained Earnings",
+                "type": "equity",
+                "active": True,
+                "system_key": "retained_earnings",
+            },
+        ],
+        "gl_journals": [],
+        "gl_journal_lines": [],
+        "bank_accounts": [],
     }
 
 
@@ -163,3 +216,188 @@ def test_post_route_returns_400_for_unbalanced_payload(monkeypatch):
 
     assert exc_info.value.status_code == 400
     assert "must balance" in exc_info.value.detail
+
+
+def test_upsert_account_opening_balance_creates_balanced_journal():
+    db = MemoryDB(_account_level_tables())
+
+    result = upsert_account_opening_balance(
+        db,
+        organisation_id=ORG_ID,
+        account_id=ASSET_ID,
+        as_at_date="2026-06-30",
+        side="debit",
+        amount="1250",
+        user_id="user-1",
+    )
+
+    assert result["success"] is True
+    assert db.tables["gl_journals"][0]["source_type"] == "opening_balance"
+    assert db.tables["gl_journals"][0]["total_debit"] == 1250.0
+    assert db.tables["gl_journals"][0]["total_credit"] == 1250.0
+    by_account = {row["account_id"]: row for row in db.tables["gl_journal_lines"]}
+    assert by_account[ASSET_ID]["debit_amount"] == 1250.0
+    assert by_account[RETAINED_ID]["credit_amount"] == 1250.0
+
+
+def test_upsert_account_opening_balance_recalculates_retained_earnings():
+    db = MemoryDB(_account_level_tables())
+    upsert_account_opening_balance(
+        db,
+        organisation_id=ORG_ID,
+        account_id=ASSET_ID,
+        as_at_date="2026-06-30",
+        side="debit",
+        amount="1250",
+        user_id="user-1",
+    )
+
+    upsert_account_opening_balance(
+        db,
+        organisation_id=ORG_ID,
+        account_id=LIABILITY_ID,
+        as_at_date="2026-06-30",
+        side="credit",
+        amount="300",
+        user_id="user-1",
+    )
+
+    by_account = {row["account_id"]: row for row in db.tables["gl_journal_lines"]}
+    assert by_account[ASSET_ID]["debit_amount"] == 1250.0
+    assert by_account[LIABILITY_ID]["credit_amount"] == 300.0
+    assert by_account[RETAINED_ID]["credit_amount"] == 950.0
+    assert db.tables["gl_journals"][0]["total_debit"] == 1250.0
+    assert db.tables["gl_journals"][0]["total_credit"] == 1250.0
+
+
+def test_upsert_account_opening_balance_clears_line_and_balancing_entry():
+    db = MemoryDB(_account_level_tables())
+    upsert_account_opening_balance(
+        db,
+        organisation_id=ORG_ID,
+        account_id=ASSET_ID,
+        as_at_date="2026-06-30",
+        side="debit",
+        amount="1250",
+        user_id="user-1",
+    )
+
+    upsert_account_opening_balance(
+        db,
+        organisation_id=ORG_ID,
+        account_id=ASSET_ID,
+        as_at_date="2026-06-30",
+        side="debit",
+        amount="0",
+        user_id="user-1",
+    )
+
+    assert db.tables["gl_journal_lines"] == []
+    assert db.tables["gl_journals"][0]["total_debit"] == 0.0
+    assert db.tables["gl_journals"][0]["total_credit"] == 0.0
+
+
+def test_upsert_account_opening_balance_blocks_bank_control_account():
+    tables = _account_level_tables()
+    tables["bank_accounts"] = [{
+        "id": "bank-1",
+        "organisation_id": ORG_ID,
+        "gl_account_id": ASSET_ID,
+        "name": "Main Bank",
+        "opening_balance": "500",
+        "active": True,
+    }]
+    db = MemoryDB(tables)
+
+    with pytest.raises(ValueError, match="bank/cash control account"):
+        upsert_account_opening_balance(
+            db,
+            organisation_id=ORG_ID,
+            account_id=ASSET_ID,
+            as_at_date="2026-06-30",
+            side="debit",
+            amount="1250",
+            user_id="user-1",
+        )
+
+
+def test_module_sync_can_update_bank_control_opening_balance():
+    tables = _account_level_tables()
+    tables["bank_accounts"] = [{
+        "id": "bank-1",
+        "organisation_id": ORG_ID,
+        "gl_account_id": ASSET_ID,
+        "name": "Main Bank",
+        "opening_balance": "500",
+        "active": True,
+    }]
+    db = MemoryDB(tables)
+
+    result = sync_module_account_opening_balance(
+        db,
+        organisation_id=ORG_ID,
+        account_id=ASSET_ID,
+        as_at_date="2026-06-30",
+        side="debit",
+        amount="500",
+        user_id="user-1",
+    )
+
+    assert result["success"] is True
+    assert result["opening_balance"]["editable"] is False
+    assert result["opening_balance"]["protected_reason"] == "bank/cash control account"
+    by_account = {row["account_id"]: row for row in db.tables["gl_journal_lines"]}
+    assert by_account[ASSET_ID]["debit_amount"] == 500.0
+
+
+def test_upsert_account_opening_balance_blocks_retained_earnings_edit():
+    db = MemoryDB(_account_level_tables())
+
+    with pytest.raises(ValueError, match="Retained earnings is calculated"):
+        upsert_account_opening_balance(
+            db,
+            organisation_id=ORG_ID,
+            account_id=RETAINED_ID,
+            as_at_date="2026-06-30",
+            side="credit",
+            amount="100",
+            user_id="user-1",
+        )
+
+
+def test_upsert_account_opening_balance_blocks_locked_period():
+    tables = _account_level_tables()
+    tables["organisation_accounting_periods"] = [{
+        "organisation_id": ORG_ID,
+        "status": "locked",
+        "lock_date": "2026-06-30",
+    }]
+
+    with pytest.raises(ValueError, match="accounting lock date"):
+        upsert_account_opening_balance(
+            MemoryDB(tables),
+            organisation_id=ORG_ID,
+            account_id=ASSET_ID,
+            as_at_date="2026-06-30",
+            side="debit",
+            amount="100",
+            user_id="user-1",
+        )
+
+
+def test_upsert_account_opening_balance_route_enforces_write_permission(monkeypatch):
+    db = MemoryDB(_account_level_tables())
+    calls = []
+    monkeypatch.setattr(ob_router, "ensure_org_write", lambda user_id, org_id: calls.append((user_id, org_id)))
+    payload = ob_router.AccountOpeningBalanceRequest(
+        organisation_id=ORG_UUID,
+        account_id=UUID(ASSET_ID),
+        as_at_date="2026-06-30",
+        side="debit",
+        amount="100",
+    )
+
+    result = ob_router.upsert_account_opening_balance_route(payload, auth=("user-1", db))
+
+    assert result["success"] is True
+    assert calls == [("user-1", ORG_ID)]

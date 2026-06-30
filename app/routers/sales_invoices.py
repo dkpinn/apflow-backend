@@ -27,6 +27,7 @@ from app.services.sales_invoices import (
     issue_sales_invoice,
     validate_customer_line_tracking,
 )
+from app.services.protected_accounts import protected_account_ids
 
 
 router = APIRouter(prefix="/api/sales-invoices", tags=["sales-invoices"])
@@ -174,20 +175,22 @@ def _validate_revenue_accounts(
     )
     accounts = (
         db.table("accounts")
-        .select("id, type, active, organisation_id")
+        .select("id, type, active, organisation_id, is_system, system_key")
         .eq("organisation_id", organisation_id)
         .in_("id", account_ids)
         .execute()
         .data
         or []
     ) if account_ids else []
+    protected_ids = protected_account_ids(db, organisation_id=organisation_id)
     valid = {
         str(account["id"])
         for account in accounts
         if account.get("type") == "income" and account.get("active") is not False
+        and str(account.get("id")) not in protected_ids
     }
     if len(valid) != len(account_ids):
-        raise ValueError("Every sales line needs an active income account")
+        raise ValueError("Every sales line needs an active non-control income account")
 
 
 def _calculated_lines(payload_lines: list[SalesInvoiceLineInput]) -> dict[str, Any]:

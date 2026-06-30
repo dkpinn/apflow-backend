@@ -171,6 +171,7 @@ def create_bank_account(payload: BankAccountCreate, auth: UserAuth):
         db,
         payload=payload,
         organisation_id=organisation_id,
+        user_id=user_id,
     )
     log_bank_event(db, organisation_id=organisation_id, event_type="bank_account_created", actor_user_id=user_id, bank_account_id=account["id"])
     create_bank_supplier_if_missing(db, organisation_id=organisation_id, payload=payload)

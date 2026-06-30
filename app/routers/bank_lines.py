@@ -22,6 +22,7 @@ from app.services.bank_statement_service import (
     score_rule_suggestions,
 )
 from app.services.sales_invoices import post_customer_receipt
+from app.services.protected_accounts import assert_manual_posting_account_allowed
 
 from app.routers.bank import (
     BulkDeleteLinesRequest,
@@ -108,6 +109,17 @@ def review_bank_line(line_id: str, payload: ReviewLineRequest, auth: UserAuth):
             db.table("bank_transaction_suggestions").select("*").eq("id", str(payload.suggestion_id)).eq("organisation_id", organisation_id).limit(1).execute(),
             "Suggestion not found",
         )
+    selected_account_id = str(payload.gl_account_id) if payload.gl_account_id else (suggestion or {}).get("suggested_account_id")
+    if selected_account_id:
+        try:
+            assert_manual_posting_account_allowed(
+                db,
+                organisation_id=organisation_id,
+                account_id=str(selected_account_id),
+                action="Review bank transaction",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     receipt_result = None
     if suggestion and suggestion.get("matched_sales_invoice_id"):
         evidence = suggestion.get("evidence") or {}
@@ -176,7 +188,7 @@ def review_bank_line(line_id: str, payload: ReviewLineRequest, auth: UserAuth):
             "description_pattern": None if criteria_mode == "only" else (line.get("description") or "")[:80],
             "reference_pattern": None if criteria_mode == "only" else line.get("reference"),
             "counterparty_pattern": None if criteria_mode == "only" else line.get("counterparty"),
-            "gl_account_id": str(payload.gl_account_id) if payload.gl_account_id else (suggestion or {}).get("suggested_account_id"),
+            "gl_account_id": selected_account_id,
             "tracking": payload.tracking or (suggestion or {}).get("suggested_tracking") or {},
             "tax_treatment": payload.tax_treatment or (suggestion or {}).get("suggested_tax_treatment"),
             "source_bank_statement_line_id": line_id,

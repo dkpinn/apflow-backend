@@ -157,12 +157,39 @@ def test_summary_marks_unlinked_tb_without_displaying_zero():
     summary = build_bank_balance_summary(
         _DB({}),
         organisation_id="org-1",
-        account={"id": "bank-1", "gl_account_id": None},
+        account={"id": "bank-1", "gl_account_id": None, "opening_balance": "0"},
         lines=[],
         uploads=[],
     )
 
-    assert summary["bank_statement_balance"] is None
-    assert summary["calculated_imported_balance"] is None
+    assert summary["bank_statement_balance"] == 0.0
+    assert summary["calculated_imported_balance"] == 0.0
     assert summary["current_tb_balance"] is None
+    assert summary["bank_balance_status"] == "available"
+    assert summary["imported_balance_status"] == "available"
     assert summary["tb_balance_status"] == "gl_account_not_linked"
+
+
+def test_summary_uses_bank_opening_balance_when_statement_header_is_missing():
+    summary = build_bank_balance_summary(
+        _DB({
+            "gl_journal_lines": [],
+            "gl_journals": [],
+        }),
+        organisation_id="org-1",
+        account={
+            "id": "bank-1",
+            "gl_account_id": "bank-gl",
+            "opening_balance": "1000.00",
+            "current_reconciled_balance": None,
+        },
+        lines=[
+            {"bank_statement_upload_id": "upload-1", "signed_amount": "150.00", "line_date": "2026-06-02"},
+            {"bank_statement_upload_id": "upload-1", "signed_amount": "-25.00", "line_date": "2026-06-03"},
+        ],
+        uploads=[{"id": "upload-1", "extraction_status": "extracted"}],
+    )
+
+    assert summary["bank_statement_balance"] == 1000.0
+    assert summary["calculated_imported_balance"] == 1125.0
+    assert summary["current_tb_balance"] == 0.0

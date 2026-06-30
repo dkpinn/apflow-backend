@@ -21,6 +21,7 @@ from app.services.organisation_module_settings import (
     required_tracking_dimensions,
     validate_bank_allocation_tracking,
 )
+from app.services.protected_accounts import assert_manual_posting_account_allowed
 
 # Shared helpers and models live in bank.py; import them here.
 from app.routers.bank import (
@@ -46,6 +47,15 @@ def preview_bank_journal(line_id: str, payload: DraftJournalRequest, auth: UserA
         db.table("bank_statement_lines").select("*").eq("id", line_id).eq("organisation_id", organisation_id).limit(1).execute(),
         "Bank statement line not found",
     )
+    try:
+        assert_manual_posting_account_allowed(
+            db,
+            organisation_id=organisation_id,
+            account_id=str(payload.gl_account_id),
+            action="Allocate bank transaction",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     rows = build_journal_rows_for_line(
         db,
         organisation_id=organisation_id,
@@ -75,6 +85,15 @@ def draft_bank_journal(line_id: str, payload: DraftJournalRequest, auth: UserAut
     )
     if line.get("posting_status") == "posted":
         raise HTTPException(status_code=400, detail="Posted bank transactions must be unposted before redrafting")
+    try:
+        assert_manual_posting_account_allowed(
+            db,
+            organisation_id=organisation_id,
+            account_id=str(payload.gl_account_id),
+            action="Allocate bank transaction",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if line.get("posting_status") == "draft" and line.get("gl_journal_id"):
         journal = _one(
             db.table("gl_journals").select("*").eq("id", line["gl_journal_id"]).eq("organisation_id", organisation_id).limit(1).execute(),

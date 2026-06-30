@@ -11,6 +11,7 @@ from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
 from app.routers.bank import _auth, _one, log_bank_event, now_iso
 from app.services.bank_rules import list_bank_rules, preview_bank_rule_matches
 from app.services.bank_statement_service import normalize_rule_criteria
+from app.services.protected_accounts import assert_manual_posting_account_allowed
 
 
 router = APIRouter(prefix="/api/bank", tags=["bank"])
@@ -95,6 +96,16 @@ def update_rule(rule_id: str, payload: BankRuleUpdate, auth: UserAuth):
     patch = payload.model_dump(mode="json", exclude={"organisation_id"}, exclude_none=True)
     if "criteria" in patch:
         patch["criteria"] = normalize_rule_criteria(patch.get("criteria"))
+    if patch.get("gl_account_id"):
+        try:
+            assert_manual_posting_account_allowed(
+                db,
+                organisation_id=organisation_id,
+                account_id=str(patch["gl_account_id"]),
+                action="Update bank rule",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not patch:
         raise HTTPException(status_code=400, detail="No rule changes supplied")
     patch["updated_at"] = now_iso()

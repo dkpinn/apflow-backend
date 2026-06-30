@@ -16,6 +16,7 @@ class BankAccountCreate(BaseModel):
     account_number_hash: Optional[str] = None
     gl_account_id: Optional[UUID] = None
     opening_balance: float = 0
+    opening_balance_date: Optional[str] = None
 
 
 class BankUploadCreate(BaseModel):
@@ -93,4 +94,3 @@ class ParsingRuleUpdate(BaseModel):
     account_type: Optional[str] = None
     parsing_hint: Optional[str] = None
     active: Optional[bool] = None
-

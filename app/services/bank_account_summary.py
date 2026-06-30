@@ -160,6 +160,16 @@ def build_bank_balance_summary(
 
     latest_upload, latest_transaction_date = select_latest_statement(uploads, lines)
     bank_balance, imported_balance = calculate_statement_balances(latest_upload, lines)
+    opening_balance = _money(account.get("opening_balance"))
+    if bank_balance is None:
+        fallback_bank_balance = account.get("current_reconciled_balance")
+        if fallback_bank_balance is not None:
+            bank_balance = float(_money(fallback_bank_balance))
+        else:
+            bank_balance = float(opening_balance)
+    if imported_balance is None:
+        movement = sum((_money(line.get("signed_amount")) for line in lines), ZERO)
+        imported_balance = float((opening_balance + movement).quantize(Decimal("0.01")))
     gl_account_id = str(account.get("gl_account_id")) if account.get("gl_account_id") else None
     tb_balance = posted_gl_balance(
         db,

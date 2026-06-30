@@ -186,6 +186,21 @@ def test_draft_bank_journal_400_when_posted(monkeypatch):
     assert "unposted" in exc_info.value.detail.lower()
 
 
+def test_draft_bank_journal_blocks_bank_control_allocation(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line()],
+        "bank_accounts": [{"id": "ba-2", "organisation_id": ORG_ID, "gl_account_id": str(GL_UUID), "active": True}],
+    })
+    monkeypatch.setattr(bj, "_auth", _fake_auth(db))
+    monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bj.draft_bank_journal("line-1", _draft_payload(), auth=("user-1", None))
+
+    assert exc_info.value.status_code == 400
+    assert "bank/cash control account" in exc_info.value.detail
+
+
 # ── post_bank_journal ────────────────────────────────────────────────────────
 
 def test_post_bank_journal_marks_journal_posted(monkeypatch):

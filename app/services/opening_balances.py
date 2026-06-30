@@ -7,10 +7,14 @@ from typing import Any
 from app.services.accounting_locks import assert_accounting_period_unlocked, parse_accounting_date
 from app.services.bank_statement_service import new_uuid
 from app.services.money import money
+from app.services.protected_accounts import assert_manual_posting_account_allowed, protected_account_reason
 
 
 MONEY = Decimal("0.01")
 ZERO = Decimal("0.00")
+CREDIT_NORMAL_TYPES = {"income", "liability", "equity"}
+OPENING_BALANCE_SOURCE = "opening_balance"
+RETAINED_EARNINGS_SYSTEM_KEY = "retained_earnings"
 
 
 def _amount(value: Any) -> Decimal:
@@ -21,10 +25,31 @@ def _out(value: Decimal) -> float:
     return float(value.quantize(MONEY, rounding=ROUND_HALF_UP))
 
 
+def _normal_side(account_type: str) -> str:
+    return "credit" if str(account_type or "").lower() in CREDIT_NORMAL_TYPES else "debit"
+
+
+def _normal_amount(account_type: str, debit: Decimal, credit: Decimal) -> Decimal:
+    if _normal_side(account_type) == "credit":
+        return credit - debit
+    return debit - credit
+
+
+def _side_amount(debit: Decimal, credit: Decimal) -> tuple[str, Decimal]:
+    if debit >= credit:
+        return "debit", debit - credit
+    return "credit", credit - debit
+
+
+def _line_tracking(line: dict[str, Any]) -> dict[str, Any]:
+    tracking = line.get("tracking")
+    return tracking if isinstance(tracking, dict) else {}
+
+
 def _fetch_accounts(db, organisation_id: str) -> dict[str, dict[str, Any]]:
     rows = (
         db.table("accounts")
-        .select("id, code, name, type, active")
+        .select("id, code, name, type, active, is_system, system_key")
         .eq("organisation_id", organisation_id)
         .execute()
         .data
@@ -85,6 +110,15 @@ def preview_opening_balance(
             account_id=line.get("account_id"),
             account_code=line.get("account_code") or line.get("code"),
         )
+        reason = protected_account_reason(
+            db,
+            organisation_id=organisation_id,
+            account_id=str(account.get("id")),
+        )
+        if reason:
+            raise ValueError(
+                f"Opening balance import cannot use {account.get('code') or account.get('name')} because it is a {reason}"
+            )
         if account.get("active") is False:
             warnings.append({
                 "code": "inactive_account",
@@ -140,13 +174,452 @@ def _existing_opening_balance_journal(db, *, organisation_id: str, as_at_date: s
         db.table("gl_journals")
         .select("id, status, journal_date, description")
         .eq("organisation_id", organisation_id)
-        .eq("source_type", "opening_balance")
+        .eq("source_type", OPENING_BALANCE_SOURCE)
         .eq("journal_date", as_at_date)
         .execute()
         .data
         or []
     )
     return next((row for row in rows if row.get("status") != "reversed"), None)
+
+
+def _active_opening_balance_journals(db, *, organisation_id: str, as_at_date: str) -> list[dict[str, Any]]:
+    rows = (
+        db.table("gl_journals")
+        .select("id, status, journal_date, description")
+        .eq("organisation_id", organisation_id)
+        .eq("source_type", OPENING_BALANCE_SOURCE)
+        .eq("journal_date", as_at_date)
+        .execute()
+        .data
+        or []
+    )
+    return [row for row in rows if row.get("status") != "reversed"]
+
+
+def _fetch_journal_lines(db, *, organisation_id: str, journal_id: str) -> list[dict[str, Any]]:
+    return (
+        db.table("gl_journal_lines")
+        .select("id, organisation_id, gl_journal_id, account_id, description, debit_amount, credit_amount, tracking, sort_order")
+        .eq("organisation_id", organisation_id)
+        .eq("gl_journal_id", journal_id)
+        .order("sort_order")
+        .execute()
+        .data
+        or []
+    )
+
+
+def _retained_earnings_account(accounts_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    matches = [
+        account
+        for account in accounts_by_id.values()
+        if account.get("system_key") == RETAINED_EARNINGS_SYSTEM_KEY
+    ]
+    if not matches:
+        raise ValueError("Retained earnings system account was not found for this organisation")
+    return matches[0]
+
+
+def _opening_line_for_account(
+    lines: list[dict[str, Any]],
+    *,
+    account_id: str,
+    label: str,
+) -> dict[str, Any] | None:
+    matches = [line for line in lines if str(line.get("account_id") or "") == account_id]
+    if len(matches) > 1:
+        raise ValueError(f"{label} has split opening-balance lines. Use the full opening-balance import to edit it.")
+    if matches and _line_tracking(matches[0]):
+        raise ValueError(f"{label} has tracked opening-balance detail. Use the full opening-balance import to edit it.")
+    return matches[0] if matches else None
+
+
+def _bank_opening_warnings(
+    db,
+    *,
+    organisation_id: str,
+    account_id: str,
+    account_type: str,
+    debit: Decimal,
+    credit: Decimal,
+) -> list[dict[str, Any]]:
+    try:
+        rows = (
+            db.table("bank_accounts")
+            .select("id, name, opening_balance, active")
+            .eq("organisation_id", organisation_id)
+            .eq("gl_account_id", account_id)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return []
+
+    warnings: list[dict[str, Any]] = []
+    gl_opening = _normal_amount(account_type, debit, credit)
+    for row in rows:
+        bank_opening = _amount(row.get("opening_balance") or 0)
+        if bank_opening and bank_opening != gl_opening:
+            warnings.append({
+                "code": "bank_opening_balance_mismatch",
+                "message": f"{row.get('name') or 'Linked bank account'} has a module opening balance that differs from this GL opening balance.",
+                "bank_account_id": row.get("id"),
+                "bank_account_name": row.get("name"),
+                "module_opening_balance": _out(bank_opening),
+                "gl_opening_balance": _out(gl_opening),
+            })
+    return warnings
+
+
+def get_account_opening_balance(
+    db,
+    *,
+    organisation_id: str,
+    account_id: str,
+    as_at_date: str,
+) -> dict[str, Any]:
+    parsed_date = parse_accounting_date(as_at_date, field="as_at_date").isoformat()
+    accounts_by_id = _fetch_accounts(db, organisation_id)
+    account = _resolve_account(accounts_by_id, account_id=account_id, account_code=None)
+    retained = _retained_earnings_account(accounts_by_id)
+    is_retained = str(account.get("id")) == str(retained.get("id"))
+    protected_reason = protected_account_reason(
+        db,
+        organisation_id=organisation_id,
+        account_id=str(account.get("id")),
+    )
+    journals = _active_opening_balance_journals(
+        db,
+        organisation_id=organisation_id,
+        as_at_date=parsed_date,
+    )
+    if len(journals) > 1:
+        raise ValueError(f"More than one active opening balance journal exists for {parsed_date}")
+
+    debit = ZERO
+    credit = ZERO
+    line_id = None
+    journal = journals[0] if journals else None
+    if journal:
+        lines = _fetch_journal_lines(db, organisation_id=organisation_id, journal_id=str(journal["id"]))
+        if is_retained:
+            line = _opening_line_for_account(lines, account_id=str(account["id"]), label="Retained earnings")
+        else:
+            line = _opening_line_for_account(lines, account_id=str(account["id"]), label=account.get("name") or "Account")
+        if line:
+            line_id = line.get("id")
+            debit = _amount(line.get("debit_amount"))
+            credit = _amount(line.get("credit_amount"))
+
+    side, amount = _side_amount(debit, credit)
+    normal_amount = _normal_amount(str(account.get("type") or "other"), debit, credit)
+    warnings = [] if is_retained else _bank_opening_warnings(
+        db,
+        organisation_id=organisation_id,
+        account_id=str(account["id"]),
+        account_type=str(account.get("type") or "other"),
+        debit=debit,
+        credit=credit,
+    )
+
+    return {
+        "organisation_id": organisation_id,
+        "as_at_date": parsed_date,
+        "journal": journal,
+        "line_id": line_id,
+        "account": {
+            "id": account.get("id"),
+            "code": account.get("code"),
+            "name": account.get("name"),
+            "type": account.get("type"),
+            "active": account.get("active"),
+            "system_key": account.get("system_key"),
+        },
+        "balancing_account": {
+            "id": retained.get("id"),
+            "code": retained.get("code"),
+            "name": retained.get("name"),
+            "system_key": retained.get("system_key"),
+        },
+        "editable": not is_retained and protected_reason is None,
+        "protected_reason": protected_reason,
+        "side": side,
+        "amount": _out(amount),
+        "normal_side": _normal_side(str(account.get("type") or "other")),
+        "normal_amount": _out(normal_amount),
+        "debit_amount": _out(debit),
+        "credit_amount": _out(credit),
+        "warnings": warnings,
+    }
+
+
+def _line_payload(
+    *,
+    organisation_id: str,
+    journal_id: str,
+    account_id: str,
+    description: str,
+    debit: Decimal,
+    credit: Decimal,
+    sort_order: int,
+) -> dict[str, Any]:
+    return {
+        "organisation_id": organisation_id,
+        "gl_journal_id": journal_id,
+        "account_id": account_id,
+        "description": description,
+        "debit_amount": _out(debit),
+        "credit_amount": _out(credit),
+        "tracking": {},
+        "sort_order": sort_order,
+    }
+
+
+def _journal_totals(lines: list[dict[str, Any]]) -> tuple[Decimal, Decimal]:
+    debit = sum((_amount(line.get("debit_amount")) for line in lines), ZERO)
+    credit = sum((_amount(line.get("credit_amount")) for line in lines), ZERO)
+    return debit, credit
+
+
+def upsert_account_opening_balance(
+    db,
+    *,
+    organisation_id: str,
+    account_id: str,
+    as_at_date: str,
+    side: str,
+    amount: Any,
+    user_id: str,
+    description: str | None = None,
+    allow_protected: bool = False,
+) -> dict[str, Any]:
+    parsed_date = parse_accounting_date(as_at_date, field="as_at_date").isoformat()
+    side = str(side or "").lower().strip()
+    if side not in {"debit", "credit"}:
+        raise ValueError("side must be debit or credit")
+    amount_dec = _amount(amount)
+    if amount_dec < ZERO:
+        raise ValueError("Opening balance amount cannot be negative")
+
+    accounts_by_id = _fetch_accounts(db, organisation_id)
+    account = _resolve_account(accounts_by_id, account_id=account_id, account_code=None)
+    retained = _retained_earnings_account(accounts_by_id)
+    if str(account["id"]) == str(retained["id"]):
+        raise ValueError("Retained earnings is calculated from the other opening balances and cannot be edited here")
+    if not allow_protected:
+        assert_manual_posting_account_allowed(
+            db,
+            organisation_id=organisation_id,
+            account_id=str(account["id"]),
+            action="Update opening balance",
+        )
+    if account.get("active") is False and amount_dec:
+        raise ValueError("Inactive accounts cannot be given an opening balance")
+
+    assert_accounting_period_unlocked(
+        db,
+        organisation_id=organisation_id,
+        transaction_date=parsed_date,
+        action="Update opening balance",
+    )
+
+    journals = _active_opening_balance_journals(
+        db,
+        organisation_id=organisation_id,
+        as_at_date=parsed_date,
+    )
+    if len(journals) > 1:
+        raise ValueError(f"More than one active opening balance journal exists for {parsed_date}")
+
+    debit = amount_dec if side == "debit" else ZERO
+    credit = amount_dec if side == "credit" else ZERO
+    target_description = (description or "").strip() or f"Opening balance - {account.get('code') or account.get('name')}"
+    retained_description = f"Opening balance balancing entry - {retained.get('code') or retained.get('name')}"
+
+    if not journals:
+        if not amount_dec:
+            return {
+                "success": True,
+                "journal": None,
+                "opening_balance": get_account_opening_balance(
+                    db,
+                    organisation_id=organisation_id,
+                    account_id=account_id,
+                    as_at_date=parsed_date,
+                ),
+            }
+        journal_id = new_uuid()
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        retained_debit = credit
+        retained_credit = debit
+        journal_lines = [
+            _line_payload(
+                organisation_id=organisation_id,
+                journal_id=journal_id,
+                account_id=str(account["id"]),
+                description=target_description,
+                debit=debit,
+                credit=credit,
+                sort_order=0,
+            ),
+            _line_payload(
+                organisation_id=organisation_id,
+                journal_id=journal_id,
+                account_id=str(retained["id"]),
+                description=retained_description,
+                debit=retained_debit,
+                credit=retained_credit,
+                sort_order=1,
+            ),
+        ]
+        total_debit, total_credit = _journal_totals(journal_lines)
+        journal = {
+            "id": journal_id,
+            "organisation_id": organisation_id,
+            "source_type": OPENING_BALANCE_SOURCE,
+            "source_id": None,
+            "journal_date": parsed_date,
+            "description": f"Opening balances as at {parsed_date}",
+            "status": "posted",
+            "total_debit": _out(total_debit),
+            "total_credit": _out(total_credit),
+            "created_by": user_id,
+            "posted_by": user_id,
+            "posted_at": now,
+        }
+        db.table("gl_journals").insert(journal).execute()
+        db.table("gl_journal_lines").insert(journal_lines).execute()
+        return {
+            "success": True,
+            "journal": journal,
+            "opening_balance": get_account_opening_balance(
+                db,
+                organisation_id=organisation_id,
+                account_id=account_id,
+                as_at_date=parsed_date,
+            ),
+        }
+
+    journal = journals[0]
+    if str(journal.get("status") or "").lower() != "posted":
+        raise ValueError("Account-level opening balance editing only supports posted opening balance journals")
+    journal_id = str(journal["id"])
+    lines = _fetch_journal_lines(db, organisation_id=organisation_id, journal_id=journal_id)
+    target_line = _opening_line_for_account(
+        lines,
+        account_id=str(account["id"]),
+        label=account.get("name") or "Account",
+    )
+    retained_line = _opening_line_for_account(
+        lines,
+        account_id=str(retained["id"]),
+        label="Retained earnings",
+    )
+
+    if target_line:
+        if amount_dec:
+            db.table("gl_journal_lines").update({
+                "description": target_description,
+                "debit_amount": _out(debit),
+                "credit_amount": _out(credit),
+                "tracking": {},
+            }).eq("id", target_line["id"]).execute()
+        else:
+            db.table("gl_journal_lines").delete().eq("id", target_line["id"]).execute()
+    elif amount_dec:
+        db.table("gl_journal_lines").insert(_line_payload(
+            organisation_id=organisation_id,
+            journal_id=journal_id,
+            account_id=str(account["id"]),
+            description=target_description,
+            debit=debit,
+            credit=credit,
+            sort_order=len(lines),
+        )).execute()
+
+    refreshed_lines = _fetch_journal_lines(db, organisation_id=organisation_id, journal_id=journal_id)
+    non_retained = [
+        line for line in refreshed_lines if str(line.get("account_id") or "") != str(retained["id"])
+    ]
+    non_retained_debit, non_retained_credit = _journal_totals(non_retained)
+    difference = non_retained_debit - non_retained_credit
+    retained_debit = ZERO
+    retained_credit = ZERO
+    if difference > ZERO:
+        retained_credit = difference
+    elif difference < ZERO:
+        retained_debit = -difference
+
+    if retained_line:
+        if retained_debit or retained_credit:
+            db.table("gl_journal_lines").update({
+                "description": retained_description,
+                "debit_amount": _out(retained_debit),
+                "credit_amount": _out(retained_credit),
+                "tracking": {},
+                "sort_order": len(non_retained),
+            }).eq("id", retained_line["id"]).execute()
+        else:
+            db.table("gl_journal_lines").delete().eq("id", retained_line["id"]).execute()
+    elif retained_debit or retained_credit:
+        db.table("gl_journal_lines").insert(_line_payload(
+            organisation_id=organisation_id,
+            journal_id=journal_id,
+            account_id=str(retained["id"]),
+            description=retained_description,
+            debit=retained_debit,
+            credit=retained_credit,
+            sort_order=len(non_retained),
+        )).execute()
+
+    final_lines = _fetch_journal_lines(db, organisation_id=organisation_id, journal_id=journal_id)
+    total_debit, total_credit = _journal_totals(final_lines)
+    db.table("gl_journals").update({
+        "total_debit": _out(total_debit),
+        "total_credit": _out(total_credit),
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }).eq("id", journal_id).execute()
+
+    return {
+        "success": True,
+        "journal": {
+            **journal,
+            "total_debit": _out(total_debit),
+            "total_credit": _out(total_credit),
+        },
+        "opening_balance": get_account_opening_balance(
+            db,
+            organisation_id=organisation_id,
+            account_id=account_id,
+            as_at_date=parsed_date,
+        ),
+    }
+
+
+def sync_module_account_opening_balance(
+    db,
+    *,
+    organisation_id: str,
+    account_id: str,
+    as_at_date: str,
+    side: str,
+    amount: Any,
+    user_id: str,
+    description: str | None = None,
+) -> dict[str, Any]:
+    return upsert_account_opening_balance(
+        db,
+        organisation_id=organisation_id,
+        account_id=account_id,
+        as_at_date=as_at_date,
+        side=side,
+        amount=amount,
+        user_id=user_id,
+        description=description,
+        allow_protected=True,
+    )
 
 
 def post_opening_balance(

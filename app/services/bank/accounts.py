@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from fastapi import HTTPException
@@ -7,6 +8,8 @@ from fastapi import HTTPException
 from app.schemas.bank import BankAccountCreate, BankBalanceSummary
 from app.services.bank_account_summary import build_bank_balance_summary
 from app.services.bank_statement_service import money
+from app.services.opening_balances import sync_module_account_opening_balance
+from app.services.protected_accounts import assert_manual_posting_account_allowed
 
 
 def _one(res, message: str):
@@ -149,10 +152,21 @@ def create_bank_account_record(
     *,
     payload: BankAccountCreate,
     organisation_id: str,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     opening = float(money(payload.opening_balance))
 
     gl_account_id: str | None = str(payload.gl_account_id) if payload.gl_account_id else None
+    if gl_account_id:
+        try:
+            assert_manual_posting_account_allowed(
+                db,
+                organisation_id=organisation_id,
+                account_id=gl_account_id,
+                action="Link bank account",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not gl_account_id:
         code_rows = (
             db.table("accounts")
@@ -205,7 +219,23 @@ def create_bank_account_record(
         "current_reconciled_balance": opening,
         "active": True,
     }
-    return _one(db.table("bank_accounts").insert(row).execute(), "Bank account create failed")
+    bank_account = _one(db.table("bank_accounts").insert(row).execute(), "Bank account create failed")
+    opening_date = payload.opening_balance_date or date.today().isoformat()
+    side = "credit" if opening < 0 else "debit"
+    try:
+        sync_module_account_opening_balance(
+            db,
+            organisation_id=organisation_id,
+            account_id=gl_account_id,
+            as_at_date=opening_date,
+            side=side,
+            amount=abs(opening),
+            user_id=user_id or "system",
+            description=f"Bank opening balance - {payload.name}",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return bank_account
 
 
 def create_bank_supplier_if_missing(
