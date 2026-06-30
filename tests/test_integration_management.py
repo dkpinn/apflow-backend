@@ -122,10 +122,12 @@ class IntegrationManagementTests(unittest.TestCase):
         self.old_secret = os.environ.get("INTEGRATION_SECRET_KEY")
         self.old_owner = os.environ.get("PLATFORM_OWNER_USER_IDS")
         self.old_lm_studio_enabled = os.environ.get("LM_STUDIO_VLM_ENABLED")
+        self.old_lm_studio_paused = os.environ.get("LM_STUDIO_VLM_PAUSED")
         self.old_lm_studio_model = os.environ.get("LM_STUDIO_VLM_MODEL")
         os.environ["INTEGRATION_SECRET_KEY"] = "test-secret-for-integrations"
         os.environ["PLATFORM_OWNER_USER_IDS"] = "owner-user"
         os.environ["LM_STUDIO_VLM_ENABLED"] = "false"
+        os.environ.pop("LM_STUDIO_VLM_PAUSED", None)
         self.db = _FakeDB()
         self.old_get_supabase_client = admin_integrations.get_supabase_client
         self.old_dependencies_get_supabase_client = dependencies.get_supabase_client
@@ -145,6 +147,10 @@ class IntegrationManagementTests(unittest.TestCase):
             os.environ.pop("LM_STUDIO_VLM_ENABLED", None)
         else:
             os.environ["LM_STUDIO_VLM_ENABLED"] = self.old_lm_studio_enabled
+        if self.old_lm_studio_paused is None:
+            os.environ.pop("LM_STUDIO_VLM_PAUSED", None)
+        else:
+            os.environ["LM_STUDIO_VLM_PAUSED"] = self.old_lm_studio_paused
         if self.old_lm_studio_model is None:
             os.environ.pop("LM_STUDIO_VLM_MODEL", None)
         else:
@@ -304,7 +310,7 @@ class IntegrationManagementTests(unittest.TestCase):
         self.assertEqual(result["data"]["supplier_name_extracted"], "PRODEC PAINTS CC")
         self.assertEqual([attempt["provider"] for attempt in result["attempts"]], ["openai", "gemini"])
 
-    def test_lm_studio_env_provider_runs_before_configured_integrations(self):
+    def test_lm_studio_env_provider_runs_only_when_explicitly_unpaused(self):
         from app.services.integration_secrets import encrypt_secret, secret_fingerprint
 
         self.db.tables[SYSTEM_INTEGRATIONS_TABLE] = [
@@ -332,6 +338,7 @@ class IntegrationManagementTests(unittest.TestCase):
         old_runners = dict(ai_provider_fallback.PROVIDER_RUNNERS)
         try:
             os.environ["LM_STUDIO_VLM_ENABLED"] = "true"
+            os.environ["LM_STUDIO_VLM_PAUSED"] = "false"
             os.environ["LM_STUDIO_VLM_MODEL"] = "local-test-model"
             ai_provider_fallback._run_lm_studio_provider = lambda **_kwargs: {
                 "data": {"supplier_name_extracted": "LOCAL SUPPLIER", "confidence_score": 0.97},
@@ -359,6 +366,65 @@ class IntegrationManagementTests(unittest.TestCase):
         self.assertEqual(result["model"], "local-test-model")
         self.assertEqual(result["data"]["supplier_name_extracted"], "LOCAL SUPPLIER")
         self.assertEqual([attempt["provider"] for attempt in result["attempts"]], ["lm_studio"])
+
+    def test_lm_studio_is_paused_by_default_and_gemini_backup_runs(self):
+        from app.services.integration_secrets import encrypt_secret, secret_fingerprint
+
+        self.db.tables[SYSTEM_INTEGRATIONS_TABLE] = [
+            {
+                "id": "lm-1",
+                "provider": "lm_studio",
+                "capability": "vlm",
+                "enabled": True,
+                "model": "local-test-model",
+            },
+            {
+                "id": "gemini-1",
+                "provider": "gemini",
+                "capability": "vlm",
+                "enabled": True,
+                "model": "gemini-test",
+                "encrypted_api_key": encrypt_secret("gemini-key"),
+                "api_key_fingerprint": secret_fingerprint("gemini-key"),
+            },
+        ]
+        self.db.tables[SYSTEM_POLICIES_TABLE] = [
+            {
+                "id": "policy-1",
+                "task": "invoice_vlm_extraction",
+                "enabled": True,
+                "ordered_integration_ids": ["lm-1", "gemini-1"],
+                "config": {},
+            }
+        ]
+
+        old_runners = dict(ai_provider_fallback.PROVIDER_RUNNERS)
+        try:
+            os.environ["LM_STUDIO_VLM_ENABLED"] = "true"
+            os.environ.pop("LM_STUDIO_VLM_PAUSED", None)
+            ai_provider_fallback.PROVIDER_RUNNERS["lm_studio"] = lambda **_kwargs: {
+                "data": {"supplier_name_extracted": "LOCAL SUPPLIER"},
+                "reason": None,
+                "error": None,
+            }
+            ai_provider_fallback.PROVIDER_RUNNERS["gemini"] = lambda **_kwargs: {
+                "data": {"supplier_name_extracted": "GEMINI SUPPLIER", "confidence_score": 0.95},
+                "reason": None,
+                "error": None,
+            }
+
+            result = ai_provider_fallback.extract_with_vlm_fallback(
+                b"fake-pdf",
+                "application/pdf",
+                supabase=self.db,
+            )
+        finally:
+            ai_provider_fallback.PROVIDER_RUNNERS.clear()
+            ai_provider_fallback.PROVIDER_RUNNERS.update(old_runners)
+
+        self.assertEqual(result["provider"], "gemini")
+        self.assertEqual(result["data"]["supplier_name_extracted"], "GEMINI SUPPLIER")
+        self.assertEqual([attempt["provider"] for attempt in result["attempts"]], ["gemini"])
 
     def test_openai_adapter_normalises_response_to_invoice_schema(self):
         calls = []

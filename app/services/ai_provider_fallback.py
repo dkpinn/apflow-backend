@@ -19,7 +19,7 @@ from app.services.integration_service import (
 )
 from app.services.lm_studio_vlm import (
     DEFAULT_LM_STUDIO_MODEL,
-    env_truthy,
+    lm_studio_enabled,
     lm_studio_vision_text,
 )
 from app.services.invoice_extraction.vlm_parser import (
@@ -417,6 +417,8 @@ def _active_system_integrations(db) -> list[dict]:
         .eq("enabled", True)
         .execute()
     ).data or []
+    if not lm_studio_enabled():
+        rows = [row for row in rows if (row.get("provider") or "").lower() != "lm_studio"]
     return rows
 
 
@@ -450,8 +452,8 @@ def extract_with_vlm_fallback(
     """
     Run platform-configured VLM providers in fallback order.
 
-    If LM Studio is enabled, try the local model first. The old Gemini/OpenRouter
-    path remains behind it as the backup procedure.
+    Gemini/system providers are the normal fallback path. LM Studio is kept
+    available for later experiments, but is skipped unless explicitly unpaused.
     """
     try:
         db = supabase or get_supabase_client()
@@ -465,21 +467,21 @@ def extract_with_vlm_fallback(
             }
         integrations = _ordered_integrations(_active_system_integrations(db), policy)
     except Exception as exc:
-        if env_truthy("LM_STUDIO_VLM_ENABLED"):
+        if lm_studio_enabled():
             lm_result = _env_lm_studio_fallback(file_bytes, mime_type)
             lm_result["config_error"] = str(exc)[:500]
             if lm_result.get("data") is not None:
                 return lm_result
         env_result = _env_gemini_fallback(file_bytes, mime_type)
         env_result["config_error"] = str(exc)[:500]
-        if env_truthy("LM_STUDIO_VLM_ENABLED"):
+        if lm_studio_enabled():
             env_result["attempts"] = (lm_result.get("attempts") or []) + (env_result.get("attempts") or [])
             env_result["lm_studio_error"] = lm_result.get("error")
         return env_result
 
     prompt = _criteria_prompt(db, task)
     pre_attempts: list[dict] = []
-    if env_truthy("LM_STUDIO_VLM_ENABLED"):
+    if lm_studio_enabled():
         lm_result = _env_lm_studio_fallback(file_bytes, mime_type, prompt=prompt)
         pre_attempts = lm_result.get("attempts") or []
         if lm_result.get("data") is not None:
@@ -487,7 +489,7 @@ def extract_with_vlm_fallback(
 
     if not integrations:
         env_result = _env_gemini_fallback(file_bytes, mime_type)
-        if env_truthy("LM_STUDIO_VLM_ENABLED"):
+        if lm_studio_enabled():
             env_result["attempts"] = pre_attempts + (env_result.get("attempts") or [])
             env_result["lm_studio_error"] = lm_result.get("error")
         if env_result.get("data") is not None:

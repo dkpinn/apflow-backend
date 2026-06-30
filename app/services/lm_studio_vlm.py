@@ -13,6 +13,7 @@ DEFAULT_LM_STUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_LM_STUDIO_MODEL = "local-model"
 DEFAULT_LM_STUDIO_TIMEOUT_SECONDS = 120
 DEFAULT_LM_STUDIO_MAX_TOKENS = 8192
+LM_STUDIO_PAUSED_ENV = "LM_STUDIO_VLM_PAUSED"
 
 
 def env_truthy(name: str, default: bool = False) -> bool:
@@ -23,6 +24,8 @@ def env_truthy(name: str, default: bool = False) -> bool:
 
 
 def lm_studio_enabled() -> bool:
+    if env_truthy(LM_STUDIO_PAUSED_ENV, default=True):
+        return False
     return env_truthy("LM_STUDIO_VLM_ENABLED")
 
 

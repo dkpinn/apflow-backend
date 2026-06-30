@@ -1,16 +1,20 @@
 from datetime import date, datetime
 from io import BytesIO
+import sys
+import types
 
 import pytest
 from openpyxl import Workbook
 
 import app.services.bank_statement_extraction as extraction
 import app.services.bank_statement_service as facade
+from app.services.bank_statement_extraction import vlm_parser as bank_vlm_parser
 from app.services.bank_statement_extraction.vlm_parser import (
     _parse_vlm_json_payload,
     _parse_vlm_transaction_date,
     _vlm_statement_period_dates,
 )
+from app.services.invoice_extraction import vlm_parser as invoice_vlm_parser
 from app.services.extraction_foundation import detect_source_format
 from app.services.extractor_registry import select_bank_cash_extractor
 
@@ -182,6 +186,71 @@ def test_vlm_json_payload_accepts_markdown_fenced_json():
 def test_vlm_json_payload_rejects_invalid_response_with_preview():
     with pytest.raises(ValueError, match="Test VLM returned invalid JSON"):
         _parse_vlm_json_payload("I could not extract this statement", provider="Test VLM")
+
+
+def test_bank_vlm_lm_studio_failure_falls_back_to_gemini(monkeypatch):
+    class _FakeResponse:
+        text = """
+        {
+          "statement_period_from": "2026-06-01",
+          "statement_period_to": "2026-06-30",
+          "currency": "ZAR",
+          "confidence_score": 0.92,
+          "transactions": [
+            {
+              "line_date": "2026-06-15",
+              "description": "Supplier payment",
+              "reference": "PAY-1",
+              "debit_amount": 100,
+              "credit_amount": 0,
+              "balance_amount": 900
+            }
+          ]
+        }
+        """
+        usage_metadata = types.SimpleNamespace(prompt_token_count=10, candidates_token_count=20)
+
+    class _FakeModels:
+        def __init__(self):
+            self.calls = []
+
+        def generate_content(self, **kwargs):
+            self.calls.append(kwargs)
+            return _FakeResponse()
+
+    fake_models = _FakeModels()
+    fake_genai = types.ModuleType("google.genai")
+    fake_genai.Client = lambda api_key: types.SimpleNamespace(models=fake_models)
+    fake_genai_types = types.SimpleNamespace(
+        GenerateContentConfig=lambda **kwargs: kwargs,
+        Part=types.SimpleNamespace(from_bytes=lambda **kwargs: kwargs),
+    )
+    fake_genai.types = fake_genai_types
+    fake_google = types.ModuleType("google")
+    fake_google.genai = fake_genai
+
+    monkeypatch.setitem(sys.modules, "google", fake_google)
+    monkeypatch.setitem(sys.modules, "google.genai", fake_genai)
+    monkeypatch.setitem(sys.modules, "google.genai.types", fake_genai_types)
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("LM_STUDIO_VLM_ENABLED", "true")
+    monkeypatch.setenv("LM_STUDIO_VLM_PAUSED", "false")
+    monkeypatch.setattr(invoice_vlm_parser, "preprocess_for_vlm", lambda *_args, **_kwargs: [(b"png", "image/png")])
+    monkeypatch.setattr(bank_vlm_parser, "_call_lm_studio_bank_vlm", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("local timeout")))
+
+    header, lines = bank_vlm_parser.parse_vlm_statement(
+        b"fake-pdf",
+        mime_type="application/pdf",
+        bank_account_id="bank-1",
+        currency="ZAR",
+        parsing_hint="Extract statement lines.",
+    )
+
+    assert len(fake_models.calls) == 1
+    assert header["extraction_model"] == "gemini-2.5-flash"
+    assert len(lines) == 1
+    assert lines[0].description == "Supplier payment"
+    assert lines[0].debit_amount == facade.money("100")
 
 
 def test_fnb_vlm_yearless_transaction_date_uses_statement_period_year():

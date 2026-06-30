@@ -393,8 +393,8 @@ def parse_vlm_statement(
             logger.warning("[VLM] LM Studio failed, falling back to backup providers: %s", _step_exc)
             _final_exc = _step_exc
 
-    if payload is None and _lm_studio_enabled():
-        raise _final_exc or RuntimeError("LM Studio returned no transactions")
+    if payload is None and _final_exc and _lm_studio_enabled():
+        logger.info("[VLM] Continuing to Gemini backup after LM Studio failure")
 
     if payload is None:
         try:
