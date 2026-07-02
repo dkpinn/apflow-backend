@@ -31,6 +31,8 @@ def select_latest_statement(
     for upload in uploads:
         if upload.get("extraction_status") != "extracted":
             continue
+        if upload.get("closing_balance") is None:
+            continue
         upload_id = str(upload.get("id") or "")
         latest_line_date = max(
             (_date_key(line.get("line_date")) for line in lines_by_upload.get(upload_id, [])),
@@ -79,7 +81,14 @@ def calculate_statement_balances(
         ),
         ZERO,
     )
-    return bank_balance, float((_money(opening) + movement).quantize(Decimal("0.01")))
+    calculated = (_money(opening) + movement).quantize(Decimal("0.01"))
+    if (
+        latest_upload.get("balance_status") == "balanced"
+        and latest_upload.get("closing_balance") is not None
+        and calculated != _money(latest_upload.get("closing_balance"))
+    ):
+        calculated = _money(latest_upload.get("closing_balance"))
+    return bank_balance, float(calculated)
 
 
 def posted_gl_balance(
@@ -134,6 +143,59 @@ def posted_gl_balance(
     return float(balance.quantize(Decimal("0.01")))
 
 
+def posted_gl_opening_balance(
+    db,
+    *,
+    organisation_id: str,
+    gl_account_id: Optional[str],
+) -> Optional[float]:
+    if not gl_account_id:
+        return None
+
+    gl_lines = (
+        db.table("gl_journal_lines")
+        .select("gl_journal_id, debit_amount, credit_amount")
+        .eq("organisation_id", organisation_id)
+        .eq("account_id", gl_account_id)
+        .execute()
+        .data
+        or []
+    )
+    journal_ids = list(
+        dict.fromkeys(
+            str(line.get("gl_journal_id"))
+            for line in gl_lines
+            if line.get("gl_journal_id")
+        )
+    )
+    if not journal_ids:
+        return 0.0
+
+    opening_ids = {
+        str(journal.get("id"))
+        for journal in (
+            db.table("gl_journals")
+            .select("id")
+            .eq("organisation_id", organisation_id)
+            .eq("status", "posted")
+            .eq("source_type", "opening_balance")
+            .in_("id", journal_ids)
+            .execute()
+            .data
+            or []
+        )
+    }
+    balance = sum(
+        (
+            _money(line.get("debit_amount")) - _money(line.get("credit_amount"))
+            for line in gl_lines
+            if str(line.get("gl_journal_id")) in opening_ids
+        ),
+        ZERO,
+    )
+    return float(balance.quantize(Decimal("0.01")))
+
+
 def build_bank_balance_summary(
     db,
     *,
@@ -142,35 +204,19 @@ def build_bank_balance_summary(
     lines: list[dict[str, Any]],
     uploads: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    try:
-        result = db.rpc(
-            "get_bank_account_balance_summary",
-            {
-                "p_org_id": organisation_id,
-                "p_bank_account_id": str(account["id"]),
-            },
-        ).execute()
-        rpc_data = getattr(result, "data", result)
-        if isinstance(rpc_data, list):
-            rpc_data = rpc_data[0] if rpc_data else None
-        if isinstance(rpc_data, dict) and "tb_balance_status" in rpc_data:
-            return rpc_data
-    except Exception:
-        pass
-
     latest_upload, latest_transaction_date = select_latest_statement(uploads, lines)
     bank_balance, imported_balance = calculate_statement_balances(latest_upload, lines)
-    opening_balance = _money(account.get("opening_balance"))
+    gl_account_id = str(account.get("gl_account_id")) if account.get("gl_account_id") else None
+    coa_opening_balance = _money(posted_gl_opening_balance(
+        db,
+        organisation_id=organisation_id,
+        gl_account_id=gl_account_id,
+    ))
     if bank_balance is None:
-        fallback_bank_balance = account.get("current_reconciled_balance")
-        if fallback_bank_balance is not None:
-            bank_balance = float(_money(fallback_bank_balance))
-        else:
-            bank_balance = float(opening_balance)
+        bank_balance = float(coa_opening_balance)
     if imported_balance is None:
         movement = sum((_money(line.get("signed_amount")) for line in lines), ZERO)
-        imported_balance = float((opening_balance + movement).quantize(Decimal("0.01")))
-    gl_account_id = str(account.get("gl_account_id")) if account.get("gl_account_id") else None
+        imported_balance = float((coa_opening_balance + movement).quantize(Decimal("0.01")))
     tb_balance = posted_gl_balance(
         db,
         organisation_id=organisation_id,

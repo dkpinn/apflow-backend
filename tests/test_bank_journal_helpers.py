@@ -31,6 +31,13 @@ def test_build_journal_rows_for_line_splits_vat_on_allocation_side():
                 "gl_account_id": "bank-gl",
             },
         ],
+        "organisations": [
+            {
+                "id": ORG_ID,
+                "vat_registered": True,
+                "vat_registration_date": "2026-01-01",
+            }
+        ],
         "organisation_module_settings": [],
     })
 
@@ -39,6 +46,7 @@ def test_build_journal_rows_for_line_splits_vat_on_allocation_side():
         organisation_id=ORG_ID,
         line={
             "bank_account_id": "bank-1",
+            "line_date": "2026-06-30",
             "signed_amount": -115,
             "description": "Office supplies",
         },
@@ -54,3 +62,41 @@ def test_build_journal_rows_for_line_splits_vat_on_allocation_side():
     assert rows[2]["debit_amount"] == 15.0
     assert rows[0]["tracking"] == {"project": "admin"}
     assert rows[2]["tracking"] == {}
+
+
+def test_build_journal_rows_for_line_suppresses_vat_before_registration_date():
+    db = MemoryDB({
+        "bank_accounts": [
+            {
+                "id": "bank-1",
+                "organisation_id": ORG_ID,
+                "gl_account_id": "bank-gl",
+            },
+        ],
+        "organisations": [
+            {
+                "id": ORG_ID,
+                "vat_registered": True,
+                "vat_registration_date": "2026-07-01",
+            }
+        ],
+        "organisation_module_settings": [],
+    })
+
+    rows = build_journal_rows_for_line(
+        db,
+        organisation_id=ORG_ID,
+        line={
+            "bank_account_id": "bank-1",
+            "line_date": "2026-06-30",
+            "signed_amount": -115,
+            "description": "Office supplies",
+        },
+        gl_account_id="expense-1",
+        tracking={},
+        vat_rate=15,
+        vat_account_id="vat-control",
+    )
+
+    assert [row["account_id"] for row in rows] == ["expense-1", "bank-gl"]
+    assert rows[0]["debit_amount"] == 115.0

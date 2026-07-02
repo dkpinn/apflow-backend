@@ -15,7 +15,7 @@ class BankAccountCreate(BaseModel):
     account_number_mask: Optional[str] = None
     account_number_hash: Optional[str] = None
     gl_account_id: Optional[UUID] = None
-    opening_balance: float = 0
+    opening_balance: Optional[float] = None
     opening_balance_date: Optional[str] = None
 
 

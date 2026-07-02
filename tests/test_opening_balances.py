@@ -8,7 +8,6 @@ from app.services.opening_balances import (
     get_account_opening_balance,
     post_opening_balance,
     preview_opening_balance,
-    sync_module_account_opening_balance,
     upsert_account_opening_balance,
 )
 from tests.conftest import MemoryDB
@@ -125,6 +124,31 @@ def test_preview_opening_balance_reports_out_of_balance():
 
     assert preview["summary"]["in_balance"] is False
     assert preview["warnings"][0]["code"] == "out_of_balance"
+
+
+def test_preview_opening_balance_allows_bank_control_account_from_coa():
+    tables = _tables()
+    tables["bank_accounts"] = [{
+        "id": "bank-1",
+        "organisation_id": ORG_ID,
+        "gl_account_id": "asset-1",
+        "name": "Main Bank",
+        "active": True,
+    }]
+    db = MemoryDB(tables)
+
+    preview = preview_opening_balance(
+        db,
+        organisation_id=ORG_ID,
+        as_at_date="2026-06-30",
+        lines=[
+            {"account_id": "asset-1", "debit": "100", "credit": "0"},
+            {"account_id": "equity-1", "debit": "0", "credit": "100"},
+        ],
+    )
+
+    assert preview["summary"]["in_balance"] is True
+    assert {line["account_id"] for line in preview["lines"]} == {"asset-1", "equity-1"}
 
 
 def test_post_opening_balance_creates_posted_journal_and_lines():
@@ -297,7 +321,7 @@ def test_upsert_account_opening_balance_clears_line_and_balancing_entry():
     assert db.tables["gl_journals"][0]["total_credit"] == 0.0
 
 
-def test_upsert_account_opening_balance_blocks_bank_control_account():
+def test_upsert_account_opening_balance_allows_bank_control_account_from_coa():
     tables = _account_level_tables()
     tables["bank_accounts"] = [{
         "id": "bank-1",
@@ -309,31 +333,7 @@ def test_upsert_account_opening_balance_blocks_bank_control_account():
     }]
     db = MemoryDB(tables)
 
-    with pytest.raises(ValueError, match="bank/cash control account"):
-        upsert_account_opening_balance(
-            db,
-            organisation_id=ORG_ID,
-            account_id=ASSET_ID,
-            as_at_date="2026-06-30",
-            side="debit",
-            amount="1250",
-            user_id="user-1",
-        )
-
-
-def test_module_sync_can_update_bank_control_opening_balance():
-    tables = _account_level_tables()
-    tables["bank_accounts"] = [{
-        "id": "bank-1",
-        "organisation_id": ORG_ID,
-        "gl_account_id": ASSET_ID,
-        "name": "Main Bank",
-        "opening_balance": "500",
-        "active": True,
-    }]
-    db = MemoryDB(tables)
-
-    result = sync_module_account_opening_balance(
+    result = upsert_account_opening_balance(
         db,
         organisation_id=ORG_ID,
         account_id=ASSET_ID,
@@ -344,10 +344,35 @@ def test_module_sync_can_update_bank_control_opening_balance():
     )
 
     assert result["success"] is True
-    assert result["opening_balance"]["editable"] is False
-    assert result["opening_balance"]["protected_reason"] == "bank/cash control account"
+    assert result["opening_balance"]["editable"] is True
+    assert result["opening_balance"]["protected_reason"] is None
+    assert result["opening_balance"]["warnings"] == []
     by_account = {row["account_id"]: row for row in db.tables["gl_journal_lines"]}
     assert by_account[ASSET_ID]["debit_amount"] == 500.0
+
+
+def test_upsert_account_opening_balance_still_blocks_system_account_linked_to_bank():
+    tables = _account_level_tables()
+    tables["accounts"][0]["system_key"] = "cash_control"
+    tables["bank_accounts"] = [{
+        "id": "bank-1",
+        "organisation_id": ORG_ID,
+        "gl_account_id": ASSET_ID,
+        "name": "Main Bank",
+        "active": True,
+    }]
+    db = MemoryDB(tables)
+
+    with pytest.raises(ValueError, match="system account"):
+        upsert_account_opening_balance(
+            db,
+            organisation_id=ORG_ID,
+            account_id=ASSET_ID,
+            as_at_date="2026-06-30",
+            side="debit",
+            amount="500",
+            user_id="user-1",
+        )
 
 
 def test_upsert_account_opening_balance_blocks_retained_earnings_edit():

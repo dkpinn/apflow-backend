@@ -14,6 +14,7 @@ from app.services.organisation_module_settings import (
     required_tracking_dimensions,
     validate_bank_allocation_tracking,
 )
+from app.services.organisation_vat import vat_applicability
 
 
 def _one(res, message: str):
@@ -99,6 +100,16 @@ def build_journal_rows_for_line(
         description=(description_override or "").strip() or line.get("description") or "Bank transaction",
         tracking=tracking,
     )
+    if vat_rate and vat_account_id:
+        applicability = vat_applicability(
+            db,
+            organisation_id=organisation_id,
+            transaction_date=line.get("line_date"),
+            action="Post bank VAT",
+        )
+        if not applicability.applicable:
+            vat_rate = None
+            vat_account_id = None
     if vat_rate and vat_account_id and len(rows) >= 2:
         # rows[0] = allocation/expense side; rows[1] = bank GL side at full amount.
         alloc = rows[0]

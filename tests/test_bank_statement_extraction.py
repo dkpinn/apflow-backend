@@ -7,6 +7,7 @@ import pytest
 from openpyxl import Workbook
 
 import app.services.bank_statement_extraction as extraction
+from app.services.bank_statement_extraction import pipeline as extraction_pipeline
 import app.services.bank_statement_service as facade
 from app.services.bank_statement_extraction import vlm_parser as bank_vlm_parser
 from app.services.bank_statement_extraction.vlm_parser import (
@@ -168,6 +169,72 @@ def test_extract_statement_routes_xlsx_without_changing_response_shape():
     assert header["parser_strategy"] == "deterministic_xlsx"
     assert header["extractor_type"] == "bank_statement"
     assert len(lines) == 1
+
+
+def test_pdf_extract_uses_vlm_rescue_when_text_candidate_fails_balance(monkeypatch):
+    bad_header, bad_lines = facade.parse_csv_statement(
+        (
+            "Date,Description,Amount,Balance\n"
+            "2026-01-01,Payment,-100.00,900.00\n"
+            "2026-01-02,Shifted amount,-999.00,850.00\n"
+        ).encode(),
+        bank_account_id="bank-1",
+    )
+    bad_header["parser_strategy"] = "pdf_text_blocks"
+    good_header, good_lines = facade.parse_csv_statement(
+        (
+            "Date,Description,Amount,Balance\n"
+            "2026-01-01,Payment,-100.00,900.00\n"
+            "2026-01-02,Correct amount,-50.00,850.00\n"
+        ).encode(),
+        bank_account_id="bank-1",
+    )
+    good_header["parser_strategy"] = "vlm"
+
+    monkeypatch.setattr(extraction_pipeline, "parse_text_statement", lambda *_a, **_kw: (bad_header, bad_lines))
+    monkeypatch.setattr(extraction_pipeline, "parse_vlm_statement", lambda *_a, **_kw: (good_header, good_lines))
+
+    header, lines = extraction_pipeline.extract_statement(
+        b"pdf",
+        filename="statement.pdf",
+        mime_type="application/pdf",
+        bank_account_id="bank-1",
+    )
+
+    assert header["parser_strategy"] == "pdf_text_blocks_then_vlm"
+    assert header["pdf_rescue"]["selected"] == "vlm"
+    assert header["pdf_rescue"]["reason"] == "closing_mismatch"
+    assert [line.signed_amount for line in lines] == [facade.money("-100"), facade.money("-50")]
+
+
+def test_pdf_extract_keeps_balanced_text_candidate_without_vlm(monkeypatch):
+    header_fixture, line_fixture = facade.parse_csv_statement(
+        (
+            "Date,Description,Amount,Balance\n"
+            "2026-01-01,Payment,-100.00,900.00\n"
+            "2026-01-02,Correct amount,-50.00,850.00\n"
+        ).encode(),
+        bank_account_id="bank-1",
+    )
+    header_fixture["parser_strategy"] = "pdf_text_blocks"
+
+    monkeypatch.setattr(extraction_pipeline, "parse_text_statement", lambda *_a, **_kw: (header_fixture, line_fixture))
+    monkeypatch.setattr(
+        extraction_pipeline,
+        "parse_vlm_statement",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("VLM should not be called")),
+    )
+
+    header, lines = extraction_pipeline.extract_statement(
+        b"pdf",
+        filename="statement.pdf",
+        mime_type="application/pdf",
+        bank_account_id="bank-1",
+    )
+
+    assert header["parser_strategy"] == "pdf_text_blocks"
+    assert header["pdf_rescue"]["attempted"] is False
+    assert len(lines) == 2
 
 
 def test_vlm_json_payload_accepts_markdown_fenced_json():

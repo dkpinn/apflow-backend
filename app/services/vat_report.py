@@ -7,6 +7,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 from app.services.money import money
+from app.services.organisation_vat import vat_report_effective_period
 
 
 ZERO = Decimal("0.00")
@@ -226,6 +227,14 @@ def generate_vat_report(
     date_to: str,
 ) -> dict:
     _validate_dates(date_from, date_to)
+    original_date_from = date_from
+    effective_date_from, effective_start = vat_report_effective_period(
+        db,
+        organisation_id=organisation_id,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    date_from = effective_date_from
 
     vat_accounts = _fetch_rows(
         db.table("accounts")
@@ -341,6 +350,11 @@ def generate_vat_report(
     )
     historical_variance = ZERO
     warnings: list[dict] = []
+    if effective_start:
+        warnings.append(_warning(
+            "vat_period_trimmed_to_registration_date",
+            f"VAT reporting starts from registration date {effective_start}.",
+        ))
     exceptions: list[dict] = []
     period_rows: list[dict] = []
     invoice_vat_debits: dict[str, Decimal] = {}
@@ -536,6 +550,8 @@ def generate_vat_report(
         "organisation_id": organisation_id,
         "date_from": date_from,
         "date_to": date_to,
+        "requested_date_from": original_date_from,
+        "effective_vat_start_date": effective_start,
         "vat_control_account": vat_account,
         "summary": {
             "opening_balance": amount_out(opening_balance),

@@ -171,14 +171,18 @@ def _patch_extract_services(monkeypatch, fresh_db):
         "parser_strategy": "structured",
     }
     fake_line = {"line_date": "2024-01-05", "signed_amount": -50.0, "description": "Coffee"}
-    wrapped_lines = [{"line": fake_line, "duplicate_status": "clear"}]
+    zero_line = {"line_date": "2024-01-01", "signed_amount": 0.0, "description": "Balance brought forward"}
+    wrapped_lines = [
+        {"line": fake_line, "duplicate_status": "clear"},
+        {"line": zero_line, "duplicate_status": "clear"},
+    ]
     dup_summary = {"duplicate_status": "clear", "duplicate_line_count": 0}
     bal_summary = {"balance_status": "balanced"}
     val_result = {"can_allocate": True}
 
     monkeypatch.setattr(bu, "file_sha256", lambda _bytes: "fake-sha256")
     monkeypatch.setattr(bu, "lookup_parsing_hint", lambda *_a, **_kw: None)
-    monkeypatch.setattr(bu, "extract_statement", lambda *_a, **_kw: (header, [fake_line]))
+    monkeypatch.setattr(bu, "extract_statement", lambda *_a, **_kw: (header, [fake_line, zero_line]))
     monkeypatch.setattr(bu, "get_fresh_supabase_client", lambda: fresh_db)
     monkeypatch.setattr(bu, "detect_line_duplicates", lambda **_kw: (wrapped_lines, dup_summary))
     monkeypatch.setattr(bu, "validate_balances", lambda **_kw: bal_summary)
@@ -213,6 +217,13 @@ def test_extract_bank_upload_happy_path(monkeypatch):
     assert result["line_count"] == 1
     assert result["balance_summary"]["balance_status"] == "balanced"
     assert len(fresh_db.tables["bank_statement_lines"]) == 1
+    upload = fresh_db.tables["bank_statement_uploads"][0]
+    evidence = upload["extraction_evidence"]
+    assert evidence["raw_extracted_transaction_count"] == 2
+    assert evidence["stored_line_count"] == 1
+    assert evidence["nil_line_count"] == 1
+    assert evidence["dropped_line_count"] == 1
+    assert evidence["amount_correction"]["status"] == "skipped_insufficient_balance_data"
 
 
 def test_extract_bank_upload_500_on_extract_error(monkeypatch):

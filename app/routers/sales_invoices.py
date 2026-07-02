@@ -28,6 +28,7 @@ from app.services.sales_invoices import (
     validate_customer_line_tracking,
 )
 from app.services.protected_accounts import protected_account_ids
+from app.services.organisation_vat import vat_applicability
 
 
 router = APIRouter(prefix="/api/sales-invoices", tags=["sales-invoices"])
@@ -207,6 +208,48 @@ def _calculated_lines(payload_lines: list[SalesInvoiceLineInput]) -> dict[str, A
     )
 
 
+def _vat_gated_lines(
+    db,
+    *,
+    organisation_id: str,
+    transaction_date: date,
+    lines: list[SalesInvoiceLineInput],
+) -> list[SalesInvoiceLineInput]:
+    status = vat_applicability(
+        db,
+        organisation_id=organisation_id,
+        transaction_date=transaction_date.isoformat(),
+        action="Calculate sales invoice VAT",
+    )
+    if status.applicable:
+        return lines
+    return [
+        line.model_copy(update={"prices_include_vat": False, "vat_treatment": "exempt", "vat_rate": 0})
+        for line in lines
+    ]
+
+
+def _without_vat_line_rows(
+    db,
+    *,
+    organisation_id: str,
+    transaction_date: str | None,
+    lines: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    status = vat_applicability(
+        db,
+        organisation_id=organisation_id,
+        transaction_date=transaction_date or date.today().isoformat(),
+        action="Calculate sales invoice VAT",
+    )
+    if status.applicable:
+        return lines
+    return [
+        {**line, "prices_include_vat": False, "vat_treatment": "exempt", "vat_rate": 0}
+        for line in lines
+    ]
+
+
 def _replace_lines(
     db,
     *,
@@ -234,7 +277,13 @@ def _replace_lines(
 
 
 def _sync_totals(db, organisation_id: str, invoice_id: str) -> dict[str, Any]:
-    lines = _lines(db, organisation_id, invoice_id)
+    invoice = _invoice(db, organisation_id, invoice_id)
+    lines = _without_vat_line_rows(
+        db,
+        organisation_id=organisation_id,
+        transaction_date=invoice.get("issue_date"),
+        lines=_lines(db, organisation_id, invoice_id),
+    )
     calculated = calculate_sales_invoice(lines)
     _validate_revenue_accounts(db, organisation_id=organisation_id, lines=calculated["lines"])
     validate_customer_line_tracking(
@@ -385,11 +434,18 @@ def create_sales_invoice(payload: SalesInvoiceInput, auth: UserAuth):
     ensure_org_write(str(user_id), payload.organisation_id)
     customer = _customer(db, payload.organisation_id, payload.customer_id)
     organisation = _organisation(db, payload.organisation_id)
-    calculated = _calculated_lines(payload.lines)
+    issue_on = payload.issue_date or date.today()
+    calculated = _calculated_lines(
+        _vat_gated_lines(
+            db,
+            organisation_id=payload.organisation_id,
+            transaction_date=issue_on,
+            lines=payload.lines,
+        )
+    )
     _validate_revenue_accounts(
         db, organisation_id=payload.organisation_id, lines=calculated["lines"]
     )
-    issue_on = payload.issue_date or date.today()
     due_on = payload.due_date or default_due_date(
         issue_date=issue_on,
         customer_terms_days=customer.get("payment_terms_days"),
@@ -583,7 +639,19 @@ def update_sales_invoice(
     current = _invoice(db, payload.organisation_id, invoice_id)
     if current.get("status") != "draft":
         raise HTTPException(status_code=409, detail="Only draft sales invoices can be edited")
-    calculated = _calculated_lines(payload.lines)
+    issue_on = payload.issue_date or (
+        date.fromisoformat(str(current["issue_date"])[:10])
+        if current.get("issue_date")
+        else date.today()
+    )
+    calculated = _calculated_lines(
+        _vat_gated_lines(
+            db,
+            organisation_id=payload.organisation_id,
+            transaction_date=issue_on,
+            lines=payload.lines,
+        )
+    )
     _validate_revenue_accounts(
         db, organisation_id=payload.organisation_id, lines=calculated["lines"]
     )
@@ -636,6 +704,12 @@ def add_rebill_lines(invoice_id: str, payload: RebillRequest, auth: UserAuth):
         source_rows,
         default_revenue_account_id=payload.revenue_account_id,
         markup_percent=payload.markup_percent,
+    )
+    rebill = _without_vat_line_rows(
+        db,
+        organisation_id=payload.organisation_id,
+        transaction_date=invoice.get("issue_date"),
+        lines=rebill,
     )
     current_count = len(_lines(db, payload.organisation_id, invoice_id))
     inserts = [

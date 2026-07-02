@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from app.services.bank_statement_service import (
+    correct_amounts_from_balance,
     detect_line_duplicates,
     journal_lines_for_bank_transaction,
     line_to_insert,
@@ -103,6 +104,27 @@ def test_parse_text_statement_groups_bank_continuation_lines():
         "1/04/2024 Admin Charge Headoffice * 292.50 199 613.19",
         "See Charge Statement Detail",
     ]
+
+
+def test_correct_amounts_from_balance_returns_correction_evidence():
+    _header, lines = parse_csv_statement(
+        (
+            "Date,Description,Amount,Balance\n"
+            "2026-01-01,Opening payment,-100.00,900.00\n"
+            "2026-01-02,Model shifted amount,-999.00,850.00\n"
+        ).encode(),
+        bank_account_id="bank-1",
+    )
+
+    summary = correct_amounts_from_balance(lines, bank_account_id="bank-1")
+
+    assert summary["status"] == "applied"
+    assert summary["corrections_needed"] == 1
+    assert summary["corrections_applied"] == 1
+    assert summary["corrections"][0]["row_index"] == 1
+    assert summary["corrections"][0]["previous_amount"] == -999.0
+    assert summary["corrections"][0]["corrected_amount"] == -50.0
+    assert lines[1].signed_amount == Decimal("-50.00")
 
 
 def test_bank_cash_extractor_registry_keeps_domain_profiles_separate():

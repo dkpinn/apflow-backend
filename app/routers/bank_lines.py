@@ -23,6 +23,7 @@ from app.services.bank_statement_service import (
 )
 from app.services.sales_invoices import post_customer_receipt
 from app.services.protected_accounts import assert_manual_posting_account_allowed
+from app.services.organisation_vat import vat_applicability
 
 from app.routers.bank import (
     BulkDeleteLinesRequest,
@@ -280,6 +281,41 @@ def bulk_allocate_bank_lines(payload: BulkAllocateRequest, auth: UserAuth):
     organisation_id = str(payload.organisation_id)
     ensure_org_write(user_id, organisation_id)
     items = [item.model_dump(mode="json") for item in payload.items]
+    line_ids = [str(item["line_id"]) for item in items]
+    line_rows = (
+        db.table("bank_statement_lines")
+        .select("id, line_date")
+        .eq("organisation_id", organisation_id)
+        .in_("id", line_ids)
+        .execute()
+        .data
+        or []
+    )
+    line_dates = {str(row.get("id")): row.get("line_date") for row in line_rows if row.get("id")}
+    for item in items:
+        has_vat_allocation = any(
+            allocation.get("vat_treatment") in {"full", "blocked", "zero_rated"}
+            or float(allocation.get("vat_rate") or 0) > 0
+            for allocation in item.get("allocations", [])
+        )
+        if not has_vat_allocation:
+            continue
+        applicability = vat_applicability(
+            db,
+            organisation_id=organisation_id,
+            transaction_date=line_dates.get(str(item["line_id"])),
+            action="Post bank VAT",
+        )
+        if applicability.applicable:
+            continue
+        item["allocations"] = [
+            {
+                **allocation,
+                "vat_treatment": "exempt",
+                "vat_rate": 0,
+            }
+            for allocation in item.get("allocations", [])
+        ]
     try:
         result = db.rpc(
             "create_bank_draft_journals_atomic",

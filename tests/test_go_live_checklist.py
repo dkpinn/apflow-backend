@@ -73,7 +73,6 @@ def _ready_tables():
                 "organisation_id": "org-1",
                 "active": True,
                 "gl_account_id": "a4",
-                "opening_balance": "100.00",
             }
         ],
         "organisation_users": [
@@ -91,7 +90,14 @@ def _ready_tables():
                 "account_number": "1234",
             }
         ],
-        "gl_journals": [{"id": "journal-1", "organisation_id": "org-1", "status": "posted"}],
+        "gl_journals": [
+            {
+                "id": "journal-1",
+                "organisation_id": "org-1",
+                "status": "posted",
+                "source_type": "opening_balance",
+            }
+        ],
     }
 
 

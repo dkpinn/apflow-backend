@@ -6,6 +6,7 @@ from typing import Any, Iterable
 
 from app.services.accounting_locks import assert_accounting_period_unlocked
 from app.services.money import money
+from app.services.organisation_vat import vat_applicability
 from app.services.organisation_module_settings import (
     missing_tracking_dimensions,
     required_tracking_dimensions,
@@ -229,6 +230,25 @@ def issue_sales_invoice(
         or []
     )
     issue_date = invoice_rows[0].get("issue_date") if invoice_rows else None
+    status = vat_applicability(
+        db,
+        organisation_id=organisation_id,
+        transaction_date=issue_date or date.today().isoformat(),
+        action="Issue sales invoice VAT",
+    )
+    if not status.applicable:
+        tax_rows = (
+            db.table("sales_invoice_lines")
+            .select("tax_amount")
+            .eq("sales_invoice_id", sales_invoice_id)
+            .eq("organisation_id", organisation_id)
+            .execute()
+            .data
+            or []
+        )
+        tax_total = sum((money(row.get("tax_amount")) for row in tax_rows), Decimal("0"))
+        if tax_total:
+            raise ValueError("Sales invoice has VAT before the organisation VAT registration date")
     assert_accounting_period_unlocked(
         db,
         organisation_id=organisation_id,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
 
@@ -41,15 +40,6 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _money(value: Any) -> Decimal:
-    if value in (None, ""):
-        return Decimal("0")
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return Decimal("0")
-
-
 def _item(
     item_id: str,
     label: str,
@@ -81,7 +71,7 @@ def _readiness_label(percent: int, blocking_count: int) -> str:
 def generate_go_live_checklist(db, *, organisation_id: str) -> dict[str, Any]:
     organisation = _organisation(db, organisation_id) or {}
     accounts = _rows(db, "accounts", organisation_id, "id, active, is_system, system_key")
-    bank_accounts = _rows(db, "bank_accounts", organisation_id, "id, active, gl_account_id, opening_balance")
+    bank_accounts = _rows(db, "bank_accounts", organisation_id, "id, active, gl_account_id")
     users = _rows(db, "organisation_users", organisation_id, "id, role, status")
     tracking_dimensions = _rows(db, "tracking_dimensions", organisation_id, "id, active")
     suppliers = _rows(db, "suppliers", organisation_id, "id, active")
@@ -93,7 +83,7 @@ def generate_go_live_checklist(db, *, organisation_id: str) -> dict[str, Any]:
         organisation_id,
         "logo_storage_path, bank_name, account_holder, account_number, primary_color",
     )
-    posted_journals = _rows(db, "gl_journals", organisation_id, "id, status")
+    posted_journals = _rows(db, "gl_journals", organisation_id, "id, status, source_type")
 
     org_has_core = bool(
         _text(organisation.get("name"))
@@ -133,7 +123,11 @@ def generate_go_live_checklist(db, *, organisation_id: str) -> dict[str, Any]:
         )
     )
     has_tax_identity = bool(_text(organisation.get("vat_number")) or _text(organisation.get("tax_number")))
-    has_opening_balance_signal = any(_money(row.get("opening_balance")) != 0 for row in active_bank_accounts)
+    has_opening_balance_signal = any(
+        _status(row.get("status")) == "posted"
+        and _status(row.get("source_type")) == "opening_balance"
+        for row in posted_journals
+    )
     has_posted_journal = any(_status(row.get("status")) == "posted" for row in posted_journals)
 
     items = [
@@ -212,13 +206,13 @@ def generate_go_live_checklist(db, *, organisation_id: str) -> dict[str, Any]:
         _item(
             "opening_balances",
             "Opening balances",
-            "complete" if has_opening_balance_signal or has_posted_journal else "attention",
+            "complete" if has_opening_balance_signal else "attention",
             False,
-            "/bank",
+            "/settings",
             (
-                "Opening balance or posted journal activity detected."
-                if has_opening_balance_signal or has_posted_journal
-                else "Capture opening bank balances or opening journals before relying on reports."
+                "Posted COA opening-balance journal detected."
+                if has_opening_balance_signal
+                else "Capture opening balances in Chart of Accounts before relying on opening reports."
             ),
         ),
         _item(

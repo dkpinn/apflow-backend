@@ -44,7 +44,7 @@ def correct_amounts_from_balance(
     lines: list[ParsedBankLine],
     *,
     bank_account_id: str,
-) -> list[ParsedBankLine]:
+) -> dict[str, Any]:
     """Fix amounts that a VLM misread by recomputing them from the running balance.
 
     If balance[n] - balance[n-1] disagrees with signed_amount by more than
@@ -55,14 +55,24 @@ def correct_amounts_from_balance(
     (if more than half need correcting the balance column itself was likely
     misread, and applying corrections would corrupt good amounts).
     """
+    summary: dict[str, Any] = {
+        "status": "no_lines",
+        "line_count": len(lines),
+        "lines_with_balance": 0,
+        "corrections_needed": 0,
+        "corrections_applied": 0,
+        "corrections": [],
+    }
     if not lines:
-        return lines
+        return summary
 
     # Require at least 60% of lines to have a balance before trusting it.
     lines_with_balance = sum(1 for ln in lines if _line_value(ln, "balance_amount") is not None)
+    summary["lines_with_balance"] = lines_with_balance
     if lines_with_balance < max(2, len(lines) * 0.6):
         logger.debug("[BALANCE-CORRECT] Skipping: only %d/%d lines have balance_amount", lines_with_balance, len(lines))
-        return lines
+        summary["status"] = "skipped_insufficient_balance_data"
+        return summary
 
     # Dry-run: count how many corrections would be applied.
     previous_balance: Optional[Decimal] = None
@@ -75,6 +85,7 @@ def correct_amounts_from_balance(
                 corrections_needed += 1
         if balance_amount is not None:
             previous_balance = balance_amount
+    summary["corrections_needed"] = corrections_needed
 
     # If more than half the lines need "correction" the balance column is suspect.
     if corrections_needed > lines_with_balance * 0.5:
@@ -82,15 +93,26 @@ def correct_amounts_from_balance(
             "[BALANCE-CORRECT] Skipping: %d/%d lines would be corrected — balance column likely misread",
             corrections_needed, lines_with_balance,
         )
-        return lines
+        summary["status"] = "skipped_untrusted_balance_column"
+        return summary
 
     # Apply corrections.
     previous_balance = None
-    for line in lines:
+    for row_index, line in enumerate(lines):
         balance_amount = _line_value(line, "balance_amount")
         if balance_amount is not None and previous_balance is not None:
             expected = money(balance_amount) - money(previous_balance)
-            if abs(expected - _line_value(line, "signed_amount", MONEY_ZERO)) > Decimal("0.01"):
+            current_amount = _line_value(line, "signed_amount", MONEY_ZERO)
+            if abs(expected - current_amount) > Decimal("0.01"):
+                correction = {
+                    "row_index": row_index,
+                    "date": _line_value(line, "line_date"),
+                    "description": (_line_value(line, "description", "") or "")[:80],
+                    "previous_amount": dec_to_float(money(current_amount)),
+                    "corrected_amount": dec_to_float(expected),
+                    "previous_balance": dec_to_float(money(previous_balance)),
+                    "balance": dec_to_float(money(balance_amount)),
+                }
                 if isinstance(line, dict):
                     line["signed_amount"] = expected
                     line["debit_amount"] = abs(expected) if expected < MONEY_ZERO else MONEY_ZERO
@@ -104,24 +126,27 @@ def correct_amounts_from_balance(
                         bank_reference=line.get("bank_reference"),
                         description=line.get("description"),
                     )
-                    continue
-                line.signed_amount = expected
-                line.debit_amount = abs(expected) if expected < MONEY_ZERO else MONEY_ZERO
-                line.credit_amount = expected if expected >= MONEY_ZERO else MONEY_ZERO
-                line.transaction_hash = transaction_fingerprint(
-                    bank_account_id=bank_account_id,
-                    line_date=line.line_date,
-                    amount=line.signed_amount,
-                    reference=line.reference,
-                    counterparty=line.counterparty,
-                    bank_reference=line.bank_reference,
-                    description=line.description,
-                )
+                else:
+                    line.signed_amount = expected
+                    line.debit_amount = abs(expected) if expected < MONEY_ZERO else MONEY_ZERO
+                    line.credit_amount = expected if expected >= MONEY_ZERO else MONEY_ZERO
+                    line.transaction_hash = transaction_fingerprint(
+                        bank_account_id=bank_account_id,
+                        line_date=line.line_date,
+                        amount=line.signed_amount,
+                        reference=line.reference,
+                        counterparty=line.counterparty,
+                        bank_reference=line.bank_reference,
+                        description=line.description,
+                    )
+                summary["corrections"].append(correction)
+                summary["corrections_applied"] += 1
         if balance_amount is not None:
             previous_balance = balance_amount
     if corrections_needed:
         logger.debug("[BALANCE-CORRECT] Applied %d corrections from running balance", corrections_needed)
-    return lines
+    summary["status"] = "applied" if summary["corrections_applied"] else "no_corrections"
+    return summary
 
 
 def detect_line_duplicates(

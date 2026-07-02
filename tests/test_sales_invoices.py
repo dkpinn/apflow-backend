@@ -112,7 +112,14 @@ class _Rpc:
 
 class _DB:
     def __init__(self, tables=None, rpc_results=None):
-        self.tables = tables or {}
+        self.tables = {
+            "organisations": [{
+                "id": "org-1",
+                "vat_registered": True,
+                "vat_registration_date": "2026-01-01",
+            }],
+            **(tables or {}),
+        }
         self.rpc_results = rpc_results or {}
         self.calls = []
 
@@ -242,6 +249,40 @@ def test_issue_and_receipt_services_use_atomic_rpcs():
         "issue_sales_invoice_atomic",
         "post_customer_receipt_atomic",
     ]
+
+
+def test_issue_sales_invoice_blocks_stale_vat_before_registration_date():
+    db = _DB(
+        {
+            "organisations": [{
+                "id": "org-1",
+                "vat_registered": True,
+                "vat_registration_date": "2026-07-01",
+            }],
+            "sales_invoices": [{
+                "id": "sales-1",
+                "organisation_id": "org-1",
+                "issue_date": "2026-06-30",
+            }],
+            "sales_invoice_lines": [{
+                "id": "line-1",
+                "sales_invoice_id": "sales-1",
+                "organisation_id": "org-1",
+                "tax_amount": 15,
+            }],
+        },
+        rpc_results={"issue_sales_invoice_atomic": {"journal_id": "journal-1"}},
+    )
+
+    with pytest.raises(ValueError, match="VAT before"):
+        issue_sales_invoice(
+            db,
+            organisation_id="org-1",
+            sales_invoice_id="sales-1",
+            actor_user_id="user-1",
+        )
+
+    assert db.calls == []
 
 
 def test_sales_invoice_issue_and_receipt_respect_accounting_lock_date():

@@ -76,6 +76,11 @@ class _ResultQuery:
 
 def _tables(*, tracking_enabled=False, line_tracking=None, allocations=None):
     return {
+        "organisations": [{
+            "id": "org-1",
+            "vat_registered": True,
+            "vat_registration_date": "2026-01-01",
+        }],
         "invoices_extracted": [{
             "id": "invoice-1",
             "organisation_id": "org-1",
@@ -152,6 +157,25 @@ def test_prepared_journal_is_the_complete_vat_aware_posting_preview():
         "vat-id",
         "payable-id",
     ]
+
+
+def test_supplier_invoice_vat_is_expensed_before_vat_registration_date():
+    tables = _tables()
+    tables["organisations"][0]["vat_registration_date"] = "2026-07-01"
+
+    prepared = prepare_invoice_gl_posting(
+        _DB(tables),
+        invoice_id="invoice-1",
+        org_id="org-1",
+    )
+
+    assert [line["account_id"] for line in prepared["journal_lines"]] == [
+        "expense-id",
+        "payable-id",
+    ]
+    assert prepared["journal_lines"][0]["debit_amount"] == 115.0
+    assert prepared["total_debit"] == 115
+    assert prepared["vat_control_account"] is None
 
 
 def test_preparation_enforces_tracking_and_balanced_allocations():

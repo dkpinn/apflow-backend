@@ -76,6 +76,13 @@ class _DB:
 
 def _tables():
     return {
+        "organisations": [
+            {
+                "id": "org-1",
+                "vat_registered": True,
+                "vat_registration_date": "2026-01-01",
+            }
+        ],
         "accounts": [
             {
                 "id": "vat-control",

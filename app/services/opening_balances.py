@@ -7,7 +7,7 @@ from typing import Any
 from app.services.accounting_locks import assert_accounting_period_unlocked, parse_accounting_date
 from app.services.bank_statement_service import new_uuid
 from app.services.money import money
-from app.services.protected_accounts import assert_manual_posting_account_allowed, protected_account_reason
+from app.services.protected_accounts import protected_account_reason
 
 
 MONEY = Decimal("0.01")
@@ -110,7 +110,7 @@ def preview_opening_balance(
             account_id=line.get("account_id"),
             account_code=line.get("account_code") or line.get("code"),
         )
-        reason = protected_account_reason(
+        reason = _opening_balance_protected_reason(
             db,
             organisation_id=organisation_id,
             account_id=str(account.get("id")),
@@ -235,42 +235,39 @@ def _opening_line_for_account(
     return matches[0] if matches else None
 
 
-def _bank_opening_warnings(
+def _opening_balance_protected_reason(
     db,
     *,
     organisation_id: str,
     account_id: str,
-    account_type: str,
-    debit: Decimal,
-    credit: Decimal,
-) -> list[dict[str, Any]]:
+) -> str | None:
     try:
         rows = (
-            db.table("bank_accounts")
-            .select("id, name, opening_balance, active")
+            db.table("accounts")
+            .select("id, is_system, system_key, managed_asset_type_id, asset_account_role")
             .eq("organisation_id", organisation_id)
-            .eq("gl_account_id", account_id)
+            .eq("id", account_id)
+            .limit(1)
             .execute()
             .data
             or []
         )
     except Exception:
-        return []
+        rows = []
+    account = rows[0] if rows else {}
+    if account.get("is_system") is True or account.get("system_key"):
+        return "system account"
+    if account.get("managed_asset_type_id") or account.get("asset_account_role"):
+        return "module-controlled account"
 
-    warnings: list[dict[str, Any]] = []
-    gl_opening = _normal_amount(account_type, debit, credit)
-    for row in rows:
-        bank_opening = _amount(row.get("opening_balance") or 0)
-        if bank_opening and bank_opening != gl_opening:
-            warnings.append({
-                "code": "bank_opening_balance_mismatch",
-                "message": f"{row.get('name') or 'Linked bank account'} has a module opening balance that differs from this GL opening balance.",
-                "bank_account_id": row.get("id"),
-                "bank_account_name": row.get("name"),
-                "module_opening_balance": _out(bank_opening),
-                "gl_opening_balance": _out(gl_opening),
-            })
-    return warnings
+    reason = protected_account_reason(
+        db,
+        organisation_id=organisation_id,
+        account_id=account_id,
+    )
+    if reason == "bank/cash control account":
+        return None
+    return reason
 
 
 def get_account_opening_balance(
@@ -285,7 +282,7 @@ def get_account_opening_balance(
     account = _resolve_account(accounts_by_id, account_id=account_id, account_code=None)
     retained = _retained_earnings_account(accounts_by_id)
     is_retained = str(account.get("id")) == str(retained.get("id"))
-    protected_reason = protected_account_reason(
+    protected_reason = _opening_balance_protected_reason(
         db,
         organisation_id=organisation_id,
         account_id=str(account.get("id")),
@@ -315,14 +312,6 @@ def get_account_opening_balance(
 
     side, amount = _side_amount(debit, credit)
     normal_amount = _normal_amount(str(account.get("type") or "other"), debit, credit)
-    warnings = [] if is_retained else _bank_opening_warnings(
-        db,
-        organisation_id=organisation_id,
-        account_id=str(account["id"]),
-        account_type=str(account.get("type") or "other"),
-        debit=debit,
-        credit=credit,
-    )
 
     return {
         "organisation_id": organisation_id,
@@ -351,7 +340,7 @@ def get_account_opening_balance(
         "normal_amount": _out(normal_amount),
         "debit_amount": _out(debit),
         "credit_amount": _out(credit),
-        "warnings": warnings,
+        "warnings": [],
     }
 
 
@@ -409,12 +398,13 @@ def upsert_account_opening_balance(
     if str(account["id"]) == str(retained["id"]):
         raise ValueError("Retained earnings is calculated from the other opening balances and cannot be edited here")
     if not allow_protected:
-        assert_manual_posting_account_allowed(
+        reason = _opening_balance_protected_reason(
             db,
             organisation_id=organisation_id,
             account_id=str(account["id"]),
-            action="Update opening balance",
         )
+        if reason:
+            raise ValueError(f"Update opening balance cannot use a {reason}")
     if account.get("active") is False and amount_dec:
         raise ValueError("Inactive accounts cannot be given an opening balance")
 
@@ -596,30 +586,6 @@ def upsert_account_opening_balance(
             as_at_date=parsed_date,
         ),
     }
-
-
-def sync_module_account_opening_balance(
-    db,
-    *,
-    organisation_id: str,
-    account_id: str,
-    as_at_date: str,
-    side: str,
-    amount: Any,
-    user_id: str,
-    description: str | None = None,
-) -> dict[str, Any]:
-    return upsert_account_opening_balance(
-        db,
-        organisation_id=organisation_id,
-        account_id=account_id,
-        as_at_date=as_at_date,
-        side=side,
-        amount=amount,
-        user_id=user_id,
-        description=description,
-        allow_protected=True,
-    )
 
 
 def post_opening_balance(

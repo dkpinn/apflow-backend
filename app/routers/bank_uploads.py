@@ -164,7 +164,7 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             account_type=account.get("account_type"),
             parsing_hint=parsing_hint,
         )
-        correct_amounts_from_balance(lines, bank_account_id=account["id"])
+        correction_summary = correct_amounts_from_balance(lines, bank_account_id=account["id"])
         running_balance_result = validate_running_balance(lines, header)
         if running_balance_result["balance_walk_mismatches"]:
             logger.warning(
@@ -199,11 +199,16 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             1 for w in line_wrappers
             if w["duplicate_status"] == "clear" and _line_signed_amount(w["line"]) == 0
         )
+        duplicate_line_count = int(duplicate_summary.get("duplicate_line_count", 0) or 0)
+        raw_extracted_transaction_count = len(lines)
         clearable = [
             w for w in line_wrappers
             if w["duplicate_status"] == "clear" and _line_signed_amount(w["line"]) != 0
         ]
+        stored_line_count = len(clearable)
         duplicate_summary["nil_line_count"] = nil_line_count
+        duplicate_summary["raw_extracted_transaction_count"] = raw_extracted_transaction_count
+        duplicate_summary["stored_line_count"] = stored_line_count
 
         db.table("bank_statement_lines").delete().eq("bank_statement_upload_id", upload_id).execute()
         inserts = [
@@ -226,8 +231,8 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             "statement_period_to": header.get("statement_period_to"),
             "opening_balance": header.get("opening_balance"),
             "closing_balance": closing,
-            "extracted_line_count": len(inserts),
-            "duplicate_line_count": duplicate_summary.get("duplicate_line_count", 0),
+            "extracted_line_count": stored_line_count,
+            "duplicate_line_count": duplicate_line_count,
             "duplicate_status": duplicate_summary.get("duplicate_status", "clear"),
             "balance_status": balance_summary["balance_status"],
             "confidence_score": header.get("confidence_score"),
@@ -243,10 +248,17 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
                 "extractor_version": header.get("extractor_version"),
                 "source_format": header.get("source_format"),
                 "parser_strategy": header.get("parser_strategy"),
-                "line_count": len(inserts),
+                "line_count": stored_line_count,
+                "raw_extracted_transaction_count": raw_extracted_transaction_count,
+                "stored_line_count": stored_line_count,
+                "nil_line_count": nil_line_count,
+                "duplicate_line_count": duplicate_line_count,
+                "dropped_line_count": raw_extracted_transaction_count - stored_line_count,
                 "warnings": header.get("extraction_warnings") or [],
                 "validation": validation_result,
                 "running_balance": running_balance_result,
+                "amount_correction": correction_summary,
+                "pdf_rescue": header.get("pdf_rescue"),
             },
             "extraction_status": "extracted" if validation_result["can_allocate"] else "needs_review",
             "extracted_at": now_iso(),

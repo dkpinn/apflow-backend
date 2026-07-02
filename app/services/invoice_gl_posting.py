@@ -8,6 +8,7 @@ from app.services.organisation_module_settings import (
     validate_supplier_allocations_tracking,
 )
 from app.services.protected_accounts import protected_account_ids
+from app.services.organisation_vat import vat_applicability
 from app.services.vat_report import allocate_amount_by_weights, allocate_invoice_vat
 
 
@@ -261,6 +262,12 @@ def prepare_invoice_gl_posting(
     sys_accts = {row["system_key"]: row for row in all_accts if row.get("system_key")}
     trade_payables = sys_accts.get("trade_payables")
     vat_control = sys_accts.get("vat_control")
+    vat_status = vat_applicability(
+        supabase,
+        organisation_id=org_id,
+        transaction_date=invoice.get("invoice_date"),
+        action="Post supplier invoice VAT",
+    )
 
     if not trade_payables:
         raise ValueError(
@@ -295,8 +302,8 @@ def prepare_invoice_gl_posting(
         invoice=invoice,
         line_items=line_items,
         allocations_by_line=allocations_by_line,
-        supplier_has_vat_number=bool(str(supplier_vat_number or "").strip()),
-        vat_control_account_id=str(vat_control["id"]) if vat_control else None,
+        supplier_has_vat_number=vat_status.applicable and bool(str(supplier_vat_number or "").strip()),
+        vat_control_account_id=str(vat_control["id"]) if vat_status.applicable and vat_control else None,
     )
     journal_lines = posting["journal_lines"]
     missing_accounts = posting["missing_accounts"]
@@ -339,7 +346,7 @@ def prepare_invoice_gl_posting(
         "total_debit": total_debit,
         "total_credit": total_debit,
         "trade_payables_account": trade_payables.get("code"),
-        "vat_control_account": vat_control.get("code") if vat_control else None,
+        "vat_control_account": vat_control.get("code") if vat_status.applicable and vat_control else None,
     }
 
 

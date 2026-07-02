@@ -214,13 +214,29 @@ class _Rpc:
 
 
 class _RpcDB:
-    def __init__(self, rpc_result=None, rpc_error=None):
+    def __init__(self, rpc_result=None, rpc_error=None, tables=None):
         self.rpc_result = rpc_result or []
         self.rpc_error = rpc_error
         self.rpc_calls = []
+        self.tables = {
+            "organisations": [{
+                "id": "22222222-2222-2222-2222-222222222222",
+                "vat_registered": True,
+                "vat_registration_date": "2026-01-01",
+            }],
+            "bank_statement_lines": [{
+                "id": "33333333-3333-3333-3333-333333333333",
+                "organisation_id": "22222222-2222-2222-2222-222222222222",
+                "line_date": "2026-06-30",
+            }],
+            **(tables or {}),
+        }
 
     def rpc(self, name, params):
         return _Rpc(self, name, params)
+
+    def table(self, name):
+        return _Query(self.tables.get(name, []))
 
 
 def _patch_write_auth(monkeypatch, db):
@@ -333,6 +349,20 @@ def test_c19_migration_contains_atomic_guards_and_draft_cleanup():
     assert "journal.status = 'draft'" in migration
     assert "refresh_bank_account_statement_state" in migration
     assert "get_bank_account_balance_summary" in migration
+
+
+def test_latest_statement_summary_rpc_uses_valid_closing_balance():
+    migration = (
+            Path(__file__).parents[1]
+            / "app"
+            / "db"
+            / "20260702_bank_balance_summary_latest_valid_statement.sql"
+        ).read_text(encoding="utf-8")
+
+    assert "u.extraction_status = 'extracted'" in migration
+    assert "u.closing_balance IS NOT NULL" in migration
+    assert "latest_upload.balance_status = 'balanced'" in migration
+    assert "THEN latest_upload.closing_balance" in migration
 
 
 def test_skip_is_audited_without_changing_review_status(monkeypatch):
