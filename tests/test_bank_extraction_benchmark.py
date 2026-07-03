@@ -12,6 +12,7 @@ from tests.conftest import MemoryDB
 
 ORG_ID = "00000000-0000-0000-0000-000000000001"
 GOLD_ID = "00000000-0000-0000-0000-000000000002"
+UPLOAD_ID = "00000000-0000-0000-0000-000000000003"
 AUTH = ("user-1", None)
 
 
@@ -79,7 +80,10 @@ def _line():
 
 def test_run_org_gold_file_benchmark_downloads_source_and_saves_run(monkeypatch):
     db = _MemoryDBWithStorage({
-        "bank_statement_gold_files": [_gold_file()],
+        "bank_statement_gold_files": [_gold_file(gold_json={
+            **_gold_file()["gold_json"],
+            "_apflow_source_upload_id": UPLOAD_ID,
+        })],
         "bank_statement_extraction_runs": [],
     })
     monkeypatch.setattr(beb, "_auth", lambda _: ("user-1", db))
@@ -105,6 +109,7 @@ def test_run_org_gold_file_benchmark_downloads_source_and_saves_run(monkeypatch)
     assert result["validation_result"]["can_allocate"] is True
     run = db.tables["bank_statement_extraction_runs"][0]
     assert run["organisation_id"] == ORG_ID
+    assert run["bank_statement_upload_id"] == UPLOAD_ID
     assert run["document_id"] == "bad-import"
     assert run["expected_transaction_count"] == 1
     assert run["extracted_transaction_count"] == 1

@@ -27,6 +27,9 @@ class _Query:
         self._limit = value
         return self
 
+    def order(self, *_args, **_kwargs):
+        return self
+
     def execute(self):
         rows = self.rows
         for field, value in self.filters:
@@ -70,8 +73,35 @@ def _tables():
                 "organisation_id": "org-1",
                 "extraction_status": "failed",
                 "original_filename": "june.pdf",
+            },
+            {
+                "id": "upload-bad-benchmark",
+                "organisation_id": "org-1",
+                "extraction_status": "extracted",
+                "original_filename": "corrected.pdf",
             }
         ],
+        "bank_statement_gold_files": [
+            {
+                "id": "gold-1",
+                "organisation_id": "org-1",
+                "document_id": "corrected-fixture",
+                "gold_json": {
+                    "_apflow_source_upload_id": "upload-bad-benchmark",
+                    "transactions": [{"transaction_index": 1}],
+                },
+            }
+        ],
+        "bank_statement_extraction_runs": [
+            {
+                "organisation_id": "org-1",
+                "bank_statement_upload_id": "upload-bad-benchmark",
+                "document_id": "corrected-fixture",
+                "can_allocate": False,
+                "created_at": "2026-06-24T10:00:00",
+            }
+        ],
+        "bank_audit_events": [],
         "invoices_extracted": [
             {
                 "id": "supplier-review",
@@ -146,6 +176,7 @@ def test_command_centre_counts_operational_queues_and_health_score():
     assert report["summary"]["pending_approvals"] == 1
     assert report["summary"]["draft_journals"] == 1
     assert report["summary"]["failed_extractions"] == 1
+    assert report["summary"]["bank_extraction_benchmark_exceptions"] == 1
     assert report["summary"]["missing_bank_mappings"] == 1
     assert report["summary"]["overdue_receivables_amount"] == 230.0
     assert report["summary"]["overdue_supplier_bill_amount"] == 115.0
@@ -153,6 +184,7 @@ def test_command_centre_counts_operational_queues_and_health_score():
     queue_counts = {queue["id"]: queue["count"] for queue in report["queues"]}
     assert queue_counts["unreconciled_bank"] == 1
     assert queue_counts["failed_extractions"] == 1
+    assert queue_counts["bank_extraction_benchmarks"] == 1
 
 
 def test_command_centre_route_uses_org_read_permission(monkeypatch):

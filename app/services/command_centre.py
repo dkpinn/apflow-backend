@@ -4,6 +4,8 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from app.services.bank.extraction_gate import corrected_fixture_benchmark_blockers
+
 
 def _rows(db, table: str, organisation_id: str, select: str = "*") -> list[dict[str, Any]]:
     return (
@@ -103,6 +105,27 @@ def _health_label(score: int) -> str:
     return "Critical"
 
 
+def _bank_uploads_with_benchmark_issues(
+    db,
+    *,
+    organisation_id: str,
+    bank_uploads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    for upload in bank_uploads:
+        upload_id = str(upload.get("id") or "")
+        if not upload_id:
+            continue
+        blockers = corrected_fixture_benchmark_blockers(
+            db,
+            organisation_id=organisation_id,
+            upload_id=upload_id,
+        )
+        if blockers:
+            issues.append({**upload, "benchmark_blockers": blockers})
+    return issues
+
+
 def generate_command_centre(
     db,
     *,
@@ -187,6 +210,11 @@ def generate_command_centre(
     failed_extractions = [
         row for row in bank_uploads if _status(row.get("extraction_status")) in {"failed", "needs_review"}
     ]
+    benchmark_exceptions = _bank_uploads_with_benchmark_issues(
+        db,
+        organisation_id=organisation_id,
+        bank_uploads=bank_uploads,
+    )
     missing_bank_mappings = [
         row for row in bank_accounts if row.get("active") is not False and not row.get("gl_account_id")
     ]
@@ -249,6 +277,14 @@ def generate_command_centre(
             "Bank uploads that failed extraction or need extraction review.",
         ),
         _queue(
+            "bank_extraction_benchmarks",
+            "Bank extraction benchmark exceptions",
+            len(benchmark_exceptions),
+            "critical" if benchmark_exceptions else "info",
+            "/bank",
+            "Corrected bank statement fixtures that are missing or failing parser benchmarks.",
+        ),
+        _queue(
             "missing_bank_mappings",
             "Missing bank GL mappings",
             len(missing_bank_mappings),
@@ -266,6 +302,7 @@ def generate_command_centre(
     score -= _deduct(len(pending_approvals), 2, 12)
     score -= _deduct(len(draft_journal_rows), 2, 12)
     score -= _deduct(len(failed_extractions), 6, 18)
+    score -= _deduct(len(benchmark_exceptions), 8, 24)
     score -= _deduct(len(missing_bank_mappings), 4, 16)
     if oldest_bank_age_days > 30:
         score -= 10
@@ -293,6 +330,7 @@ def generate_command_centre(
             "pending_approvals": len(pending_approvals),
             "draft_journals": len(draft_journal_rows),
             "failed_extractions": len(failed_extractions),
+            "bank_extraction_benchmark_exceptions": len(benchmark_exceptions),
             "missing_bank_mappings": len(missing_bank_mappings),
             "overdue_receivables_amount": float(overdue_receivables_amount),
             "overdue_supplier_bill_amount": float(overdue_supplier_bill_amount),

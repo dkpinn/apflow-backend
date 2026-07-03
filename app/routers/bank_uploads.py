@@ -17,6 +17,7 @@ from app.db.supabase_client import get_fresh_supabase_client
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
 from app.schemas.bank import ApproveExtractionRequest, CreateGoldFileFromUploadRequest
 from app.services.bank_extraction_validation import validate_extracted_statement_quality
+from app.services.bank.extraction_gate import corrected_fixture_benchmark_blockers
 from app.services.bank_statement_service import (
     correct_amounts_from_balance,
     detect_line_duplicates,
@@ -220,7 +221,7 @@ def create_bank_upload(payload: BankUploadCreate, auth: UserAuth):
     return {"success": True, "upload": upload}
 
 
-def _approval_blockers(upload: dict) -> list[str]:
+def _approval_blockers(upload: dict, db=None) -> list[str]:
     blockers: list[str] = []
     evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
     validation = evidence.get("validation") if isinstance(evidence.get("validation"), dict) else {}
@@ -249,6 +250,14 @@ def _approval_blockers(upload: dict) -> list[str]:
     )
     if duplicate_count:
         blockers.append("Duplicate transaction rows are still present")
+    if db is not None:
+        blockers.extend(
+            corrected_fixture_benchmark_blockers(
+                db,
+                organisation_id=str(upload.get("organisation_id")),
+                upload_id=str(upload.get("id")),
+            )
+        )
     return blockers
 
 
@@ -289,7 +298,7 @@ def approve_bank_upload_extraction(upload_id: str, payload: ApproveExtractionReq
             detail="Bank statement extraction must be approved by a different reviewer",
         )
 
-    blockers = _approval_blockers(upload) + _attestation_blockers(payload)
+    blockers = _approval_blockers(upload, db) + _attestation_blockers(payload)
     if blockers:
         raise HTTPException(status_code=400, detail={"message": "Bank statement extraction cannot be approved", "blockers": blockers})
 
@@ -388,7 +397,7 @@ def get_bank_upload_extraction_review(upload_id: str, organisation_id: str, auth
         },
         "review_snapshot": review_snapshot,
         "stored_lines": stored_lines,
-        "approval_blockers": _approval_blockers(upload),
+        "approval_blockers": _approval_blockers(upload, db),
     }
 
 
@@ -458,10 +467,12 @@ def create_bank_upload_gold_file(
         .execute(),
         "Bank account not found",
     )
-    gold_json = payload.gold_json
+    gold_json = dict(payload.gold_json)
     transactions = gold_json.get("transactions") if isinstance(gold_json, dict) else None
     if not isinstance(transactions, list) or not transactions:
         raise HTTPException(status_code=400, detail="Corrected gold JSON must contain transactions")
+    gold_json["_apflow_source_upload_id"] = upload_id
+    gold_json["_apflow_source_bank_account_id"] = upload.get("bank_account_id")
 
     row = {
         "organisation_id": organisation_id,

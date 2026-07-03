@@ -125,6 +125,17 @@ def test_account_unreconciled_endpoint_filters_org_account_status_and_enriches_u
                     "review_status": "pending",
                 },
                 {
+                    "id": "blocked-upload",
+                    "organisation_id": "org-1",
+                    "bank_account_id": "bank-1",
+                    "bank_statement_upload_id": "upload-needs-review",
+                    "line_date": "2024-04-03",
+                    "source_row_index": 0,
+                    "posting_status": "unposted",
+                    "allocation_status": "unallocated",
+                    "review_status": "pending",
+                },
+                {
                     "id": "other-account",
                     "organisation_id": "org-1",
                     "bank_account_id": "bank-2",
@@ -142,9 +153,13 @@ def test_account_unreconciled_endpoint_filters_org_account_status_and_enriches_u
                 },
             ],
             "bank_statement_uploads": [
-                {"id": "upload-1", "organisation_id": "org-1", "bank_account_id": "bank-1", "original_filename": "april.pdf", "uploaded_at": "2026-05-31T12:00:00Z"},
-                {"id": "upload-2", "organisation_id": "org-1", "bank_account_id": "bank-1", "original_filename": "may.pdf", "uploaded_at": "2026-05-31T13:00:00Z"},
+                {"id": "upload-1", "organisation_id": "org-1", "bank_account_id": "bank-1", "original_filename": "april.pdf", "uploaded_at": "2026-05-31T12:00:00Z", "extraction_status": "extracted"},
+                {"id": "upload-2", "organisation_id": "org-1", "bank_account_id": "bank-1", "original_filename": "may.pdf", "uploaded_at": "2026-05-31T13:00:00Z", "extraction_status": "extracted"},
+                {"id": "upload-needs-review", "organisation_id": "org-1", "bank_account_id": "bank-1", "original_filename": "bad.pdf", "uploaded_at": "2026-05-31T14:00:00Z", "extraction_status": "needs_review"},
             ],
+            "bank_statement_gold_files": [],
+            "bank_statement_extraction_runs": [],
+            "bank_audit_events": [],
             "bank_transaction_suggestions": [
                 {
                     "id": "suggestion-low",
@@ -182,6 +197,8 @@ def test_account_unreconciled_endpoint_filters_org_account_status_and_enriches_u
     assert result["lines"][1]["recon_confidence"] == 0.96
     assert result["lines"][1]["recon_suggested_account_id"] == "account-high"
     assert result["lines"][1]["recon_suggested_tax"] == "full"
+    assert result["blocked_extraction_line_count"] == 1
+    assert result["blocked_extraction_upload_count"] == 1
 
 
 def test_account_unreconciled_endpoint_rejects_account_from_other_org(monkeypatch):
@@ -478,3 +495,30 @@ def test_c21_bulk_draft_migration_enforces_atomic_accounting_guards():
     assert "account.system_key = 'vat_control'" in migration
     assert "Generated journal for bank statement line % is not balanced" in migration
     assert "REVOKE ALL ON FUNCTION" in migration
+
+
+def test_bank_transaction_journal_extraction_gate_migration_blocks_unverified_sources():
+    repo_root = Path(__file__).resolve().parents[1]
+    migration_path = repo_root / "app" / "db" / "20260703_bank_transaction_journal_extraction_gate.sql"
+    if not migration_path.exists():
+        migration_path = (
+            repo_root
+            / "app"
+            / "db"
+            / "applied"
+            / "20260703_bank_transaction_journal_extraction_gate.sql"
+        )
+    migration = migration_path.read_text(encoding="utf-8")
+
+    assert "bank_upload_corrected_fixture_blockers" in migration
+    assert "prevent_unverified_bank_transaction_journal" in migration
+    assert "BEFORE INSERT OR UPDATE OF status, source_type, source_id" in migration
+    assert "NEW.source_type IS DISTINCT FROM 'bank_transaction'" in migration
+    assert "OLD.status = 'posted'" in migration
+    assert "NEW.status = 'reversed'" in migration
+    assert "source_upload.extraction_status IS DISTINCT FROM 'extracted'" in migration
+    assert "gf.gold_json->>'_apflow_source_upload_id' = p_upload_id::text" in migration
+    assert "event.details->>'gold_file_id' = gf.id::text" in migration
+    assert "run.can_allocate IS DISTINCT FROM true" in migration
+    assert "DROP TRIGGER IF EXISTS prevent_unverified_bank_transaction_journal_trigger" in migration
+    assert "REVOKE ALL ON FUNCTION public.prevent_unverified_bank_transaction_journal()" in migration

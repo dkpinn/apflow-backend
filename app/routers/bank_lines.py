@@ -81,6 +81,15 @@ def suggest_bank_line(line_id: str, payload: ExtractUploadRequest, auth: UserAut
         db.table("bank_statement_lines").select("*").eq("id", line_id).eq("organisation_id", organisation_id).limit(1).execute(),
         "Bank statement line not found",
     )
+    try:
+        assert_bank_line_upload_extracted(
+            db,
+            organisation_id=organisation_id,
+            line=line,
+            action="Suggest bank allocation",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     suggestions = score_invoice_suggestions(db, organisation_id=organisation_id, line=line)
     suggestions += score_rule_suggestions(
         db,

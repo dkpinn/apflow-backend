@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from uuid import UUID
 
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
+from app.services.bank.extraction_gate import assert_bank_line_upload_extracted
 
 router = APIRouter(prefix="/api/receipt-inbox", tags=["receipt-inbox"])
 
@@ -106,7 +107,7 @@ def link_bank_line(
 
     line = (
         db.table("bank_statement_lines")
-        .select("id, organisation_id")
+        .select("id, organisation_id, bank_statement_upload_id")
         .eq("id", str(payload.bank_line_id))
         .eq("organisation_id", organisation_id)
         .maybe_single()
@@ -115,6 +116,15 @@ def link_bank_line(
     )
     if not line:
         raise HTTPException(status_code=404, detail="Bank line not found")
+    try:
+        assert_bank_line_upload_extracted(
+            db,
+            organisation_id=organisation_id,
+            line=line,
+            action="Link receipt to bank transaction",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     db.table("bank_statement_lines").update(
         {"receipt_document_id": receipt_id}

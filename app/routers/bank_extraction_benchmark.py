@@ -45,6 +45,31 @@ class GoldFileCreate(BaseModel):
     gold_pdf_storage_path: Optional[str] = None
 
 
+def _gold_json_source_upload_id(gold_json: object) -> str | None:
+    if not isinstance(gold_json, dict):
+        return None
+    source_upload_id = gold_json.get("_apflow_source_upload_id") or gold_json.get("source_upload_id")
+    return str(source_upload_id) if source_upload_id else None
+
+
+def _audit_source_upload_id_for_gold_file(db, *, organisation_id: str, gold_file_id: str) -> str | None:
+    events = (
+        db.table("bank_audit_events")
+        .select("*")
+        .eq("organisation_id", organisation_id)
+        .eq("event_type", "bank_statement_gold_file_created")
+        .execute()
+        .data
+        or []
+    )
+    for event in events:
+        details = event.get("details") if isinstance(event.get("details"), dict) else {}
+        if str(details.get("gold_file_id") or "") == gold_file_id:
+            upload_id = event.get("bank_statement_upload_id")
+            return str(upload_id) if upload_id else None
+    return None
+
+
 @router.post("/compare-json")
 def compare_extraction_to_gold_json(payload: CompareJsonRequest, auth: UserAuth):
     _auth(auth)
@@ -186,9 +211,14 @@ def run_org_gold_file_benchmark(gold_file_id: str, auth: UserAuth):
         lines=lines,
     )
     validation_result = evaluate_extracted_against_gold(extracted_doc, gold_file["gold_json"])
+    source_upload_id = _gold_json_source_upload_id(gold_file.get("gold_json")) or _audit_source_upload_id_for_gold_file(
+        db,
+        organisation_id=str(organisation_id),
+        gold_file_id=str(gold_file_id),
+    )
     run_row = {
         "organisation_id": str(organisation_id),
-        "bank_statement_upload_id": None,
+        "bank_statement_upload_id": source_upload_id,
         "document_id": gold_file["document_id"],
         "bank": gold_file.get("bank"),
         "account_type": gold_file.get("account_type"),

@@ -10,6 +10,7 @@ RECEIPT_ID = "00000000-0000-0000-0000-000000000003"
 OTHER_RECEIPT_ID = "00000000-0000-0000-0000-000000000004"
 BANK_LINE_ID = "00000000-0000-0000-0000-000000000005"
 OTHER_BANK_LINE_ID = "00000000-0000-0000-0000-000000000006"
+UPLOAD_ID = "00000000-0000-0000-0000-000000000007"
 
 
 class _Response:
@@ -36,6 +37,7 @@ class _Query:
         self.order_fields = []
         self.range_from = None
         self.range_to = None
+        self.limit_count = None
         self.update_payload = None
         self.single = False
         self.not_ = _NotFilter(self)
@@ -60,6 +62,10 @@ class _Query:
         self.range_to = end
         return self
 
+    def limit(self, count):
+        self.limit_count = count
+        return self
+
     def maybe_single(self):
         self.single = True
         return self
@@ -80,6 +86,8 @@ class _Query:
             rows = sorted(rows, key=lambda row: (row.get(field) is None, row.get(field)), reverse=desc)
         if self.range_from is not None and self.range_to is not None:
             rows = rows[self.range_from : self.range_to + 1]
+        if self.limit_count is not None:
+            rows = rows[: self.limit_count]
         return rows
 
     def execute(self):
@@ -146,6 +154,7 @@ def _tables():
                 "description": "Coffee Shop",
                 "signed_amount": -45.5,
                 "receipt_document_id": RECEIPT_ID,
+                "bank_statement_upload_id": UPLOAD_ID,
             },
             {
                 "id": OTHER_BANK_LINE_ID,
@@ -154,8 +163,19 @@ def _tables():
                 "description": "Fuel Station",
                 "signed_amount": -600,
                 "receipt_document_id": None,
+                "bank_statement_upload_id": UPLOAD_ID,
             },
         ],
+        "bank_statement_uploads": [
+            {
+                "id": UPLOAD_ID,
+                "organisation_id": ORG_ID,
+                "extraction_status": "extracted",
+            }
+        ],
+        "bank_statement_gold_files": [],
+        "bank_statement_extraction_runs": [],
+        "bank_audit_events": [],
     }
 
 
@@ -236,6 +256,23 @@ def test_link_bank_line_404s_for_missing_receipt(monkeypatch):
 
     assert exc.value.status_code == 404
     assert exc.value.detail == "Receipt not found"
+
+
+def test_link_bank_line_blocks_unapproved_upload(monkeypatch):
+    monkeypatch.setattr(receipt_inbox, "ensure_org_write", lambda *_args: None)
+    tables = _tables()
+    tables["bank_statement_uploads"][0]["extraction_status"] = "needs_review"
+
+    with pytest.raises(HTTPException) as exc:
+        receipt_inbox.link_bank_line(
+            receipt_id=OTHER_RECEIPT_ID,
+            payload=receipt_inbox.LinkBankLineRequest(bank_line_id=OTHER_BANK_LINE_ID),
+            auth=(USER_ID, _DB(tables)),
+            organisation_id=ORG_ID,
+        )
+
+    assert exc.value.status_code == 400
+    assert "reviewed and approved" in exc.value.detail
 
 
 def test_unlink_bank_line_clears_receipt_links(monkeypatch):

@@ -63,6 +63,27 @@ def _upload(status="extracted"):
     }
 
 
+def _gold_file():
+    return {
+        "id": "gold-1",
+        "organisation_id": ORG_ID,
+        "document_id": "corrected-statement",
+        "gold_json": {
+            "_apflow_source_upload_id": "upload-1",
+            "transactions": [{"transaction_index": 1}],
+        },
+    }
+
+
+def _benchmark_run(can_allocate=False):
+    return {
+        "organisation_id": ORG_ID,
+        "bank_statement_upload_id": "upload-1",
+        "document_id": "corrected-statement",
+        "can_allocate": can_allocate,
+    }
+
+
 def _draft_payload():
     return bj.DraftJournalRequest(organisation_id=ORG_UUID, gl_account_id=GL_UUID)
 
@@ -232,6 +253,23 @@ def test_draft_bank_journal_blocks_unapproved_upload(monkeypatch):
     assert "reviewed and approved" in exc_info.value.detail
 
 
+def test_draft_bank_journal_blocks_failed_corrected_fixture_benchmark(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line()],
+        "bank_statement_uploads": [_upload()],
+        "bank_statement_gold_files": [_gold_file()],
+        "bank_statement_extraction_runs": [_benchmark_run(can_allocate=False)],
+    })
+    monkeypatch.setattr(bj, "_auth", _fake_auth(db))
+    monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bj.draft_bank_journal("line-1", _draft_payload(), auth=("user-1", None))
+
+    assert exc_info.value.status_code == 400
+    assert "benchmark did not match" in exc_info.value.detail
+
+
 # ── post_bank_journal ────────────────────────────────────────────────────────
 
 def test_post_bank_journal_marks_journal_posted(monkeypatch):
@@ -275,6 +313,28 @@ def test_post_bank_journal_blocks_unapproved_upload(monkeypatch):
 
     assert exc_info.value.status_code == 400
     assert "reviewed and approved" in exc_info.value.detail
+
+
+def test_post_bank_journal_blocks_failed_corrected_fixture_benchmark(monkeypatch):
+    db = MemoryDB({
+        "gl_journals": [_journal(status="draft")],
+        "gl_journal_lines": [
+            {"gl_journal_id": "journal-1", "account_id": "acc-1", "tracking": {}, "sort_order": 0},
+        ],
+        "bank_statement_lines": [_line()],
+        "bank_statement_uploads": [_upload()],
+        "bank_statement_gold_files": [_gold_file()],
+        "bank_statement_extraction_runs": [_benchmark_run(can_allocate=False)],
+        "bank_accounts": [{"id": "ba-1", "organisation_id": ORG_ID, "gl_account_id": "bank-gl-1"}],
+    })
+    monkeypatch.setattr(bj, "_auth", _fake_auth(db))
+    monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bj.post_bank_journal("journal-1", _post_payload(), auth=("user-1", None))
+
+    assert exc_info.value.status_code == 400
+    assert "benchmark did not match" in exc_info.value.detail
 
 
 def test_post_bank_journal_400_when_not_draft(monkeypatch):
@@ -334,6 +394,35 @@ def test_unpost_bank_journal_creates_reversal(monkeypatch):
     journals = db.tables["gl_journals"]
     original = next(j for j in journals if j["id"] == "journal-1")
     assert original["status"] == "reversed"
+
+
+def test_unpost_bank_journal_allows_remediation_after_failed_benchmark(monkeypatch):
+    db = MemoryDB({
+        "gl_journals": [_journal(status="posted")],
+        "gl_journal_lines": [
+            {"gl_journal_id": "journal-1", "account_id": "acc-1", "debit_amount": 100.0, "credit_amount": 0, "sort_order": 0},
+        ],
+        "bank_statement_lines": [_line(posting_status="posted")],
+        "bank_statement_uploads": [_upload()],
+        "bank_statement_gold_files": [_gold_file()],
+        "bank_statement_extraction_runs": [_benchmark_run(can_allocate=False)],
+    })
+    monkeypatch.setattr(bj, "_auth", _fake_auth(db))
+    monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bj, "reversal_lines_for_journal", lambda lines, description: [
+        {**line, "debit_amount": line.get("credit_amount", 0), "credit_amount": line.get("debit_amount", 0)}
+        for line in lines
+    ])
+    monkeypatch.setattr(bj, "journal_preview_lines", lambda _db, _org, rows: rows)
+    monkeypatch.setattr(bj, "log_bank_event", lambda *_a, **_kw: None)
+
+    result = bj.unpost_bank_journal("journal-1", _post_payload(), auth=("user-1", None))
+
+    assert result["success"] is True
+    original = next(j for j in db.tables["gl_journals"] if j["id"] == "journal-1")
+    assert original["status"] == "reversed"
+    bank_line = db.tables["bank_statement_lines"][0]
+    assert bank_line["posting_status"] == "unposted"
 
 
 def test_unpost_bank_journal_400_when_not_posted(monkeypatch):

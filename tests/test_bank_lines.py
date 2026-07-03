@@ -49,6 +49,29 @@ def _upload_row(**overrides):
     }
 
 
+def _gold_file_row(**overrides):
+    return {
+        "id": "gold-1",
+        "organisation_id": ORG_ID,
+        "document_id": "corrected-statement",
+        "gold_json": {
+            "_apflow_source_upload_id": UPLOAD_ID,
+            "transactions": [{"transaction_index": 1}],
+        },
+        **overrides,
+    }
+
+
+def _benchmark_run_row(**overrides):
+    return {
+        "organisation_id": ORG_ID,
+        "bank_statement_upload_id": UPLOAD_ID,
+        "document_id": "corrected-statement",
+        "can_allocate": False,
+        **overrides,
+    }
+
+
 # ── delete_bank_lines ─────────────────────────────────────────────────────────
 
 def test_delete_bank_lines_delegates_to_bulk(monkeypatch):
@@ -101,6 +124,10 @@ def test_bulk_delete_bank_lines_409_when_blocked(monkeypatch):
 def test_suggest_bank_line_inserts_suggestions(monkeypatch):
     db = MemoryDB({
         "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row()],
+        "bank_statement_gold_files": [],
+        "bank_statement_extraction_runs": [],
+        "bank_audit_events": [],
         "bank_transaction_suggestions": [],
     })
     monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
@@ -119,6 +146,10 @@ def test_suggest_bank_line_inserts_suggestions(monkeypatch):
 def test_suggest_bank_line_no_write_when_no_suggestions(monkeypatch):
     db = MemoryDB({
         "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row()],
+        "bank_statement_gold_files": [],
+        "bank_statement_extraction_runs": [],
+        "bank_audit_events": [],
         "bank_transaction_suggestions": [],
     })
     monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
@@ -131,6 +162,23 @@ def test_suggest_bank_line_no_write_when_no_suggestions(monkeypatch):
 
     assert result["suggestions"] == []
     assert len(db.tables["bank_transaction_suggestions"]) == 0
+
+
+def test_suggest_bank_line_blocks_unapproved_upload(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row(extraction_status="needs_review")],
+        "bank_transaction_suggestions": [],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+
+    from app.routers.bank import ExtractUploadRequest
+    with pytest.raises(HTTPException) as exc_info:
+        bl.suggest_bank_line(LINE_ID, ExtractUploadRequest(organisation_id=ORG_ID), AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert "reviewed and approved" in exc_info.value.detail
 
 
 def test_suggest_bank_line_404_when_line_missing(monkeypatch):
@@ -234,6 +282,52 @@ def test_review_bank_line_400_when_upload_not_approved(monkeypatch):
 
     assert exc_info.value.status_code == 400
     assert "reviewed and approved" in exc_info.value.detail
+
+
+def test_review_bank_line_blocks_failed_corrected_fixture_benchmark(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row()],
+        "bank_statement_gold_files": [_gold_file_row()],
+        "bank_statement_extraction_runs": [_benchmark_run_row()],
+        "bank_audit_events": [],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+
+    from app.routers.bank import ReviewLineRequest
+    with pytest.raises(HTTPException) as exc_info:
+        bl.review_bank_line(LINE_ID, ReviewLineRequest(organisation_id=ORG_ID), AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert "benchmark did not match" in exc_info.value.detail
+
+
+def test_review_bank_line_blocks_failed_fixture_linked_by_audit_event(monkeypatch):
+    gold_file = _gold_file_row(gold_json={"transactions": [{"transaction_index": 1}]})
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row()],
+        "bank_statement_gold_files": [gold_file],
+        "bank_statement_extraction_runs": [_benchmark_run_row()],
+        "bank_audit_events": [
+            {
+                "organisation_id": ORG_ID,
+                "event_type": "bank_statement_gold_file_created",
+                "bank_statement_upload_id": UPLOAD_ID,
+                "details": {"gold_file_id": gold_file["id"]},
+            }
+        ],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+
+    from app.routers.bank import ReviewLineRequest
+    with pytest.raises(HTTPException) as exc_info:
+        bl.review_bank_line(LINE_ID, ReviewLineRequest(organisation_id=ORG_ID), AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert "benchmark did not match" in exc_info.value.detail
 
 
 def test_review_bank_line_404_when_line_missing(monkeypatch):

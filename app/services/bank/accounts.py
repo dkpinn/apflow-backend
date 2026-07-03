@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from app.schemas.bank import BankAccountCreate, BankBalanceSummary
 from app.services.bank_account_summary import build_bank_balance_summary
 from app.services.bank_statement_service import money
+from app.services.bank.extraction_gate import corrected_fixture_benchmark_blockers
 from app.services.protected_accounts import assert_manual_posting_account_allowed
 
 
@@ -75,8 +76,6 @@ def get_unreconciled_lines_payload(
         .data
         or []
     )
-    lines = sorted((row for row in rows if is_unreconciled_bank_line(row)), key=bank_line_sort_key)
-
     try:
         upload_rows = (
             db.table("bank_statement_uploads")
@@ -90,6 +89,34 @@ def get_unreconciled_lines_payload(
     except Exception:
         upload_rows = []
     uploads_by_id = {str(row.get("id")): row for row in upload_rows if row.get("id")}
+    blocked_upload_ids = {
+        str(upload.get("id"))
+        for upload in upload_rows
+        if str(upload.get("extraction_status") or "").lower() != "extracted"
+        or bool(
+            corrected_fixture_benchmark_blockers(
+                db,
+                organisation_id=organisation_id,
+                upload_id=str(upload.get("id")),
+            )
+        )
+    }
+    candidate_lines = [row for row in rows if is_unreconciled_bank_line(row)]
+    blocked_lines = [
+        row
+        for row in candidate_lines
+        if str(row.get("bank_statement_upload_id") or "") in blocked_upload_ids
+        or str(row.get("bank_statement_upload_id") or "") not in uploads_by_id
+    ]
+    lines = sorted(
+        (
+            row
+            for row in candidate_lines
+            if str(row.get("bank_statement_upload_id") or "") not in blocked_upload_ids
+            and str(row.get("bank_statement_upload_id") or "") in uploads_by_id
+        ),
+        key=bank_line_sort_key,
+    )
 
     top_suggestion: dict[str, dict[str, Any]] = {}
     if lines:
@@ -141,6 +168,8 @@ def get_unreconciled_lines_payload(
     return {
         "account": account,
         "lines": enriched,
+        "blocked_extraction_line_count": len(blocked_lines),
+        "blocked_extraction_upload_count": len(blocked_upload_ids),
         "balances": balances.model_dump(),
     }
 

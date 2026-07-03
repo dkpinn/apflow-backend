@@ -565,7 +565,10 @@ def test_create_bank_upload_gold_file_saves_corrected_json(monkeypatch):
     gold_file = db.tables["bank_statement_gold_files"][0]
     assert gold_file["organisation_id"] == ORG_ID
     assert gold_file["document_id"] == "corrected-statement"
-    assert gold_file["gold_json"] == gold_json
+    assert gold_file["gold_json"]["document_id"] == gold_json["document_id"]
+    assert gold_file["gold_json"]["transactions"] == gold_json["transactions"]
+    assert gold_file["gold_json"]["_apflow_source_upload_id"] == UPLOAD_ID
+    assert gold_file["gold_json"]["_apflow_source_bank_account_id"] == ACCOUNT_ID
     assert gold_file["gold_pdf_storage_bucket"] == "statement-files"
     assert gold_file["gold_pdf_storage_path"] == "org/april.pdf"
     assert gold_file["verified_by"] == "reviewer-1"
@@ -715,3 +718,62 @@ def test_approve_bank_upload_extraction_requires_complete_review_snapshot(monkey
 
     assert exc_info.value.status_code == 400
     assert "review snapshot" in exc_info.value.detail["blockers"][0]
+
+
+def test_approve_bank_upload_extraction_blocks_unbenchmarked_corrected_fixture(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_uploads": [_reviewable_upload()],
+        "bank_statement_gold_files": [
+            {
+                "id": "gold-1",
+                "organisation_id": ORG_ID,
+                "document_id": "corrected-statement",
+                "gold_json": {
+                    "_apflow_source_upload_id": UPLOAD_ID,
+                    "transactions": [{"transaction_index": 1}],
+                },
+            }
+        ],
+        "bank_statement_extraction_runs": [],
+    })
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bu.approve_bank_upload_extraction(UPLOAD_ID, _approval_payload(), AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert "not been benchmarked" in exc_info.value.detail["blockers"][0]
+
+
+def test_approve_bank_upload_extraction_blocks_failed_corrected_fixture_benchmark(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_uploads": [_reviewable_upload()],
+        "bank_statement_gold_files": [
+            {
+                "id": "gold-1",
+                "organisation_id": ORG_ID,
+                "document_id": "corrected-statement",
+                "gold_json": {
+                    "_apflow_source_upload_id": UPLOAD_ID,
+                    "transactions": [{"transaction_index": 1}],
+                },
+            }
+        ],
+        "bank_statement_extraction_runs": [
+            {
+                "organisation_id": ORG_ID,
+                "bank_statement_upload_id": UPLOAD_ID,
+                "document_id": "corrected-statement",
+                "can_allocate": False,
+            }
+        ],
+    })
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bu.approve_bank_upload_extraction(UPLOAD_ID, _approval_payload(), AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert "benchmark did not match" in exc_info.value.detail["blockers"][0]
