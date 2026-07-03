@@ -32,6 +32,15 @@ class ExtractUploadRequest(BaseModel):
     organisation_id: UUID
 
 
+class ApproveExtractionRequest(BaseModel):
+    organisation_id: UUID
+    source_document_checked: bool = False
+    transaction_count_checked: bool = False
+    amounts_and_dates_checked: bool = False
+    balances_checked: bool = False
+    reviewer_note: Optional[str] = Field(default=None, max_length=1000)
+
+
 class ReviewLineRequest(BaseModel):
     organisation_id: UUID
     suggestion_id: Optional[UUID] = None

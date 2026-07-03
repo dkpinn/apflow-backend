@@ -8,12 +8,14 @@ bank.py does NOT import this module — no circular import risk.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 
 from app.db.supabase_client import get_fresh_supabase_client
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
+from app.schemas.bank import ApproveExtractionRequest
 from app.services.bank_extraction_validation import validate_extracted_statement_quality
 from app.services.bank_statement_service import (
     correct_amounts_from_balance,
@@ -50,6 +52,127 @@ def _line_signed_amount(line) -> float:
     if isinstance(line, dict):
         return float(line.get("signed_amount") or 0)
     return float(getattr(line, "signed_amount", 0) or 0)
+
+
+def _line_value(line, key: str, default=None):
+    if isinstance(line, dict):
+        return line.get(key, default)
+    return getattr(line, key, default)
+
+
+def _numeric_or_none(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _review_snapshot_line(wrapper: dict, row_number: int) -> dict:
+    line = wrapper["line"]
+    duplicate_status = wrapper.get("duplicate_status") or "clear"
+    signed_amount = _line_signed_amount(line)
+    if duplicate_status != "clear":
+        import_status = "duplicate_filtered"
+    elif signed_amount == 0:
+        import_status = "dropped_zero_or_opening"
+    else:
+        import_status = "stored"
+    return {
+        "row_number": row_number,
+        "import_status": import_status,
+        "duplicate_status": duplicate_status,
+        "line_date": _line_value(line, "line_date"),
+        "value_date": _line_value(line, "value_date"),
+        "description": _line_value(line, "description"),
+        "reference": _line_value(line, "reference"),
+        "counterparty": _line_value(line, "counterparty"),
+        "debit_amount": _numeric_or_none(_line_value(line, "debit_amount")),
+        "credit_amount": _numeric_or_none(_line_value(line, "credit_amount")),
+        "signed_amount": signed_amount,
+        "balance_amount": _numeric_or_none(_line_value(line, "balance_amount")),
+        "currency": _line_value(line, "currency"),
+        "source_page": _line_value(line, "source_page"),
+        "source_row_index": _line_value(line, "source_row_index"),
+        "extraction_confidence": _numeric_or_none(_line_value(line, "extraction_confidence")),
+        "extraction_warnings": _line_value(line, "extraction_warnings", []) or [],
+    }
+
+
+def _storage_signed_url(db, *, bucket: str, path: str, expires_in: int = 3600) -> tuple[str | None, str | None]:
+    try:
+        storage_bucket = db.storage.from_(bucket)
+        create_signed_url = getattr(storage_bucket, "create_signed_url", None)
+        if not callable(create_signed_url):
+            return None, "Storage client does not expose signed URL creation"
+        result = create_signed_url(path, expires_in)
+        if isinstance(result, dict):
+            signed_url = (
+                result.get("signedURL")
+                or result.get("signed_url")
+                or result.get("signedUrl")
+                or result.get("url")
+            )
+            return signed_url, None if signed_url else "Storage client returned no signed URL"
+        signed_url = getattr(result, "signed_url", None) or getattr(result, "signedURL", None)
+        return signed_url, None if signed_url else "Storage client returned no signed URL"
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _gold_document_id(upload: dict) -> str:
+    filename = str(upload.get("original_filename") or upload.get("id") or "bank-statement")
+    stem = Path(filename).stem or "bank-statement"
+    clean = "".join(ch.lower() if ch.isalnum() else "-" for ch in stem).strip("-")
+    return clean or str(upload.get("id") or "bank-statement")
+
+
+def _gold_transaction_from_review_line(line: dict, transaction_index: int) -> dict:
+    return {
+        "transaction_index": transaction_index,
+        "date": line.get("line_date"),
+        "description": line.get("description") or "",
+        "amount": line.get("signed_amount"),
+        "debit": line.get("debit_amount"),
+        "credit": line.get("credit_amount"),
+        "running_balance": line.get("balance_amount"),
+        "page_number": line.get("source_page"),
+        "source_reference": (
+            f"row-{line.get('source_row_index')}"
+            if line.get("source_row_index") not in (None, "")
+            else f"extracted-row-{line.get('row_number') or transaction_index}"
+        ),
+    }
+
+
+def _gold_draft_from_upload(upload: dict, account: dict) -> dict:
+    evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
+    review_snapshot = evidence.get("review_snapshot") if isinstance(evidence.get("review_snapshot"), dict) else {}
+    snapshot_lines = review_snapshot.get("lines") if isinstance(review_snapshot.get("lines"), list) else []
+    transactions = []
+    for line in snapshot_lines:
+        if not isinstance(line, dict):
+            continue
+        if line.get("import_status") == "dropped_zero_or_opening":
+            continue
+        if _numeric_or_none(line.get("signed_amount")) == 0:
+            continue
+        transactions.append(_gold_transaction_from_review_line(line, len(transactions) + 1))
+    return {
+        "document_id": _gold_document_id(upload),
+        "bank": account.get("institution_name"),
+        "account_type": account.get("account_type"),
+        "document_variant": upload.get("source_format") or "bank_upload",
+        "statement_start_date": upload.get("statement_period_from"),
+        "statement_end_date": upload.get("statement_period_to"),
+        "opening_balance": upload.get("opening_balance"),
+        "closing_balance": upload.get("closing_balance"),
+        "transactions": transactions,
+        "source_upload_id": upload.get("id"),
+        "source_filename": upload.get("original_filename"),
+        "needs_manual_correction": True,
+    }
 
 
 @router.get("/uploads")
@@ -114,6 +237,11 @@ def _approval_blockers(upload: dict) -> list[str]:
         blockers.append("Running balance walk has not passed")
     if int(upload.get("extracted_line_count") or 0) <= 0:
         blockers.append("No importable transaction rows were stored")
+    review_snapshot = evidence.get("review_snapshot") if isinstance(evidence.get("review_snapshot"), dict) else {}
+    review_lines = review_snapshot.get("lines") if isinstance(review_snapshot.get("lines"), list) else []
+    raw_count = int(evidence.get("raw_extracted_transaction_count") or 0)
+    if raw_count and len(review_lines) != raw_count:
+        blockers.append("Row-level extraction review snapshot is incomplete")
     duplicate_count = int(
         upload.get("duplicate_line_count")
         or duplicate_summary.get("duplicate_line_count")
@@ -124,8 +252,18 @@ def _approval_blockers(upload: dict) -> list[str]:
     return blockers
 
 
+def _attestation_blockers(payload: ApproveExtractionRequest) -> list[str]:
+    required_checks = [
+        (payload.source_document_checked, "Reviewer must confirm the source document was opened and checked"),
+        (payload.transaction_count_checked, "Reviewer must confirm the extracted transaction count matches the source"),
+        (payload.amounts_and_dates_checked, "Reviewer must confirm extracted dates, descriptions, and amounts match the source"),
+        (payload.balances_checked, "Reviewer must confirm opening, closing, and running balances reconcile"),
+    ]
+    return [message for passed, message in required_checks if not passed]
+
+
 @router.post("/uploads/{upload_id}/approve-extraction")
-def approve_bank_upload_extraction(upload_id: str, payload: ExtractUploadRequest, auth: UserAuth):
+def approve_bank_upload_extraction(upload_id: str, payload: ApproveExtractionRequest, auth: UserAuth):
     user_id, db = _auth(auth)
     organisation_id = str(payload.organisation_id)
     ensure_org_write(user_id, organisation_id)
@@ -143,11 +281,18 @@ def approve_bank_upload_extraction(upload_id: str, payload: ExtractUploadRequest
     if upload.get("extraction_status") != "needs_review":
         raise HTTPException(status_code=400, detail="Only bank statement uploads needing review can be approved")
 
-    blockers = _approval_blockers(upload)
+    evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
+    extracted_by = evidence.get("extracted_by")
+    if user_id in {upload.get("uploaded_by"), extracted_by}:
+        raise HTTPException(
+            status_code=400,
+            detail="Bank statement extraction must be approved by a different reviewer",
+        )
+
+    blockers = _approval_blockers(upload) + _attestation_blockers(payload)
     if blockers:
         raise HTTPException(status_code=400, detail={"message": "Bank statement extraction cannot be approved", "blockers": blockers})
 
-    evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
     approved_at = now_iso()
     evidence = {
         **evidence,
@@ -155,6 +300,11 @@ def approve_bank_upload_extraction(upload_id: str, payload: ExtractUploadRequest
             "approved": True,
             "approved_by": user_id,
             "approved_at": approved_at,
+            "source_document_checked": payload.source_document_checked,
+            "transaction_count_checked": payload.transaction_count_checked,
+            "amounts_and_dates_checked": payload.amounts_and_dates_checked,
+            "balances_checked": payload.balances_checked,
+            "reviewer_note": payload.reviewer_note,
             "reason": "Reviewer confirmed extracted bank statement lines against source document",
         },
     }
@@ -169,6 +319,11 @@ def approve_bank_upload_extraction(upload_id: str, payload: ExtractUploadRequest
         .execute()
     )
     updated = _one(res, "Bank statement upload approval failed")
+    if upload.get("balance_status") == "balanced" and upload.get("closing_balance") is not None:
+        db.table("bank_accounts").update({
+            "current_reconciled_balance": upload.get("closing_balance"),
+            "last_statement_upload_id": upload_id,
+        }).eq("id", upload.get("bank_account_id")).eq("organisation_id", organisation_id).execute()
     log_bank_event(
         db,
         organisation_id=organisation_id,
@@ -178,6 +333,102 @@ def approve_bank_upload_extraction(upload_id: str, payload: ExtractUploadRequest
         bank_statement_upload_id=upload_id,
     )
     return {"success": True, "upload": updated, "already_approved": False}
+
+
+@router.get("/uploads/{upload_id}/extraction-review")
+def get_bank_upload_extraction_review(upload_id: str, organisation_id: str, auth: UserAuth):
+    user_id, db = _auth(auth)
+    ensure_org_read(user_id, organisation_id)
+    upload = _one(
+        db.table("bank_statement_uploads")
+        .select("*")
+        .eq("id", upload_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Bank statement upload not found",
+    )
+    account = _one(
+        db.table("bank_accounts")
+        .select("*")
+        .eq("id", upload["bank_account_id"])
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Bank account not found",
+    )
+    stored_lines = (
+        db.table("bank_statement_lines")
+        .select("*")
+        .eq("organisation_id", organisation_id)
+        .eq("bank_statement_upload_id", upload_id)
+        .order("line_date")
+        .execute()
+        .data
+        or []
+    )
+    evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
+    review_snapshot = evidence.get("review_snapshot") if isinstance(evidence.get("review_snapshot"), dict) else {}
+    bucket = upload.get("storage_bucket") or "statement-files"
+    path = upload.get("storage_path")
+    signed_url = access_error = None
+    if path:
+        signed_url, access_error = _storage_signed_url(db, bucket=bucket, path=path)
+    return {
+        "success": True,
+        "upload": upload,
+        "account": account,
+        "source_file": {
+            "bucket": bucket,
+            "path": path,
+            "filename": upload.get("original_filename"),
+            "mime_type": upload.get("mime_type"),
+            "signed_url": signed_url,
+            "access_error": access_error,
+        },
+        "review_snapshot": review_snapshot,
+        "stored_lines": stored_lines,
+        "approval_blockers": _approval_blockers(upload),
+    }
+
+
+@router.get("/uploads/{upload_id}/gold-draft")
+def get_bank_upload_gold_draft(upload_id: str, organisation_id: str, auth: UserAuth):
+    user_id, db = _auth(auth)
+    ensure_org_read(user_id, organisation_id)
+    upload = _one(
+        db.table("bank_statement_uploads")
+        .select("*")
+        .eq("id", upload_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Bank statement upload not found",
+    )
+    account = _one(
+        db.table("bank_accounts")
+        .select("*")
+        .eq("id", upload["bank_account_id"])
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Bank account not found",
+    )
+    draft = _gold_draft_from_upload(upload, account)
+    if not draft["transactions"]:
+        raise HTTPException(
+            status_code=400,
+            detail="No non-zero extracted transaction rows are available for a gold draft",
+        )
+    return {
+        "success": True,
+        "draft": draft,
+        "review_snapshot": (
+            upload.get("extraction_evidence", {})
+            if isinstance(upload.get("extraction_evidence"), dict)
+            else {}
+        ).get("review_snapshot"),
+    }
 
 
 @router.post("/uploads/{upload_id}/extract")
@@ -295,6 +546,10 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
         duplicate_summary["nil_line_count"] = nil_line_count
         duplicate_summary["raw_extracted_transaction_count"] = raw_extracted_transaction_count
         duplicate_summary["stored_line_count"] = stored_line_count
+        review_snapshot_lines = [
+            _review_snapshot_line(wrapper, row_number)
+            for row_number, wrapper in enumerate(line_wrappers, start=1)
+        ]
 
         inserts = [
             line_to_insert(
@@ -331,6 +586,7 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
                 "extractor": header.get("extractor"),
                 "extractor_type": header.get("extractor_type"),
                 "extractor_version": header.get("extractor_version"),
+                "extracted_by": user_id,
                 "source_format": header.get("source_format"),
                 "parser_strategy": header.get("parser_strategy"),
                 "line_count": stored_line_count,
@@ -344,6 +600,13 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
                 "running_balance": running_balance_result,
                 "amount_correction": correction_summary,
                 "pdf_rescue": header.get("pdf_rescue"),
+                "review_snapshot": {
+                    "lines": review_snapshot_lines,
+                    "raw_extracted_transaction_count": raw_extracted_transaction_count,
+                    "stored_line_count": stored_line_count,
+                    "nil_line_count": nil_line_count,
+                    "duplicate_line_count": duplicate_line_count,
+                },
             },
             "extraction_status": "extracted" if validation_result["can_allocate"] else "needs_review",
             "extracted_at": now_iso(),

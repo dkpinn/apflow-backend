@@ -122,7 +122,26 @@ def test_quality_blocks_balanced_vlm_until_manually_reviewed():
     )
 
     assert result["can_allocate"] is False
-    assert "Image/VLM bank statement extraction requires manual review before allocation" in result["critical_errors"]
+    assert "PDF/image/VLM bank statement extraction requires manual review before allocation" in result["critical_errors"]
+
+
+def test_quality_blocks_balanced_pdf_until_manually_reviewed():
+    result = validate_extracted_statement_quality(
+        extracted_lines=[_line()],
+        header={
+            "statement_period_from": "2024-01-01",
+            "statement_period_to": "2024-01-31",
+            "opening_balance": 1000,
+            "closing_balance": 900,
+            "source_format": "pdf",
+            "parser_strategy": "pdf_text_blocks",
+        },
+        duplicate_summary={"duplicate_line_count": 0},
+        balance_summary={"balance_status": "balanced"},
+    )
+
+    assert result["can_allocate"] is False
+    assert "PDF/image/VLM bank statement extraction requires manual review before allocation" in result["critical_errors"]
 
 
 def test_quality_blocks_line_level_extraction_warnings():

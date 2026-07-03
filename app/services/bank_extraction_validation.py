@@ -16,7 +16,7 @@ from app.services.bank_statement_extraction.common import dec_to_float, money, n
 from app.services.bank_statement_extraction.models import ParsedBankLine
 
 TOLERANCE = Decimal("0.01")
-SOURCE_FORMATS_REQUIRING_MANUAL_REVIEW = {"image", "vlm"}
+SOURCE_FORMATS_REQUIRING_MANUAL_REVIEW = {"pdf", "image", "vlm"}
 PARSER_STRATEGIES_REQUIRING_MANUAL_REVIEW = {"vlm"}
 
 # Amount and balance accuracy matter most; description accuracy matters least.
@@ -258,7 +258,7 @@ def validate_extracted_statement_quality(
         critical_errors.append("No non-zero transaction lines were extracted")
 
     if _source_requires_manual_review(header):
-        critical_errors.append("Image/VLM bank statement extraction requires manual review before allocation")
+        critical_errors.append("PDF/image/VLM bank statement extraction requires manual review before allocation")
 
     if not header.get("statement_period_from") or not header.get("statement_period_to"):
         critical_errors.append("Statement period is missing or incomplete")
