@@ -21,6 +21,7 @@ ORG_ID = "00000000-0000-0000-0000-000000000001"
 ACCOUNT_ID = "00000000-0000-0000-0000-000000000002"
 LINE_ID = "00000000-0000-0000-0000-000000000003"
 GL_ID = "00000000-0000-0000-0000-000000000004"
+UPLOAD_ID = "00000000-0000-0000-0000-000000000099"
 
 
 def _line_row(**overrides):
@@ -28,12 +29,22 @@ def _line_row(**overrides):
         "id": LINE_ID,
         "organisation_id": ORG_ID,
         "bank_account_id": ACCOUNT_ID,
-        "bank_statement_upload_id": "00000000-0000-0000-0000-000000000099",
+        "bank_statement_upload_id": UPLOAD_ID,
         "line_date": "2024-01-05",
         "signed_amount": -120.0,
         "description": "Coffee Shop",
         "review_status": "pending",
         "allocation_status": "unallocated",
+        **overrides,
+    }
+
+
+def _upload_row(**overrides):
+    return {
+        "id": UPLOAD_ID,
+        "organisation_id": ORG_ID,
+        "bank_account_id": ACCOUNT_ID,
+        "extraction_status": "extracted",
         **overrides,
     }
 
@@ -139,6 +150,7 @@ def test_suggest_bank_line_404_when_line_missing(monkeypatch):
 def test_review_bank_line_sets_reviewed_status(monkeypatch):
     db = MemoryDB({
         "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row()],
         "bank_audit_events": [],
     })
     monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
@@ -158,6 +170,7 @@ def test_review_bank_line_sets_reviewed_status(monkeypatch):
 def test_review_bank_line_creates_rule(monkeypatch):
     db = MemoryDB({
         "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row()],
         "bank_transaction_rules": [],
         "bank_audit_events": [],
     })
@@ -184,7 +197,11 @@ def test_review_bank_line_creates_rule(monkeypatch):
 
 
 def test_review_bank_line_400_on_invalid_criteria_mode(monkeypatch):
-    db = MemoryDB({"bank_statement_lines": [_line_row()], "bank_audit_events": []})
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row()],
+        "bank_audit_events": [],
+    })
     monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
     monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
     monkeypatch.setattr(bl, "normalize_rule_criteria", lambda _: [])
@@ -200,6 +217,23 @@ def test_review_bank_line_400_on_invalid_criteria_mode(monkeypatch):
         bl.review_bank_line(LINE_ID, payload, AUTH)
 
     assert exc_info.value.status_code == 400
+
+
+def test_review_bank_line_400_when_upload_not_approved(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row(extraction_status="needs_review")],
+        "bank_audit_events": [],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+
+    from app.routers.bank import ReviewLineRequest
+    with pytest.raises(HTTPException) as exc_info:
+        bl.review_bank_line(LINE_ID, ReviewLineRequest(organisation_id=ORG_ID), AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert "reviewed and approved" in exc_info.value.detail
 
 
 def test_review_bank_line_404_when_line_missing(monkeypatch):
@@ -263,7 +297,10 @@ def test_bulk_allocate_calls_atomic_rpc(monkeypatch):
         "created_count": 1,
         "items": [{"line_id": LINE_ID, "journal_id": "journal-1", "lines": []}],
     }
-    db = StubDB({}, rpc_result=rpc_result)
+    db = StubDB({
+        "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row()],
+    }, rpc_result=rpc_result)
     monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
     monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
 
@@ -284,10 +321,17 @@ def test_bulk_allocate_calls_atomic_rpc(monkeypatch):
 
 def test_bulk_allocate_400_on_rpc_error(monkeypatch):
     class _FailDB:
+        def __init__(self):
+            self._stub = StubDB({
+                "bank_statement_lines": [_line_row()],
+                "bank_statement_uploads": [_upload_row()],
+            })
+
         def rpc(self, _name, _params):
             raise Exception({"message": "Allocations do not balance", "details": None})
+
         def table(self, name):
-            return StubDB({}).table(name)
+            return self._stub.table(name)
 
     monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", _FailDB()))
     monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)

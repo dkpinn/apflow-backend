@@ -24,6 +24,7 @@ from app.services.bank_statement_service import (
 from app.services.sales_invoices import post_customer_receipt
 from app.services.protected_accounts import assert_manual_posting_account_allowed
 from app.services.organisation_vat import vat_applicability
+from app.services.bank.extraction_gate import assert_bank_line_upload_extracted, assert_bank_lines_uploads_extracted
 
 from app.routers.bank import (
     BulkDeleteLinesRequest,
@@ -104,6 +105,15 @@ def review_bank_line(line_id: str, payload: ReviewLineRequest, auth: UserAuth):
         db.table("bank_statement_lines").select("*").eq("id", line_id).eq("organisation_id", organisation_id).limit(1).execute(),
         "Bank statement line not found",
     )
+    try:
+        assert_bank_line_upload_extracted(
+            db,
+            organisation_id=organisation_id,
+            line=line,
+            action="Review bank transaction",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     suggestion = None
     if payload.suggestion_id:
         suggestion = _one(
@@ -284,13 +294,22 @@ def bulk_allocate_bank_lines(payload: BulkAllocateRequest, auth: UserAuth):
     line_ids = [str(item["line_id"]) for item in items]
     line_rows = (
         db.table("bank_statement_lines")
-        .select("id, line_date")
+        .select("id, line_date, bank_statement_upload_id")
         .eq("organisation_id", organisation_id)
         .in_("id", line_ids)
         .execute()
         .data
         or []
     )
+    try:
+        assert_bank_lines_uploads_extracted(
+            db,
+            organisation_id=organisation_id,
+            lines=line_rows,
+            action="Bulk allocate bank transactions",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     line_dates = {str(row.get("id")): row.get("line_date") for row in line_rows if row.get("id")}
     for item in items:
         has_vat_allocation = any(

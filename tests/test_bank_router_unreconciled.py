@@ -227,7 +227,13 @@ class _RpcDB:
             "bank_statement_lines": [{
                 "id": "33333333-3333-3333-3333-333333333333",
                 "organisation_id": "22222222-2222-2222-2222-222222222222",
+                "bank_statement_upload_id": "77777777-7777-7777-7777-777777777777",
                 "line_date": "2026-06-30",
+            }],
+            "bank_statement_uploads": [{
+                "id": "77777777-7777-7777-7777-777777777777",
+                "organisation_id": "22222222-2222-2222-2222-222222222222",
+                "extraction_status": "extracted",
             }],
             **(tables or {}),
         }
@@ -352,12 +358,17 @@ def test_c19_migration_contains_atomic_guards_and_draft_cleanup():
 
 
 def test_latest_statement_summary_rpc_uses_valid_closing_balance():
-    migration = (
-            Path(__file__).parents[1]
+    repo_root = Path(__file__).parents[1]
+    migration_path = repo_root / "app" / "db" / "20260702_bank_balance_summary_latest_valid_statement.sql"
+    if not migration_path.exists():
+        migration_path = (
+            repo_root
             / "app"
             / "db"
+            / "applied"
             / "20260702_bank_balance_summary_latest_valid_statement.sql"
-        ).read_text(encoding="utf-8")
+        )
+    migration = migration_path.read_text(encoding="utf-8")
 
     assert "u.extraction_status = 'extracted'" in migration
     assert "u.closing_balance IS NOT NULL" in migration

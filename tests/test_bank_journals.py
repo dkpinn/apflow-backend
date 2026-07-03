@@ -54,6 +54,15 @@ def _line(line_id="line-1", posting_status="unposted"):
     }
 
 
+def _upload(status="extracted"):
+    return {
+        "id": "upload-1",
+        "organisation_id": ORG_ID,
+        "bank_account_id": "ba-1",
+        "extraction_status": status,
+    }
+
+
 def _draft_payload():
     return bj.DraftJournalRequest(organisation_id=ORG_UUID, gl_account_id=GL_UUID)
 
@@ -98,6 +107,7 @@ def test_list_bank_journal_lines_404_when_journal_missing(monkeypatch):
 def test_draft_bank_journal_creates_journal(monkeypatch):
     db = MemoryDB({
         "bank_statement_lines": [_line()],
+        "bank_statement_uploads": [_upload()],
         "gl_journals": [],
         "gl_journal_lines": [],
     })
@@ -122,6 +132,7 @@ def test_draft_bank_journal_creates_journal(monkeypatch):
 def test_draft_bank_journal_uses_description_override(monkeypatch):
     db = MemoryDB({
         "bank_statement_lines": [_line()],
+        "bank_statement_uploads": [_upload()],
         "gl_journals": [],
         "gl_journal_lines": [],
     })
@@ -158,6 +169,7 @@ def test_draft_bank_journal_returns_existing_draft(monkeypatch):
     existing_line = {**_line(), "posting_status": "draft", "gl_journal_id": "journal-1"}
     db = MemoryDB({
         "bank_statement_lines": [existing_line],
+        "bank_statement_uploads": [_upload()],
         "gl_journals": [existing_journal],
         "gl_journal_lines": [
             {"gl_journal_id": "journal-1", "account_id": "acc-1", "debit_amount": 100.0, "credit_amount": 0, "sort_order": 0},
@@ -175,7 +187,10 @@ def test_draft_bank_journal_returns_existing_draft(monkeypatch):
 
 def test_draft_bank_journal_400_when_posted(monkeypatch):
     posted_line = {**_line(), "posting_status": "posted"}
-    db = MemoryDB({"bank_statement_lines": [posted_line]})
+    db = MemoryDB({
+        "bank_statement_lines": [posted_line],
+        "bank_statement_uploads": [_upload()],
+    })
     monkeypatch.setattr(bj, "_auth", _fake_auth(db))
     monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
 
@@ -189,6 +204,7 @@ def test_draft_bank_journal_400_when_posted(monkeypatch):
 def test_draft_bank_journal_blocks_bank_control_allocation(monkeypatch):
     db = MemoryDB({
         "bank_statement_lines": [_line()],
+        "bank_statement_uploads": [_upload()],
         "bank_accounts": [{"id": "ba-2", "organisation_id": ORG_ID, "gl_account_id": str(GL_UUID), "active": True}],
     })
     monkeypatch.setattr(bj, "_auth", _fake_auth(db))
@@ -201,6 +217,21 @@ def test_draft_bank_journal_blocks_bank_control_allocation(monkeypatch):
     assert "bank/cash control account" in exc_info.value.detail
 
 
+def test_draft_bank_journal_blocks_unapproved_upload(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line()],
+        "bank_statement_uploads": [_upload(status="needs_review")],
+    })
+    monkeypatch.setattr(bj, "_auth", _fake_auth(db))
+    monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bj.draft_bank_journal("line-1", _draft_payload(), auth=("user-1", None))
+
+    assert exc_info.value.status_code == 400
+    assert "reviewed and approved" in exc_info.value.detail
+
+
 # ── post_bank_journal ────────────────────────────────────────────────────────
 
 def test_post_bank_journal_marks_journal_posted(monkeypatch):
@@ -210,6 +241,7 @@ def test_post_bank_journal_marks_journal_posted(monkeypatch):
             {"gl_journal_id": "journal-1", "account_id": "acc-1", "tracking": {}, "sort_order": 0},
         ],
         "bank_statement_lines": [_line()],
+        "bank_statement_uploads": [_upload()],
         "bank_accounts": [{"id": "ba-1", "organisation_id": ORG_ID, "gl_account_id": "bank-gl-1"}],
     })
     monkeypatch.setattr(bj, "_auth", _fake_auth(db))
@@ -223,6 +255,26 @@ def test_post_bank_journal_marks_journal_posted(monkeypatch):
     assert result["success"] is True
     updated = db.tables["gl_journals"][0]
     assert updated["status"] == "posted"
+
+
+def test_post_bank_journal_blocks_unapproved_upload(monkeypatch):
+    db = MemoryDB({
+        "gl_journals": [_journal(status="draft")],
+        "gl_journal_lines": [
+            {"gl_journal_id": "journal-1", "account_id": "acc-1", "tracking": {}, "sort_order": 0},
+        ],
+        "bank_statement_lines": [_line()],
+        "bank_statement_uploads": [_upload(status="needs_review")],
+        "bank_accounts": [{"id": "ba-1", "organisation_id": ORG_ID, "gl_account_id": "bank-gl-1"}],
+    })
+    monkeypatch.setattr(bj, "_auth", _fake_auth(db))
+    monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bj.post_bank_journal("journal-1", _post_payload(), auth=("user-1", None))
+
+    assert exc_info.value.status_code == 400
+    assert "reviewed and approved" in exc_info.value.detail
 
 
 def test_post_bank_journal_400_when_not_draft(monkeypatch):

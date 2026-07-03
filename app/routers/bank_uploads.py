@@ -97,6 +97,89 @@ def create_bank_upload(payload: BankUploadCreate, auth: UserAuth):
     return {"success": True, "upload": upload}
 
 
+def _approval_blockers(upload: dict) -> list[str]:
+    blockers: list[str] = []
+    evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
+    validation = evidence.get("validation") if isinstance(evidence.get("validation"), dict) else {}
+    running_balance = evidence.get("running_balance") if isinstance(evidence.get("running_balance"), dict) else {}
+    duplicate_summary = upload.get("duplicate_summary") if isinstance(upload.get("duplicate_summary"), dict) else {}
+
+    if upload.get("balance_status") != "balanced":
+        blockers.append("Statement opening/closing balances are not reconciled")
+    if validation.get("closing_balance_passed") is not True:
+        blockers.append("Closing balance validation has not passed")
+    if validation.get("running_balance_passed") is not True:
+        blockers.append("Running balance validation has not passed")
+    if running_balance.get("balance_walk_status") not in {None, "balanced"}:
+        blockers.append("Running balance walk has not passed")
+    if int(upload.get("extracted_line_count") or 0) <= 0:
+        blockers.append("No importable transaction rows were stored")
+    duplicate_count = int(
+        upload.get("duplicate_line_count")
+        or duplicate_summary.get("duplicate_line_count")
+        or 0
+    )
+    if duplicate_count:
+        blockers.append("Duplicate transaction rows are still present")
+    return blockers
+
+
+@router.post("/uploads/{upload_id}/approve-extraction")
+def approve_bank_upload_extraction(upload_id: str, payload: ExtractUploadRequest, auth: UserAuth):
+    user_id, db = _auth(auth)
+    organisation_id = str(payload.organisation_id)
+    ensure_org_write(user_id, organisation_id)
+    upload = _one(
+        db.table("bank_statement_uploads")
+        .select("*")
+        .eq("id", upload_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Bank statement upload not found",
+    )
+    if upload.get("extraction_status") == "extracted":
+        return {"success": True, "upload": upload, "already_approved": True}
+    if upload.get("extraction_status") != "needs_review":
+        raise HTTPException(status_code=400, detail="Only bank statement uploads needing review can be approved")
+
+    blockers = _approval_blockers(upload)
+    if blockers:
+        raise HTTPException(status_code=400, detail={"message": "Bank statement extraction cannot be approved", "blockers": blockers})
+
+    evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
+    approved_at = now_iso()
+    evidence = {
+        **evidence,
+        "manual_review": {
+            "approved": True,
+            "approved_by": user_id,
+            "approved_at": approved_at,
+            "reason": "Reviewer confirmed extracted bank statement lines against source document",
+        },
+    }
+    res = (
+        db.table("bank_statement_uploads")
+        .update({
+            "extraction_status": "extracted",
+            "extraction_evidence": evidence,
+        })
+        .eq("id", upload_id)
+        .eq("organisation_id", organisation_id)
+        .execute()
+    )
+    updated = _one(res, "Bank statement upload approval failed")
+    log_bank_event(
+        db,
+        organisation_id=organisation_id,
+        event_type="bank_statement_extraction_approved",
+        actor_user_id=user_id,
+        bank_account_id=upload.get("bank_account_id"),
+        bank_statement_upload_id=upload_id,
+    )
+    return {"success": True, "upload": updated, "already_approved": False}
+
+
 @router.post("/uploads/{upload_id}/extract")
 def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: UserAuth):
     user_id, db = _auth(auth)
@@ -175,6 +258,9 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
         # Refresh the DB connection after the long extraction call (Gemini VLM can take
         # 30-60s) — the persistent HTTP/2 connection may have gone stale while waiting.
         db = get_fresh_supabase_client()
+        # Delete existing lines for this upload BEFORE duplicate detection so that
+        # re-extracting the same file doesn't flag all its own lines as duplicates.
+        db.table("bank_statement_lines").delete().eq("bank_statement_upload_id", upload_id).execute()
         line_wrappers, duplicate_summary = detect_line_duplicates(
             db=db,
             organisation_id=organisation_id,
@@ -210,7 +296,6 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
         duplicate_summary["raw_extracted_transaction_count"] = raw_extracted_transaction_count
         duplicate_summary["stored_line_count"] = stored_line_count
 
-        db.table("bank_statement_lines").delete().eq("bank_statement_upload_id", upload_id).execute()
         inserts = [
             line_to_insert(
                 wrapper["line"],

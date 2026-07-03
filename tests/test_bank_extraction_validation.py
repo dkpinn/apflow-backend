@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
+from decimal import Decimal
 
-from app.services.bank_extraction_validation import evaluate_extracted_against_gold
+from app.services.bank_extraction_validation import evaluate_extracted_against_gold, validate_extracted_statement_quality
+from app.services.bank_statement_extraction.models import ParsedBankLine
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "bank_extraction"
 
@@ -9,6 +11,22 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures" / "bank_extraction"
 def _load(name: str) -> dict:
     with open(FIXTURES_DIR / name, "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _line(**overrides) -> ParsedBankLine:
+    return ParsedBankLine(
+        line_date=overrides.get("line_date", "2024-01-02"),
+        value_date=None,
+        description=overrides.get("description", "Card payment"),
+        reference=None,
+        counterparty=None,
+        debit_amount=overrides.get("debit_amount", Decimal("100.00")),
+        credit_amount=overrides.get("credit_amount", Decimal("0.00")),
+        signed_amount=overrides.get("signed_amount", Decimal("-100.00")),
+        balance_amount=overrides.get("balance_amount", Decimal("900.00")),
+        currency="ZAR",
+        extraction_warnings=overrides.get("extraction_warnings"),
+    )
 
 
 def test_perfect_match_can_allocate():
@@ -66,3 +84,63 @@ def test_closing_balance_mismatch_blocks_allocation():
 
     assert result["can_allocate"] is False
     assert result["critical_errors"]
+
+
+def test_quality_blocks_missing_statement_balances():
+    result = validate_extracted_statement_quality(
+        extracted_lines=[_line(balance_amount=None)],
+        header={
+            "statement_period_from": "2024-01-01",
+            "statement_period_to": "2024-01-31",
+            "opening_balance": None,
+            "closing_balance": None,
+            "source_format": "pdf",
+            "parser_strategy": "pdf_text_blocks",
+        },
+        duplicate_summary={"duplicate_line_count": 0},
+        balance_summary={"balance_status": "missing_balance"},
+    )
+
+    assert result["can_allocate"] is False
+    assert "Opening or closing balance missing from statement header" in result["critical_errors"]
+    assert any("running-balance evidence" in error for error in result["critical_errors"])
+
+
+def test_quality_blocks_balanced_vlm_until_manually_reviewed():
+    result = validate_extracted_statement_quality(
+        extracted_lines=[_line()],
+        header={
+            "statement_period_from": "2024-01-01",
+            "statement_period_to": "2024-01-31",
+            "opening_balance": 1000,
+            "closing_balance": 900,
+            "source_format": "vlm",
+            "parser_strategy": "vlm",
+        },
+        duplicate_summary={"duplicate_line_count": 0},
+        balance_summary={"balance_status": "balanced"},
+    )
+
+    assert result["can_allocate"] is False
+    assert "Image/VLM bank statement extraction requires manual review before allocation" in result["critical_errors"]
+
+
+def test_quality_blocks_line_level_extraction_warnings():
+    result = validate_extracted_statement_quality(
+        extracted_lines=[
+            _line(extraction_warnings=[{"code": "amount_direction_inferred", "message": "Direction inferred"}])
+        ],
+        header={
+            "statement_period_from": "2024-01-01",
+            "statement_period_to": "2024-01-31",
+            "opening_balance": 1000,
+            "closing_balance": 900,
+            "source_format": "pdf",
+            "parser_strategy": "pdf_text_blocks",
+        },
+        duplicate_summary={"duplicate_line_count": 0},
+        balance_summary={"balance_status": "balanced"},
+    )
+
+    assert result["can_allocate"] is False
+    assert any("line-level extraction warning" in error for error in result["critical_errors"])

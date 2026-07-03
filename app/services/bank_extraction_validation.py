@@ -16,6 +16,8 @@ from app.services.bank_statement_extraction.common import dec_to_float, money, n
 from app.services.bank_statement_extraction.models import ParsedBankLine
 
 TOLERANCE = Decimal("0.01")
+SOURCE_FORMATS_REQUIRING_MANUAL_REVIEW = {"image", "vlm"}
+PARSER_STRATEGIES_REQUIRING_MANUAL_REVIEW = {"vlm"}
 
 # Amount and balance accuracy matter most; description accuracy matters least.
 _WEIGHT_AMOUNT = Decimal("0.35")
@@ -211,6 +213,32 @@ def _check_running_balance_continuity(
     return True
 
 
+def _line_value(line: ParsedBankLine, key: str, default: Any = None) -> Any:
+    if isinstance(line, dict):
+        return line.get(key, default)
+    return getattr(line, key, default)
+
+
+def _line_is_nonzero(line: ParsedBankLine) -> bool:
+    return abs(money(_line_value(line, "signed_amount"))) > TOLERANCE
+
+
+def _source_requires_manual_review(header: dict[str, Any]) -> bool:
+    source_format = normalize_text(header.get("source_format")).lower()
+    parser_strategy = normalize_text(header.get("parser_strategy")).lower()
+    pdf_rescue = header.get("pdf_rescue") if isinstance(header.get("pdf_rescue"), dict) else {}
+    selected_rescue = normalize_text(pdf_rescue.get("selected")).lower() if pdf_rescue else ""
+    return (
+        source_format in SOURCE_FORMATS_REQUIRING_MANUAL_REVIEW
+        or parser_strategy in PARSER_STRATEGIES_REQUIRING_MANUAL_REVIEW
+        or selected_rescue == "vlm"
+    )
+
+
+def _count_line_warnings(lines: list[ParsedBankLine]) -> int:
+    return sum(len(_line_value(line, "extraction_warnings", []) or []) for line in lines)
+
+
 def validate_extracted_statement_quality(
     *,
     extracted_lines: list[ParsedBankLine],
@@ -222,6 +250,18 @@ def validate_extracted_statement_quality(
     any gold file (used as the observational hook in the extraction flow)."""
     critical_errors: list[str] = []
     warnings: list[str] = []
+    nonzero_lines = [line for line in extracted_lines if _line_is_nonzero(line)]
+
+    if not extracted_lines:
+        critical_errors.append("No transaction lines were extracted")
+    if not nonzero_lines:
+        critical_errors.append("No non-zero transaction lines were extracted")
+
+    if _source_requires_manual_review(header):
+        critical_errors.append("Image/VLM bank statement extraction requires manual review before allocation")
+
+    if not header.get("statement_period_from") or not header.get("statement_period_to"):
+        critical_errors.append("Statement period is missing or incomplete")
 
     duplicate_count = (duplicate_summary or {}).get("duplicate_line_count", 0)
     if duplicate_count:
@@ -234,12 +274,28 @@ def validate_extracted_statement_quality(
     elif balance_status == "opening_mismatch":
         critical_errors.append("Opening balance does not match the bank account's reconciled balance")
     elif balance_status == "missing_balance":
-        warnings.append("Opening or closing balance missing from statement header")
+        critical_errors.append("Opening or closing balance missing from statement header")
+
+    missing_date_count = sum(1 for line in nonzero_lines if not _line_value(line, "line_date"))
+    if missing_date_count:
+        critical_errors.append(f"{missing_date_count} transaction(s) are missing transaction dates")
+
+    missing_description_count = sum(1 for line in nonzero_lines if not normalize_text(_line_value(line, "description")))
+    if missing_description_count:
+        critical_errors.append(f"{missing_description_count} transaction(s) are missing descriptions")
+
+    missing_balance_count = sum(1 for line in nonzero_lines if _line_value(line, "balance_amount") is None)
+    if missing_balance_count:
+        critical_errors.append(f"{missing_balance_count} transaction(s) are missing running-balance evidence")
+
+    line_warning_count = _count_line_warnings(nonzero_lines)
+    if line_warning_count:
+        critical_errors.append(f"{line_warning_count} line-level extraction warning(s) require manual review")
 
     opening_balance = money(header.get("opening_balance")) if header.get("opening_balance") is not None else None
     transactions = [
-        {"amount": line.signed_amount, "running_balance": line.balance_amount}
-        for line in extracted_lines
+        {"amount": money(_line_value(line, "signed_amount")), "running_balance": _line_value(line, "balance_amount")}
+        for line in nonzero_lines
     ]
     running_balance_passed = _check_running_balance_continuity(opening_balance, transactions, critical_errors)
 

@@ -22,6 +22,7 @@ from app.services.organisation_module_settings import (
     validate_bank_allocation_tracking,
 )
 from app.services.protected_accounts import assert_manual_posting_account_allowed
+from app.services.bank.extraction_gate import assert_bank_line_upload_extracted
 
 # Shared helpers and models live in bank.py; import them here.
 from app.routers.bank import (
@@ -47,6 +48,15 @@ def preview_bank_journal(line_id: str, payload: DraftJournalRequest, auth: UserA
         db.table("bank_statement_lines").select("*").eq("id", line_id).eq("organisation_id", organisation_id).limit(1).execute(),
         "Bank statement line not found",
     )
+    try:
+        assert_bank_line_upload_extracted(
+            db,
+            organisation_id=organisation_id,
+            line=line,
+            action="Preview bank allocation",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         assert_manual_posting_account_allowed(
             db,
@@ -83,6 +93,15 @@ def draft_bank_journal(line_id: str, payload: DraftJournalRequest, auth: UserAut
         db.table("bank_statement_lines").select("*").eq("id", line_id).eq("organisation_id", organisation_id).limit(1).execute(),
         "Bank statement line not found",
     )
+    try:
+        assert_bank_line_upload_extracted(
+            db,
+            organisation_id=organisation_id,
+            line=line,
+            action="Draft bank journal",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if line.get("posting_status") == "posted":
         raise HTTPException(status_code=400, detail="Posted bank transactions must be unposted before redrafting")
     try:
@@ -183,13 +202,22 @@ def post_bank_journal(journal_id: str, payload: PostJournalRequest, auth: UserAu
     if journal.get("source_type") == "bank_transaction" and journal.get("source_id"):
         source_line = _one(
             db.table("bank_statement_lines")
-            .select("bank_account_id")
+            .select("bank_account_id, bank_statement_upload_id")
             .eq("id", journal["source_id"])
             .eq("organisation_id", organisation_id)
             .limit(1)
             .execute(),
             "Bank statement line not found",
         )
+        try:
+            assert_bank_line_upload_extracted(
+                db,
+                organisation_id=organisation_id,
+                line=source_line,
+                action="Post bank journal",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         bank_account = _one(
             db.table("bank_accounts")
             .select("gl_account_id")
