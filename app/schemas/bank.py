@@ -41,6 +41,15 @@ class ApproveExtractionRequest(BaseModel):
     reviewer_note: Optional[str] = Field(default=None, max_length=1000)
 
 
+class CreateGoldFileFromUploadRequest(BaseModel):
+    organisation_id: UUID
+    gold_json: dict[str, Any]
+    document_id: Optional[str] = None
+    bank: Optional[str] = None
+    account_type: Optional[str] = None
+    document_variant: Optional[str] = None
+
+
 class ReviewLineRequest(BaseModel):
     organisation_id: UUID
     suggestion_id: Optional[UUID] = None

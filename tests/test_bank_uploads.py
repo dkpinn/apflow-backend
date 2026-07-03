@@ -524,6 +524,74 @@ def test_get_bank_upload_gold_draft_blocks_when_no_transactions(monkeypatch):
     assert "No non-zero" in exc_info.value.detail
 
 
+def test_create_bank_upload_gold_file_saves_corrected_json(monkeypatch):
+    gold_json = {
+        "document_id": "corrected-statement",
+        "bank": "ABSA",
+        "account_type": "current_account",
+        "document_variant": "corrected_pdf",
+        "statement_start_date": "2024-01-01",
+        "statement_end_date": "2024-01-31",
+        "opening_balance": 1000.0,
+        "closing_balance": 950.0,
+        "transactions": [
+            {
+                "transaction_index": 1,
+                "date": "2024-01-05",
+                "description": "Coffee corrected",
+                "amount": -50,
+                "running_balance": 950,
+            }
+        ],
+    }
+    db = MemoryDB({
+        "bank_statement_uploads": [_upload_row(storage_bucket="statement-files", storage_path="org/april.pdf")],
+        "bank_accounts": [_account_row(institution_name="ABSA", account_type="bank")],
+        "bank_statement_gold_files": [],
+    })
+    events = []
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bu, "log_bank_event", lambda _db, **kw: events.append(kw))
+    monkeypatch.setattr(bu, "now_iso", lambda: "2026-07-03T12:00:00+02:00")
+
+    result = bu.create_bank_upload_gold_file(
+        UPLOAD_ID,
+        bu.CreateGoldFileFromUploadRequest(organisation_id=ORG_ID, gold_json=gold_json),
+        AUTH,
+    )
+
+    assert result["success"] is True
+    gold_file = db.tables["bank_statement_gold_files"][0]
+    assert gold_file["organisation_id"] == ORG_ID
+    assert gold_file["document_id"] == "corrected-statement"
+    assert gold_file["gold_json"] == gold_json
+    assert gold_file["gold_pdf_storage_bucket"] == "statement-files"
+    assert gold_file["gold_pdf_storage_path"] == "org/april.pdf"
+    assert gold_file["verified_by"] == "reviewer-1"
+    assert events[0]["event_type"] == "bank_statement_gold_file_created"
+
+
+def test_create_bank_upload_gold_file_rejects_empty_gold_json(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_uploads": [_upload_row()],
+        "bank_accounts": [_account_row()],
+        "bank_statement_gold_files": [],
+    })
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bu.create_bank_upload_gold_file(
+            UPLOAD_ID,
+            bu.CreateGoldFileFromUploadRequest(organisation_id=ORG_ID, gold_json={"transactions": []}),
+            AUTH,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "transactions" in exc_info.value.detail
+
+
 def _reviewable_upload(**overrides):
     row = {
         "extraction_status": "needs_review",

@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException
 
 from app.db.supabase_client import get_fresh_supabase_client
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
-from app.schemas.bank import ApproveExtractionRequest
+from app.schemas.bank import ApproveExtractionRequest, CreateGoldFileFromUploadRequest
 from app.services.bank_extraction_validation import validate_extracted_statement_quality
 from app.services.bank_statement_service import (
     correct_amounts_from_balance,
@@ -429,6 +429,72 @@ def get_bank_upload_gold_draft(upload_id: str, organisation_id: str, auth: UserA
             else {}
         ).get("review_snapshot"),
     }
+
+
+@router.post("/uploads/{upload_id}/gold-file")
+def create_bank_upload_gold_file(
+    upload_id: str,
+    payload: CreateGoldFileFromUploadRequest,
+    auth: UserAuth,
+):
+    user_id, db = _auth(auth)
+    organisation_id = str(payload.organisation_id)
+    ensure_org_write(user_id, organisation_id)
+    upload = _one(
+        db.table("bank_statement_uploads")
+        .select("*")
+        .eq("id", upload_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Bank statement upload not found",
+    )
+    account = _one(
+        db.table("bank_accounts")
+        .select("*")
+        .eq("id", upload["bank_account_id"])
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Bank account not found",
+    )
+    gold_json = payload.gold_json
+    transactions = gold_json.get("transactions") if isinstance(gold_json, dict) else None
+    if not isinstance(transactions, list) or not transactions:
+        raise HTTPException(status_code=400, detail="Corrected gold JSON must contain transactions")
+
+    row = {
+        "organisation_id": organisation_id,
+        "document_id": payload.document_id or gold_json.get("document_id") or _gold_document_id(upload),
+        "bank": payload.bank or gold_json.get("bank") or account.get("institution_name") or "Unknown bank",
+        "account_type": payload.account_type or gold_json.get("account_type") or account.get("account_type"),
+        "document_variant": (
+            payload.document_variant
+            or gold_json.get("document_variant")
+            or upload.get("source_format")
+            or "bank_upload"
+        ),
+        "statement_start_date": gold_json.get("statement_start_date") or upload.get("statement_period_from"),
+        "statement_end_date": gold_json.get("statement_end_date") or upload.get("statement_period_to"),
+        "gold_json": gold_json,
+        "gold_pdf_storage_bucket": upload.get("storage_bucket") or "statement-files",
+        "gold_pdf_storage_path": upload.get("storage_path"),
+        "verified_by": user_id,
+        "verified_at": now_iso(),
+    }
+    res = db.table("bank_statement_gold_files").insert(row).execute()
+    gold_file = _one(res, "Gold file create failed")
+    log_bank_event(
+        db,
+        organisation_id=organisation_id,
+        event_type="bank_statement_gold_file_created",
+        actor_user_id=user_id,
+        bank_account_id=upload.get("bank_account_id"),
+        bank_statement_upload_id=upload_id,
+        gold_file_id=gold_file.get("id"),
+        document_id=row["document_id"],
+    )
+    return {"success": True, "gold_file": gold_file}
 
 
 @router.post("/uploads/{upload_id}/extract")

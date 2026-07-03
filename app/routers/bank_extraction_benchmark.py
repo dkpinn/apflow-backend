@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import mimetypes
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
 from app.routers.bank import _auth
-from app.services.bank_extraction_validation import evaluate_extracted_against_gold
+from app.services.bank_extraction_validation import build_extracted_document, evaluate_extracted_against_gold
+from app.services.bank_statement_service import extract_statement
 
 router = APIRouter(prefix="/api/bank-extraction", tags=["bank-extraction-benchmark"])
 
@@ -39,6 +41,8 @@ class GoldFileCreate(BaseModel):
     statement_end_date: Optional[str] = None
     gold_json: Optional[dict[str, Any]] = None
     gold_csv_path: Optional[str] = None
+    gold_pdf_storage_bucket: Optional[str] = None
+    gold_pdf_storage_path: Optional[str] = None
 
 
 @router.post("/compare-json")
@@ -115,6 +119,8 @@ def create_gold_file(payload: GoldFileCreate, auth: UserAuth):
         "statement_end_date": payload.statement_end_date,
         "gold_json": payload.gold_json,
         "gold_csv_path": payload.gold_csv_path,
+        "gold_pdf_storage_bucket": payload.gold_pdf_storage_bucket,
+        "gold_pdf_storage_path": payload.gold_pdf_storage_path,
         "verified_by": user_id,
     }
     res = db.table("bank_statement_gold_files").insert(row).execute()
@@ -134,3 +140,79 @@ def list_gold_files(organisation_id: str, auth: UserAuth):
         .execute()
     )
     return {"success": True, "gold_files": res.data or []}
+
+
+@router.post("/gold-files/{gold_file_id}/run")
+def run_org_gold_file_benchmark(gold_file_id: str, auth: UserAuth):
+    user_id, db = _auth(auth)
+    gold_file_res = (
+        db.table("bank_statement_gold_files")
+        .select("*")
+        .eq("id", gold_file_id)
+        .limit(1)
+        .execute()
+    )
+    if not gold_file_res.data:
+        raise HTTPException(status_code=404, detail="Gold file not found")
+    gold_file = gold_file_res.data[0]
+    organisation_id = gold_file.get("organisation_id")
+    if not organisation_id:
+        raise HTTPException(status_code=404, detail="Gold file not found")
+    ensure_org_write(user_id, str(organisation_id))
+    storage_path = gold_file.get("gold_pdf_storage_path")
+    if not storage_path:
+        raise HTTPException(status_code=400, detail="Gold file has no associated source document")
+    if not gold_file.get("gold_json"):
+        raise HTTPException(status_code=400, detail="Gold file has no corrected gold JSON")
+
+    bucket = gold_file.get("gold_pdf_storage_bucket") or "statement-files"
+    file_bytes = db.storage.from_(bucket).download(storage_path)
+    mime_type, _ = mimetypes.guess_type(storage_path)
+    header, lines = extract_statement(
+        file_bytes,
+        filename=storage_path.rsplit("/", 1)[-1],
+        mime_type=mime_type or "application/pdf",
+        bank_account_id="00000000-0000-0000-0000-000000000000",
+        currency=None,
+        account_type=gold_file.get("account_type"),
+        parsing_hint=None,
+    )
+    extracted_doc = build_extracted_document(
+        document_id=gold_file["document_id"],
+        bank=gold_file.get("bank"),
+        account_type=gold_file.get("account_type"),
+        document_variant=gold_file.get("document_variant"),
+        header=header,
+        lines=lines,
+    )
+    validation_result = evaluate_extracted_against_gold(extracted_doc, gold_file["gold_json"])
+    run_row = {
+        "organisation_id": str(organisation_id),
+        "bank_statement_upload_id": None,
+        "document_id": gold_file["document_id"],
+        "bank": gold_file.get("bank"),
+        "account_type": gold_file.get("account_type"),
+        "document_variant": gold_file.get("document_variant"),
+        "extractor_name": header.get("extractor"),
+        "expected_transaction_count": validation_result.get("expected_transaction_count"),
+        "extracted_transaction_count": validation_result.get("extracted_transaction_count"),
+        "matched_transaction_count": validation_result.get("matched_transaction_count"),
+        "missing_transaction_count": validation_result.get("missing_transaction_count"),
+        "extra_transaction_count": validation_result.get("extra_transaction_count"),
+        "amount_accuracy": validation_result.get("amount_accuracy"),
+        "date_accuracy": validation_result.get("date_accuracy"),
+        "description_accuracy": validation_result.get("description_accuracy"),
+        "balance_accuracy": validation_result.get("balance_accuracy"),
+        "running_balance_passed": validation_result.get("running_balance_passed"),
+        "closing_balance_passed": validation_result.get("closing_balance_passed"),
+        "can_allocate": bool(validation_result.get("can_allocate")),
+        "overall_score": validation_result.get("overall_score"),
+        "critical_errors": validation_result.get("critical_errors") or [],
+        "warnings": validation_result.get("warnings") or [],
+    }
+    res = db.table("bank_statement_extraction_runs").insert(run_row).execute()
+    return {
+        "success": True,
+        "validation_result": validation_result,
+        "run": res.data[0] if res.data else None,
+    }
