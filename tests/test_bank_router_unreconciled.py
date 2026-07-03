@@ -522,3 +522,72 @@ def test_bank_transaction_journal_extraction_gate_migration_blocks_unverified_so
     assert "run.can_allocate IS DISTINCT FROM true" in migration
     assert "DROP TRIGGER IF EXISTS prevent_unverified_bank_transaction_journal_trigger" in migration
     assert "REVOKE ALL ON FUNCTION public.prevent_unverified_bank_transaction_journal()" in migration
+
+
+def test_bank_transaction_journal_gold_fixture_migration_requires_gold_for_risky_sources():
+    repo_root = Path(__file__).resolve().parents[1]
+    migration_path = repo_root / "app" / "db" / "20260703_bank_transaction_journal_requires_gold_fixture.sql"
+    if not migration_path.exists():
+        migration_path = (
+            repo_root
+            / "app"
+            / "db"
+            / "applied"
+            / "20260703_bank_transaction_journal_requires_gold_fixture.sql"
+        )
+    migration = migration_path.read_text(encoding="utf-8")
+
+    assert "prevent_unverified_bank_transaction_journal" in migration
+    assert "source_format IN ('pdf', 'image', 'vlm', 'png', 'jpg', 'jpeg', 'webp', 'heic', 'heif', 'tif', 'tiff')" in migration
+    assert "parser_strategy LIKE 'vlm\\_%' ESCAPE '\\'" in migration
+    assert "pdf_rescue_selected = 'vlm'" in migration
+    assert "corrected_fixture_count = 0" in migration
+    assert "approved_by := source_upload.extraction_evidence->'manual_review'->>'approved_by'" in migration
+    assert "independent_corrected_fixture_count = 0" in migration
+    assert "gf.verified_by::text <> approved_by" in migration
+    assert "requires a corrected gold fixture and passing benchmark" in migration
+    assert "different from the corrected gold fixture verifier" in migration
+    assert "bank_upload_corrected_fixture_blockers" in migration
+
+
+def test_bank_transaction_journal_stale_benchmark_migration_requires_fresh_runs():
+    repo_root = Path(__file__).resolve().parents[1]
+    migration_path = repo_root / "app" / "db" / "20260703_bank_transaction_journal_stale_benchmark_guard.sql"
+    if not migration_path.exists():
+        migration_path = (
+            repo_root
+            / "app"
+            / "db"
+            / "applied"
+            / "20260703_bank_transaction_journal_stale_benchmark_guard.sql"
+        )
+    migration = migration_path.read_text(encoding="utf-8")
+
+    assert "bank_upload_corrected_fixture_blockers" in migration
+    assert "upload.extracted_at" in migration
+    assert "coalesce(gf.verified_at, gf.created_at)" in migration
+    assert "run.created_at < gold.gold_verified_at" in migration
+    assert "run.created_at < upload_extracted_at" in migration
+    assert "rerun it after the latest correction" in migration
+    assert "rerun it after the latest extraction" in migration
+
+
+def test_bank_extraction_runs_rls_blocks_direct_upload_linked_writes():
+    repo_root = Path(__file__).resolve().parents[1]
+    migration_path = repo_root / "app" / "db" / "20260703_bank_extraction_runs_block_direct_upload_linked_writes.sql"
+    if not migration_path.exists():
+        migration_path = (
+            repo_root
+            / "app"
+            / "db"
+            / "applied"
+            / "20260703_bank_extraction_runs_block_direct_upload_linked_writes.sql"
+        )
+    migration = migration_path.read_text(encoding="utf-8")
+
+    assert 'DROP POLICY IF EXISTS "bank_extraction_runs_write_accountants"' in migration
+    assert 'CREATE POLICY "bank_extraction_runs_insert_ad_hoc"' in migration
+    assert 'CREATE POLICY "bank_extraction_runs_update_ad_hoc"' in migration
+    assert 'CREATE POLICY "bank_extraction_runs_delete_ad_hoc"' in migration
+    assert "bank_statement_upload_id IS NULL" in migration
+    assert "FOR INSERT TO authenticated" in migration

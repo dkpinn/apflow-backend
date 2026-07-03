@@ -2,7 +2,11 @@ import json
 from pathlib import Path
 from decimal import Decimal
 
-from app.services.bank_extraction_validation import evaluate_extracted_against_gold, validate_extracted_statement_quality
+from app.services.bank_extraction_validation import (
+    evaluate_extracted_against_gold,
+    validate_extracted_statement_quality,
+    validate_gold_document_integrity,
+)
 from app.services.bank_statement_extraction.models import ParsedBankLine
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "bank_extraction"
@@ -86,6 +90,23 @@ def test_closing_balance_mismatch_blocks_allocation():
     assert result["critical_errors"]
 
 
+def test_gold_document_integrity_accepts_reconciled_gold_json():
+    gold = _load("example_absa_gold.json")
+
+    assert validate_gold_document_integrity(gold) == []
+
+
+def test_gold_document_integrity_blocks_unreconciled_gold_json():
+    gold = _load("example_absa_gold.json")
+    gold["transactions"][0]["running_balance"] = float(gold["transactions"][0]["running_balance"]) + 123
+    gold["closing_balance"] = float(gold["closing_balance"]) + 456
+
+    blockers = validate_gold_document_integrity(gold)
+
+    assert any("running balances" in blocker for blocker in blockers)
+    assert any("closing balance" in blocker for blocker in blockers)
+
+
 def test_quality_blocks_missing_statement_balances():
     result = validate_extracted_statement_quality(
         extracted_lines=[_line(balance_amount=None)],
@@ -135,6 +156,44 @@ def test_quality_blocks_balanced_pdf_until_manually_reviewed():
             "closing_balance": 900,
             "source_format": "pdf",
             "parser_strategy": "pdf_text_blocks",
+        },
+        duplicate_summary={"duplicate_line_count": 0},
+        balance_summary={"balance_status": "balanced"},
+    )
+
+    assert result["can_allocate"] is False
+    assert "PDF/image/VLM bank statement extraction requires manual review before allocation" in result["critical_errors"]
+
+
+def test_quality_blocks_balanced_image_until_manually_reviewed():
+    result = validate_extracted_statement_quality(
+        extracted_lines=[_line()],
+        header={
+            "statement_period_from": "2024-01-01",
+            "statement_period_to": "2024-01-31",
+            "opening_balance": 1000,
+            "closing_balance": 900,
+            "source_format": "image",
+            "parser_strategy": "vlm_image",
+        },
+        duplicate_summary={"duplicate_line_count": 0},
+        balance_summary={"balance_status": "balanced"},
+    )
+
+    assert result["can_allocate"] is False
+    assert "PDF/image/VLM bank statement extraction requires manual review before allocation" in result["critical_errors"]
+
+
+def test_quality_blocks_unknown_vlm_strategy_until_manually_reviewed():
+    result = validate_extracted_statement_quality(
+        extracted_lines=[_line()],
+        header={
+            "statement_period_from": "2024-01-01",
+            "statement_period_to": "2024-01-31",
+            "opening_balance": 1000,
+            "closing_balance": 900,
+            "source_format": "unknown",
+            "parser_strategy": "vlm_unknown",
         },
         duplicate_summary={"duplicate_line_count": 0},
         balance_summary={"balance_status": "balanced"},

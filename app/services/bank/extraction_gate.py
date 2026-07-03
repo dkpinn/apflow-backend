@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.bank_extraction_validation import source_requires_manual_review
+
 
 def _upload_id_for_line(line: dict[str, Any]) -> str | None:
     upload_id = line.get("bank_statement_upload_id")
@@ -15,12 +17,12 @@ def gold_json_source_upload_id(gold_json: object) -> str | None:
     return str(source_upload_id) if source_upload_id else None
 
 
-def corrected_fixture_benchmark_blockers(
+def corrected_fixture_rows_for_upload(
     db,
     *,
     organisation_id: str,
     upload_id: str,
-) -> list[str]:
+) -> list[dict[str, Any]]:
     events = (
         db.table("bank_audit_events")
         .select("*")
@@ -50,8 +52,53 @@ def corrected_fixture_benchmark_blockers(
         if gold_json_source_upload_id(row.get("gold_json")) == upload_id
         or str(row.get("id")) in audit_gold_file_ids
     ]
+    return upload_gold_files
+
+
+def upload_requires_corrected_fixture(upload: dict[str, Any]) -> bool:
+    evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
+    raw_extraction = upload.get("raw_extraction") if isinstance(upload.get("raw_extraction"), dict) else {}
+    pdf_rescue = evidence.get("pdf_rescue")
+    if not isinstance(pdf_rescue, dict):
+        pdf_rescue = raw_extraction.get("pdf_rescue") if isinstance(raw_extraction.get("pdf_rescue"), dict) else None
+    return source_requires_manual_review(
+        {
+            "source_format": upload.get("source_format") or evidence.get("source_format") or raw_extraction.get("source_format"),
+            "parser_strategy": evidence.get("parser_strategy") or raw_extraction.get("parser_strategy"),
+            "pdf_rescue": pdf_rescue,
+        }
+    )
+
+
+def _timestamp_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def corrected_fixture_benchmark_blockers(
+    db,
+    *,
+    organisation_id: str,
+    upload_id: str,
+) -> list[str]:
+    upload_gold_files = corrected_fixture_rows_for_upload(
+        db,
+        organisation_id=organisation_id,
+        upload_id=upload_id,
+    )
     if not upload_gold_files:
         return []
+
+    upload_rows = (
+        db.table("bank_statement_uploads")
+        .select("id, extracted_at")
+        .eq("organisation_id", organisation_id)
+        .eq("id", upload_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    upload_extracted_at = _timestamp_text((upload_rows[0] if upload_rows else {}).get("extracted_at"))
 
     document_ids = {
         str(row.get("document_id"))
@@ -78,6 +125,17 @@ def corrected_fixture_benchmark_blockers(
         return ["Corrected gold fixture has not been benchmarked against the parser output"]
     if any(row.get("can_allocate") is not True for row in latest_runs_by_document.values()):
         return ["Corrected gold fixture benchmark did not match the parser output"]
+    for gold_file in upload_gold_files:
+        document_id = str(gold_file.get("document_id") or "")
+        latest_run = latest_runs_by_document.get(document_id)
+        if not latest_run:
+            continue
+        run_created_at = _timestamp_text(latest_run.get("created_at"))
+        gold_verified_at = _timestamp_text(gold_file.get("verified_at") or gold_file.get("created_at"))
+        if gold_verified_at and (not run_created_at or run_created_at < gold_verified_at):
+            return ["Corrected gold fixture benchmark is stale; rerun it after the latest correction"]
+        if upload_extracted_at and (not run_created_at or run_created_at < upload_extracted_at):
+            return ["Corrected gold fixture benchmark is stale; rerun it after the latest extraction"]
     return []
 
 
@@ -87,7 +145,16 @@ def assert_upload_corrected_fixtures_benchmarked(
     organisation_id: str,
     upload_id: str,
     action: str,
+    require_fixture: bool = False,
 ) -> None:
+    if require_fixture and not corrected_fixture_rows_for_upload(
+        db,
+        organisation_id=organisation_id,
+        upload_id=upload_id,
+    ):
+        raise ValueError(
+            f"{action} is blocked: PDF/image/VLM bank statement extraction requires a corrected gold fixture and passing benchmark"
+        )
     blockers = corrected_fixture_benchmark_blockers(
         db,
         organisation_id=organisation_id,
@@ -110,7 +177,7 @@ def assert_bank_line_upload_extracted(
 
     res = (
         db.table("bank_statement_uploads")
-        .select("id, extraction_status")
+        .select("id, extraction_status, source_format, raw_extraction, extraction_evidence")
         .eq("id", upload_id)
         .eq("organisation_id", organisation_id)
         .limit(1)
@@ -129,6 +196,7 @@ def assert_bank_line_upload_extracted(
         organisation_id=organisation_id,
         upload_id=upload_id,
         action=action,
+        require_fixture=upload_requires_corrected_fixture(rows[0]),
     )
 
 
@@ -147,22 +215,25 @@ def assert_bank_lines_uploads_extracted(
 
     res = (
         db.table("bank_statement_uploads")
-        .select("id, extraction_status")
+        .select("id, extraction_status, source_format, raw_extraction, extraction_evidence")
         .eq("organisation_id", organisation_id)
         .in_("id", upload_ids)
         .execute()
     )
     rows = getattr(res, "data", None) or []
-    statuses = {str(row.get("id")): str(row.get("extraction_status") or "").lower() for row in rows}
+    uploads_by_id = {str(row.get("id")): row for row in rows}
+    statuses = {upload_id: str(row.get("extraction_status") or "").lower() for upload_id, row in uploads_by_id.items()}
     blocked = [upload_id for upload_id in upload_ids if statuses.get(upload_id) != "extracted"]
     if blocked:
         raise ValueError(
             f"{action} is blocked until all bank statement extractions are reviewed and approved"
         )
     for upload_id in upload_ids:
+        upload = uploads_by_id.get(upload_id) or {}
         assert_upload_corrected_fixtures_benchmarked(
             db,
             organisation_id=organisation_id,
             upload_id=upload_id,
             action=action,
+            require_fixture=upload_requires_corrected_fixture(upload),
         )

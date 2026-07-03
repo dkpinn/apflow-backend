@@ -6,6 +6,7 @@ extraction pipeline. Restricted to platform owners.
 from __future__ import annotations
 
 import mimetypes
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -14,13 +15,21 @@ from pydantic import BaseModel
 from app.db.supabase_client import get_supabase_client
 from app.dependencies import UserAuth, ensure_platform_owner
 from app.services.bank_extraction_prompt import DEFAULT_VLM_PROMPT, upsert_vlm_prompt, reset_vlm_prompt
-from app.services.bank_extraction_validation import build_extracted_document, evaluate_extracted_against_gold
+from app.services.bank_extraction_validation import (
+    build_extracted_document,
+    evaluate_extracted_against_gold,
+    validate_gold_document_integrity,
+)
 from app.services.bank_statement_service import extract_statement
 
 router = APIRouter(prefix="/api/admin/bank-extraction", tags=["admin-bank-extraction"])
 
 DUMMY_BANK_ACCOUNT_ID = "00000000-0000-0000-0000-000000000000"
 GOLD_BUCKET = "bank-extraction-gold"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class VLMPromptUpdate(BaseModel):
@@ -95,6 +104,12 @@ def delete_vlm_prompt(auth: UserAuth):
 @router.post("/gold-files")
 def create_gold_file(payload: GoldFileCreate, auth: UserAuth):
     user_id, db = _platform_db(auth)
+    gold_blockers = validate_gold_document_integrity(payload.gold_json)
+    if gold_blockers:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "Corrected gold JSON cannot be saved", "blockers": gold_blockers},
+        )
     row = {
         "organisation_id": None,
         "document_id": payload.document_id,
@@ -107,6 +122,7 @@ def create_gold_file(payload: GoldFileCreate, auth: UserAuth):
         "gold_pdf_storage_bucket": GOLD_BUCKET,
         "gold_pdf_storage_path": payload.gold_pdf_storage_path,
         "verified_by": user_id,
+        "verified_at": _now_iso(),
     }
     res = db.table("bank_statement_gold_files").insert(row).execute()
     return {"success": True, "gold_file": res.data[0] if res.data else None}
@@ -150,7 +166,13 @@ def list_gold_files(auth: UserAuth):
 
 @router.patch("/gold-files/{gold_file_id}")
 def update_gold_file(gold_file_id: str, payload: GoldFileUpdate, auth: UserAuth):
-    _user_id, db = _platform_db(auth)
+    user_id, db = _platform_db(auth)
+    gold_blockers = validate_gold_document_integrity(payload.gold_json)
+    if gold_blockers:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "Corrected gold JSON cannot be saved", "blockers": gold_blockers},
+        )
     _one(
         db.table("bank_statement_gold_files")
         .select("id")
@@ -163,7 +185,11 @@ def update_gold_file(gold_file_id: str, payload: GoldFileUpdate, auth: UserAuth)
 
     res = (
         db.table("bank_statement_gold_files")
-        .update({"gold_json": payload.gold_json})
+        .update({
+            "gold_json": payload.gold_json,
+            "verified_by": user_id,
+            "verified_at": _now_iso(),
+        })
         .eq("id", gold_file_id)
         .execute()
     )

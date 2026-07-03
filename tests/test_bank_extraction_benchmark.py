@@ -129,3 +129,95 @@ def test_run_org_gold_file_benchmark_blocks_missing_source(monkeypatch):
 
     assert exc_info.value.status_code == 400
     assert "source document" in exc_info.value.detail
+
+
+def test_save_extraction_test_run_rejects_upload_linked_manual_run(monkeypatch):
+    db = MemoryDB({"bank_statement_extraction_runs": []})
+    monkeypatch.setattr(beb, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(beb, "ensure_org_write", lambda *_: None)
+
+    payload = beb.SaveTestRunRequest(
+        organisation_id=ORG_ID,
+        bank_statement_upload_id=UPLOAD_ID,
+        document_id="bad-import",
+        validation_result={"can_allocate": True},
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        beb.save_extraction_test_run(payload, AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert "cannot be linked to a bank upload" in exc_info.value.detail
+    assert db.tables["bank_statement_extraction_runs"] == []
+
+
+def test_save_extraction_test_run_allows_offline_benchmark(monkeypatch):
+    db = MemoryDB({"bank_statement_extraction_runs": []})
+    monkeypatch.setattr(beb, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(beb, "ensure_org_write", lambda *_: None)
+
+    payload = beb.SaveTestRunRequest(
+        organisation_id=ORG_ID,
+        document_id="sandbox-import",
+        validation_result={"can_allocate": True, "expected_transaction_count": 1},
+    )
+
+    result = beb.save_extraction_test_run(payload, AUTH)
+
+    assert result["success"] is True
+    run = db.tables["bank_statement_extraction_runs"][0]
+    assert run["bank_statement_upload_id"] is None
+    assert run["can_allocate"] is True
+
+
+def test_create_gold_file_records_verification_timestamp(monkeypatch):
+    db = MemoryDB({"bank_statement_gold_files": []})
+    monkeypatch.setattr(beb, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(beb, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(beb, "now_iso", lambda: "2026-07-03T15:00:00+00:00")
+
+    payload = beb.GoldFileCreate(
+        organisation_id=ORG_ID,
+        document_id="bad-import",
+        bank="ABSA",
+        account_type="current_account",
+        document_variant="pdf",
+        gold_json=_gold_file()["gold_json"],
+        gold_pdf_storage_bucket="statement-files",
+        gold_pdf_storage_path="org/bad.pdf",
+    )
+
+    result = beb.create_gold_file(payload, AUTH)
+
+    assert result["success"] is True
+    gold_file = db.tables["bank_statement_gold_files"][0]
+    assert gold_file["verified_by"] == "user-1"
+    assert gold_file["verified_at"] == "2026-07-03T15:00:00+00:00"
+
+
+def test_create_gold_file_rejects_unreconciled_gold_json(monkeypatch):
+    bad_gold = {
+        **_gold_file()["gold_json"],
+        "closing_balance": 800,
+    }
+    db = MemoryDB({"bank_statement_gold_files": []})
+    monkeypatch.setattr(beb, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(beb, "ensure_org_write", lambda *_: None)
+
+    payload = beb.GoldFileCreate(
+        organisation_id=ORG_ID,
+        document_id="bad-import",
+        bank="ABSA",
+        account_type="current_account",
+        document_variant="pdf",
+        gold_json=bad_gold,
+        gold_pdf_storage_bucket="statement-files",
+        gold_pdf_storage_path="org/bad.pdf",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        beb.create_gold_file(payload, AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert "Corrected gold JSON cannot be saved" in exc_info.value.detail["message"]
+    assert db.tables["bank_statement_gold_files"] == []

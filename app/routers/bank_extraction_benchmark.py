@@ -8,8 +8,12 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
-from app.routers.bank import _auth
-from app.services.bank_extraction_validation import build_extracted_document, evaluate_extracted_against_gold
+from app.routers.bank import _auth, now_iso
+from app.services.bank_extraction_validation import (
+    build_extracted_document,
+    evaluate_extracted_against_gold,
+    validate_gold_document_integrity,
+)
 from app.services.bank_statement_service import extract_statement
 
 router = APIRouter(prefix="/api/bank-extraction", tags=["bank-extraction-benchmark"])
@@ -82,11 +86,19 @@ def save_extraction_test_run(payload: SaveTestRunRequest, auth: UserAuth):
     organisation_id = str(payload.organisation_id) if payload.organisation_id else None
     if organisation_id:
         ensure_org_write(user_id, organisation_id)
+    if payload.bank_statement_upload_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Ad hoc extraction test runs cannot be linked to a bank upload. "
+                "Run the corrected gold fixture benchmark against the source document instead."
+            ),
+        )
 
     result = payload.validation_result
     row = {
         "organisation_id": organisation_id,
-        "bank_statement_upload_id": str(payload.bank_statement_upload_id) if payload.bank_statement_upload_id else None,
+        "bank_statement_upload_id": None,
         "document_id": payload.document_id,
         "bank": payload.bank,
         "account_type": payload.account_type,
@@ -133,6 +145,13 @@ def create_gold_file(payload: GoldFileCreate, auth: UserAuth):
     organisation_id = str(payload.organisation_id) if payload.organisation_id else None
     if organisation_id:
         ensure_org_write(user_id, organisation_id)
+    if payload.gold_json:
+        gold_blockers = validate_gold_document_integrity(payload.gold_json)
+        if gold_blockers:
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "Corrected gold JSON cannot be saved", "blockers": gold_blockers},
+            )
 
     row = {
         "organisation_id": organisation_id,
@@ -147,6 +166,7 @@ def create_gold_file(payload: GoldFileCreate, auth: UserAuth):
         "gold_pdf_storage_bucket": payload.gold_pdf_storage_bucket,
         "gold_pdf_storage_path": payload.gold_pdf_storage_path,
         "verified_by": user_id,
+        "verified_at": now_iso(),
     }
     res = db.table("bank_statement_gold_files").insert(row).execute()
     return {"success": True, "gold_file": res.data[0] if res.data else None}

@@ -405,6 +405,158 @@ def test_get_bank_upload_extraction_review_returns_source_snapshot_and_lines(mon
     assert result["review_snapshot"]["lines"][0]["import_status"] == "stored"
     assert result["stored_lines"][0]["description"] == "Coffee"
     assert result["approval_blockers"] == []
+    assert result["review_workflow"]["route_hint"]["action_label"] == "Review Extraction"
+    assert result["review_workflow"]["gold_draft"]["transactions"]
+
+
+def test_get_bank_upload_extraction_review_returns_resumable_workflow_state(monkeypatch):
+    upload = _reviewable_upload(
+        source_format="pdf",
+        extracted_at="2026-07-03T10:00:00+00:00",
+        extraction_evidence={
+            "extracted_by": "extractor-1",
+            "source_format": "pdf",
+            "parser_strategy": "pdf_text_blocks",
+            "raw_extracted_transaction_count": 2,
+            "validation": {
+                "closing_balance_passed": True,
+                "running_balance_passed": True,
+            },
+            "running_balance": {"balance_walk_status": "balanced"},
+            "review_snapshot": {
+                "lines": [
+                    {
+                        "row_number": 1,
+                        "import_status": "stored",
+                        "line_date": "2024-01-05",
+                        "description": "Coffee",
+                        "signed_amount": -50,
+                        "balance_amount": 1150,
+                    },
+                    {
+                        "row_number": 2,
+                        "import_status": "stored",
+                        "line_date": "2024-01-06",
+                        "description": "Fuel",
+                        "signed_amount": 50,
+                        "balance_amount": 1200,
+                    },
+                ]
+            },
+        },
+    )
+    db = _MemoryDBWithSignedUrl({
+        "bank_statement_uploads": [upload],
+        "bank_accounts": [_account_row()],
+        "bank_statement_lines": [],
+        "bank_audit_events": [],
+        "bank_statement_gold_files": [
+            {
+                "id": "gold-1",
+                "organisation_id": ORG_ID,
+                "document_id": "corrected-statement",
+                "verified_by": "verifier-1",
+                "verified_at": "2026-07-03T10:05:00+00:00",
+                "gold_json": {
+                    "_apflow_source_upload_id": UPLOAD_ID,
+                    "transactions": [{"transaction_index": 1}],
+                },
+            }
+        ],
+        "bank_statement_extraction_runs": [
+            {
+                "id": "run-1",
+                "organisation_id": ORG_ID,
+                "bank_statement_upload_id": UPLOAD_ID,
+                "document_id": "corrected-statement",
+                "can_allocate": True,
+                "created_at": "2026-07-03T10:10:00+00:00",
+            }
+        ],
+    })
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_read", lambda *_: None)
+
+    result = bu.get_bank_upload_extraction_review(UPLOAD_ID, ORG_ID, AUTH)
+
+    workflow = result["review_workflow"]
+    assert workflow["route_hint"]["bank_cash_review_path"] == (
+        f"/bank-cash/accounts/{ACCOUNT_ID}/uploads/{UPLOAD_ID}/review"
+    )
+    assert workflow["route_hint"]["show_review_action"] is True
+    assert workflow["requires_corrected_fixture"] is True
+    assert workflow["has_corrected_fixture"] is True
+    assert workflow["has_independent_gold_verifier"] is True
+    assert workflow["latest_gold_file"]["id"] == "gold-1"
+    assert workflow["latest_benchmark_run"]["id"] == "run-1"
+    assert workflow["benchmark_status"] == "passed"
+    assert workflow["approval_blockers"] == []
+    assert workflow["actions"] == {
+        "can_save_gold_file": True,
+        "can_run_benchmark": True,
+        "can_approve": True,
+    }
+
+
+def test_get_bank_upload_extraction_review_flags_same_gold_verifier(monkeypatch):
+    upload = _reviewable_upload(
+        source_format="pdf",
+        extracted_at="2026-07-03T10:00:00+00:00",
+        extraction_evidence={
+            "extracted_by": "extractor-1",
+            "source_format": "pdf",
+            "parser_strategy": "pdf_text_blocks",
+            "raw_extracted_transaction_count": 2,
+            "validation": {
+                "closing_balance_passed": True,
+                "running_balance_passed": True,
+            },
+            "running_balance": {"balance_walk_status": "balanced"},
+            "review_snapshot": {
+                "lines": [
+                    {"row_number": 1, "import_status": "stored", "signed_amount": -50},
+                    {"row_number": 2, "import_status": "stored", "signed_amount": 50},
+                ]
+            },
+        },
+    )
+    db = _MemoryDBWithSignedUrl({
+        "bank_statement_uploads": [upload],
+        "bank_accounts": [_account_row()],
+        "bank_statement_lines": [],
+        "bank_audit_events": [],
+        "bank_statement_gold_files": [
+            {
+                "id": "gold-1",
+                "organisation_id": ORG_ID,
+                "document_id": "corrected-statement",
+                "verified_by": "reviewer-1",
+                "verified_at": "2026-07-03T10:05:00+00:00",
+                "gold_json": {
+                    "_apflow_source_upload_id": UPLOAD_ID,
+                    "transactions": [{"transaction_index": 1}],
+                },
+            }
+        ],
+        "bank_statement_extraction_runs": [
+            {
+                "id": "run-1",
+                "organisation_id": ORG_ID,
+                "bank_statement_upload_id": UPLOAD_ID,
+                "document_id": "corrected-statement",
+                "can_allocate": True,
+                "created_at": "2026-07-03T10:10:00+00:00",
+            }
+        ],
+    })
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_read", lambda *_: None)
+
+    workflow = bu.get_bank_upload_extraction_review(UPLOAD_ID, ORG_ID, AUTH)["review_workflow"]
+
+    assert workflow["has_independent_gold_verifier"] is False
+    assert workflow["actions"]["can_approve"] is False
+    assert any("different from the corrected gold fixture verifier" in blocker for blocker in workflow["approval_blockers"])
 
 
 def test_get_bank_upload_extraction_review_404_when_upload_missing(monkeypatch):
@@ -595,6 +747,47 @@ def test_create_bank_upload_gold_file_rejects_empty_gold_json(monkeypatch):
     assert "transactions" in exc_info.value.detail
 
 
+def test_create_bank_upload_gold_file_rejects_unreconciled_gold_json(monkeypatch):
+    gold_json = {
+        "document_id": "bad-gold",
+        "bank": "ABSA",
+        "account_type": "current_account",
+        "document_variant": "corrected_pdf",
+        "statement_start_date": "2024-01-01",
+        "statement_end_date": "2024-01-31",
+        "opening_balance": 1000.0,
+        "closing_balance": 800.0,
+        "transactions": [
+            {
+                "transaction_index": 1,
+                "date": "2024-01-05",
+                "description": "Coffee",
+                "amount": -50,
+                "running_balance": 900,
+            }
+        ],
+    }
+    db = MemoryDB({
+        "bank_statement_uploads": [_upload_row()],
+        "bank_accounts": [_account_row()],
+        "bank_statement_gold_files": [],
+    })
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bu.create_bank_upload_gold_file(
+            UPLOAD_ID,
+            bu.CreateGoldFileFromUploadRequest(organisation_id=ORG_ID, gold_json=gold_json),
+            AUTH,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "Corrected gold JSON cannot be saved" in exc_info.value.detail["message"]
+    assert any("running balances" in blocker for blocker in exc_info.value.detail["blockers"])
+    assert db.tables["bank_statement_gold_files"] == []
+
+
 def _reviewable_upload(**overrides):
     row = {
         "extraction_status": "needs_review",
@@ -681,6 +874,100 @@ def test_approve_bank_upload_extraction_requires_attestation(monkeypatch):
 
     assert exc_info.value.status_code == 400
     assert "transaction count" in exc_info.value.detail["blockers"][0]
+    assert db.tables["bank_statement_uploads"][0]["extraction_status"] == "needs_review"
+
+
+def test_approve_bank_upload_extraction_requires_gold_fixture_for_pdf(monkeypatch):
+    upload = _reviewable_upload(
+        source_format="pdf",
+        extraction_evidence={
+            "extracted_by": "extractor-1",
+            "source_format": "pdf",
+            "parser_strategy": "pdf_text_blocks",
+            "raw_extracted_transaction_count": 2,
+            "validation": {
+                "closing_balance_passed": True,
+                "running_balance_passed": True,
+            },
+            "running_balance": {"balance_walk_status": "balanced"},
+            "review_snapshot": {
+                "lines": [
+                    {"row_number": 1, "import_status": "stored"},
+                    {"row_number": 2, "import_status": "stored"},
+                ]
+            },
+        },
+    )
+    db = MemoryDB({
+        "bank_statement_uploads": [upload],
+        "bank_statement_gold_files": [],
+        "bank_statement_extraction_runs": [],
+        "bank_audit_events": [],
+    })
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bu.approve_bank_upload_extraction(UPLOAD_ID, _approval_payload(), AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert "corrected gold fixture" in exc_info.value.detail["blockers"][0]
+    assert db.tables["bank_statement_uploads"][0]["extraction_status"] == "needs_review"
+
+
+def test_approve_bank_upload_extraction_requires_independent_gold_verifier(monkeypatch):
+    upload = _reviewable_upload(
+        source_format="pdf",
+        extraction_evidence={
+            "extracted_by": "extractor-1",
+            "source_format": "pdf",
+            "parser_strategy": "pdf_text_blocks",
+            "raw_extracted_transaction_count": 2,
+            "validation": {
+                "closing_balance_passed": True,
+                "running_balance_passed": True,
+            },
+            "running_balance": {"balance_walk_status": "balanced"},
+            "review_snapshot": {
+                "lines": [
+                    {"row_number": 1, "import_status": "stored"},
+                    {"row_number": 2, "import_status": "stored"},
+                ]
+            },
+        },
+    )
+    db = MemoryDB({
+        "bank_statement_uploads": [upload],
+        "bank_statement_gold_files": [
+            {
+                "id": "gold-1",
+                "organisation_id": ORG_ID,
+                "document_id": "corrected-statement",
+                "verified_by": "reviewer-1",
+                "gold_json": {
+                    "_apflow_source_upload_id": UPLOAD_ID,
+                    "transactions": [{"transaction_index": 1}],
+                },
+            }
+        ],
+        "bank_statement_extraction_runs": [
+            {
+                "organisation_id": ORG_ID,
+                "bank_statement_upload_id": UPLOAD_ID,
+                "document_id": "corrected-statement",
+                "can_allocate": True,
+            }
+        ],
+        "bank_audit_events": [],
+    })
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bu.approve_bank_upload_extraction(UPLOAD_ID, _approval_payload(), AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert "different from the corrected gold fixture verifier" in exc_info.value.detail["blockers"][0]
     assert db.tables["bank_statement_uploads"][0]["extraction_status"] == "needs_review"
 
 

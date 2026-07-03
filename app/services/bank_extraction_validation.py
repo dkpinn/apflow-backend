@@ -16,7 +16,19 @@ from app.services.bank_statement_extraction.common import dec_to_float, money, n
 from app.services.bank_statement_extraction.models import ParsedBankLine
 
 TOLERANCE = Decimal("0.01")
-SOURCE_FORMATS_REQUIRING_MANUAL_REVIEW = {"pdf", "image", "vlm"}
+SOURCE_FORMATS_REQUIRING_MANUAL_REVIEW = {
+    "pdf",
+    "image",
+    "vlm",
+    "png",
+    "jpg",
+    "jpeg",
+    "webp",
+    "heic",
+    "heif",
+    "tif",
+    "tiff",
+}
 PARSER_STRATEGIES_REQUIRING_MANUAL_REVIEW = {"vlm"}
 
 # Amount and balance accuracy matter most; description accuracy matters least.
@@ -137,6 +149,57 @@ def load_gold_csv(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return [normalise_gold_transaction(row) for row in rows]
 
 
+def validate_gold_document_integrity(gold_doc: dict[str, Any]) -> list[str]:
+    """Return blockers when a corrected gold JSON document is not internally
+    complete and reconciled.
+
+    Gold files are treated as human-verified source truth, so they must be
+    stronger than parser output: every transaction needs date, description,
+    amount, and running-balance evidence, and the final balance walk must land
+    on the declared statement closing balance.
+    """
+    blockers: list[str] = []
+    gold = load_gold_json(gold_doc)
+    transactions = gold["transactions"]
+
+    if not gold["statement_start_date"] or not gold["statement_end_date"]:
+        blockers.append("Gold JSON statement period is missing or incomplete")
+    if gold["opening_balance"] is None:
+        blockers.append("Gold JSON opening balance is missing")
+    if gold["closing_balance"] is None:
+        blockers.append("Gold JSON closing balance is missing")
+    if not transactions:
+        blockers.append("Gold JSON must contain at least one transaction")
+
+    nonzero_transactions = [txn for txn in transactions if abs(txn["amount"]) > TOLERANCE]
+    if transactions and not nonzero_transactions:
+        blockers.append("Gold JSON must contain at least one non-zero transaction")
+
+    missing_dates = sum(1 for txn in nonzero_transactions if txn["date"] is None)
+    if missing_dates:
+        blockers.append(f"{missing_dates} gold transaction(s) are missing transaction dates")
+
+    missing_descriptions = sum(1 for txn in nonzero_transactions if not normalize_text(txn["description"]))
+    if missing_descriptions:
+        blockers.append(f"{missing_descriptions} gold transaction(s) are missing descriptions")
+
+    missing_running_balances = sum(1 for txn in nonzero_transactions if txn["running_balance"] is None)
+    if missing_running_balances:
+        blockers.append(f"{missing_running_balances} gold transaction(s) are missing running-balance evidence")
+
+    if gold["opening_balance"] is not None and nonzero_transactions:
+        running = gold["opening_balance"]
+        for txn in nonzero_transactions:
+            running += txn["amount"]
+            if txn["running_balance"] is not None and abs(running - txn["running_balance"]) > TOLERANCE:
+                blockers.append("Gold JSON running balances do not reconcile with cumulative transaction amounts")
+                break
+        if gold["closing_balance"] is not None and abs(running - gold["closing_balance"]) > TOLERANCE:
+            blockers.append("Gold JSON closing balance does not reconcile with opening balance plus transactions")
+
+    return blockers
+
+
 def compare_extracted_to_gold(extracted: list[dict[str, Any]], gold: list[dict[str, Any]]) -> dict[str, Any]:
     """Compare normalised extracted transactions against normalised gold
     transactions, matched by ``transaction_index`` (falling back to position)."""
@@ -231,8 +294,14 @@ def _source_requires_manual_review(header: dict[str, Any]) -> bool:
     return (
         source_format in SOURCE_FORMATS_REQUIRING_MANUAL_REVIEW
         or parser_strategy in PARSER_STRATEGIES_REQUIRING_MANUAL_REVIEW
+        or parser_strategy.startswith("vlm_")
+        or "_vlm" in parser_strategy
         or selected_rescue == "vlm"
     )
+
+
+def source_requires_manual_review(header: dict[str, Any]) -> bool:
+    return _source_requires_manual_review(header)
 
 
 def _count_line_warnings(lines: list[ParsedBankLine]) -> int:
