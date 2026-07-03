@@ -16,8 +16,12 @@ from fastapi import APIRouter, HTTPException
 from app.db.supabase_client import get_fresh_supabase_client
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
 from app.schemas.bank import ApproveExtractionRequest, CreateGoldFileFromUploadRequest
-from app.services.bank_extraction_validation import validate_extracted_statement_quality
-from app.services.bank.extraction_gate import corrected_fixture_benchmark_blockers
+from app.services.bank_extraction_validation import validate_extracted_statement_quality, validate_gold_document_integrity
+from app.services.bank.extraction_gate import (
+    corrected_fixture_benchmark_blockers,
+    corrected_fixture_rows_for_upload,
+    upload_requires_corrected_fixture,
+)
 from app.services.bank_statement_service import (
     correct_amounts_from_balance,
     detect_line_duplicates,
@@ -27,6 +31,7 @@ from app.services.bank_statement_service import (
     validate_running_balance,
 )
 from app.services.extraction_foundation import file_sha256
+from app.services.bank.auto_post import auto_post_matched_lines
 
 from app.routers.bank import (
     BankUploadCreate,
@@ -221,7 +226,7 @@ def create_bank_upload(payload: BankUploadCreate, auth: UserAuth):
     return {"success": True, "upload": upload}
 
 
-def _approval_blockers(upload: dict, db=None) -> list[str]:
+def _approval_blockers(upload: dict, db=None, reviewer_id: str | None = None) -> list[str]:
     blockers: list[str] = []
     evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
     validation = evidence.get("validation") if isinstance(evidence.get("validation"), dict) else {}
@@ -251,6 +256,24 @@ def _approval_blockers(upload: dict, db=None) -> list[str]:
     if duplicate_count:
         blockers.append("Duplicate transaction rows are still present")
     if db is not None:
+        fixture_rows = corrected_fixture_rows_for_upload(
+            db,
+            organisation_id=str(upload.get("organisation_id")),
+            upload_id=str(upload.get("id")),
+        )
+        if upload_requires_corrected_fixture(upload) and not fixture_rows:
+            blockers.append(
+                "PDF/image/VLM bank statement extraction requires a corrected gold fixture and passing benchmark"
+            )
+        if upload_requires_corrected_fixture(upload) and fixture_rows and reviewer_id:
+            has_independent_verifier = any(
+                row.get("verified_by") and str(row.get("verified_by")) != str(reviewer_id)
+                for row in fixture_rows
+            )
+            if not has_independent_verifier:
+                blockers.append(
+                    "PDF/image/VLM bank statement extraction approval must be performed by a reviewer different from the corrected gold fixture verifier"
+                )
         blockers.extend(
             corrected_fixture_benchmark_blockers(
                 db,
@@ -261,6 +284,14 @@ def _approval_blockers(upload: dict, db=None) -> list[str]:
     return blockers
 
 
+def _reviewer_identity_blockers(upload: dict, reviewer_id: str) -> list[str]:
+    evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
+    extracted_by = evidence.get("extracted_by")
+    if reviewer_id in {upload.get("uploaded_by"), extracted_by}:
+        return ["Bank statement extraction must be approved by a different reviewer"]
+    return []
+
+
 def _attestation_blockers(payload: ApproveExtractionRequest) -> list[str]:
     required_checks = [
         (payload.source_document_checked, "Reviewer must confirm the source document was opened and checked"),
@@ -269,6 +300,143 @@ def _attestation_blockers(payload: ApproveExtractionRequest) -> list[str]:
         (payload.balances_checked, "Reviewer must confirm opening, closing, and running balances reconcile"),
     ]
     return [message for passed, message in required_checks if not passed]
+
+
+def _timestamp_key(row: dict, *fields: str) -> str:
+    for field in fields:
+        value = row.get(field)
+        if value:
+            return str(value)
+    return ""
+
+
+def _latest_gold_file(rows: list[dict]) -> dict | None:
+    if not rows:
+        return None
+    return max(rows, key=lambda row: (_timestamp_key(row, "verified_at", "created_at"), str(row.get("id") or "")))
+
+
+def _latest_benchmark_run_for_gold_file(
+    db,
+    *,
+    organisation_id: str,
+    upload_id: str,
+    gold_file: dict | None,
+) -> dict | None:
+    if not gold_file or not gold_file.get("document_id"):
+        return None
+    runs = (
+        db.table("bank_statement_extraction_runs")
+        .select("*")
+        .eq("organisation_id", organisation_id)
+        .eq("bank_statement_upload_id", upload_id)
+        .eq("document_id", gold_file["document_id"])
+        .order("created_at")
+        .execute()
+        .data
+        or []
+    )
+    if not runs:
+        return None
+    return max(runs, key=lambda row: (_timestamp_key(row, "created_at"), str(row.get("id") or "")))
+
+
+def _benchmark_status(
+    *,
+    upload: dict,
+    requires_fixture: bool,
+    latest_gold_file: dict | None,
+    latest_benchmark_run: dict | None,
+) -> str:
+    if not requires_fixture and not latest_gold_file:
+        return "not_required"
+    if requires_fixture and not latest_gold_file:
+        return "missing_gold_file"
+    if latest_gold_file and not latest_benchmark_run:
+        return "not_run"
+
+    run_created_at = _timestamp_key(latest_benchmark_run or {}, "created_at")
+    gold_verified_at = _timestamp_key(latest_gold_file or {}, "verified_at", "created_at")
+    upload_extracted_at = _timestamp_key(upload, "extracted_at")
+    if gold_verified_at and (not run_created_at or run_created_at < gold_verified_at):
+        return "stale_after_gold_correction"
+    if upload_extracted_at and (not run_created_at or run_created_at < upload_extracted_at):
+        return "stale_after_latest_extraction"
+    return "passed" if latest_benchmark_run and latest_benchmark_run.get("can_allocate") is True else "failed"
+
+
+def _gold_draft_or_none(upload: dict, account: dict) -> dict | None:
+    draft = _gold_draft_from_upload(upload, account)
+    return draft if draft["transactions"] else None
+
+
+def _review_workflow_state(
+    db,
+    *,
+    organisation_id: str,
+    upload: dict,
+    account: dict,
+    reviewer_id: str,
+) -> dict:
+    fixture_rows = corrected_fixture_rows_for_upload(
+        db,
+        organisation_id=organisation_id,
+        upload_id=str(upload.get("id")),
+    )
+    latest_gold_file = _latest_gold_file(fixture_rows)
+    latest_benchmark_run = _latest_benchmark_run_for_gold_file(
+        db,
+        organisation_id=organisation_id,
+        upload_id=str(upload.get("id")),
+        gold_file=latest_gold_file,
+    )
+    approval_blockers = (
+        _reviewer_identity_blockers(upload, reviewer_id)
+        if upload.get("extraction_status") == "needs_review"
+        else []
+    ) + _approval_blockers(upload, db, reviewer_id=reviewer_id)
+    requires_fixture = upload_requires_corrected_fixture(upload)
+    status = _benchmark_status(
+        upload=upload,
+        requires_fixture=requires_fixture,
+        latest_gold_file=latest_gold_file,
+        latest_benchmark_run=latest_benchmark_run,
+    )
+    gold_draft = _gold_draft_or_none(upload, account)
+    has_independent_gold_verifier = any(
+        row.get("verified_by") and str(row.get("verified_by")) != str(reviewer_id)
+        for row in fixture_rows
+    )
+    return {
+        "route_hint": {
+            "bank_cash_review_path": (
+                f"/bank-cash/accounts/{upload.get('bank_account_id')}/"
+                f"uploads/{upload.get('id')}/review"
+            ),
+            "action_label": "Review Extraction",
+            "show_review_action": (
+                str(upload.get("extraction_status") or "").lower() in {"needs_review", "failed"}
+                or bool(approval_blockers)
+            ),
+        },
+        "gold_draft": gold_draft,
+        "latest_gold_file": latest_gold_file,
+        "latest_benchmark_run": latest_benchmark_run,
+        "requires_corrected_fixture": requires_fixture,
+        "has_corrected_fixture": bool(fixture_rows),
+        "has_independent_gold_verifier": has_independent_gold_verifier,
+        "benchmark_status": status,
+        "approval_blockers": approval_blockers,
+        "actions": {
+            "can_save_gold_file": gold_draft is not None,
+            "can_run_benchmark": latest_gold_file is not None,
+            "can_approve": (
+                upload.get("extraction_status") == "needs_review"
+                and not approval_blockers
+                and status in {"passed", "not_required"}
+            ),
+        },
+    }
 
 
 @router.post("/uploads/{upload_id}/approve-extraction")
@@ -298,7 +466,7 @@ def approve_bank_upload_extraction(upload_id: str, payload: ApproveExtractionReq
             detail="Bank statement extraction must be approved by a different reviewer",
         )
 
-    blockers = _approval_blockers(upload, db) + _attestation_blockers(payload)
+    blockers = _approval_blockers(upload, db, reviewer_id=user_id) + _attestation_blockers(payload)
     if blockers:
         raise HTTPException(status_code=400, detail={"message": "Bank statement extraction cannot be approved", "blockers": blockers})
 
@@ -383,6 +551,13 @@ def get_bank_upload_extraction_review(upload_id: str, organisation_id: str, auth
     signed_url = access_error = None
     if path:
         signed_url, access_error = _storage_signed_url(db, bucket=bucket, path=path)
+    review_workflow = _review_workflow_state(
+        db,
+        organisation_id=organisation_id,
+        upload=upload,
+        account=account,
+        reviewer_id=user_id,
+    )
     return {
         "success": True,
         "upload": upload,
@@ -397,7 +572,8 @@ def get_bank_upload_extraction_review(upload_id: str, organisation_id: str, auth
         },
         "review_snapshot": review_snapshot,
         "stored_lines": stored_lines,
-        "approval_blockers": _approval_blockers(upload, db),
+        "approval_blockers": review_workflow["approval_blockers"],
+        "review_workflow": review_workflow,
     }
 
 
@@ -471,6 +647,12 @@ def create_bank_upload_gold_file(
     transactions = gold_json.get("transactions") if isinstance(gold_json, dict) else None
     if not isinstance(transactions, list) or not transactions:
         raise HTTPException(status_code=400, detail="Corrected gold JSON must contain transactions")
+    gold_blockers = validate_gold_document_integrity(gold_json)
+    if gold_blockers:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "Corrected gold JSON cannot be saved", "blockers": gold_blockers},
+        )
     gold_json["_apflow_source_upload_id"] = upload_id
     gold_json["_apflow_source_bank_account_id"] = upload.get("bank_account_id")
 
@@ -638,8 +820,30 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             )
             for wrapper in clearable
         ]
+        inserted_line_ids: list[str] = []
         if inserts:
-            db.table("bank_statement_lines").insert(inserts).execute()
+            insert_result = db.table("bank_statement_lines").insert(inserts).execute()
+            inserted_line_ids = [
+                str(row["id"]) for row in (insert_result.data or []) if row.get("id")
+            ]
+
+        if inserted_line_ids:
+            try:
+                auto_result = auto_post_matched_lines(
+                    db,
+                    organisation_id=organisation_id,
+                    bank_account_id=account["id"],
+                    line_ids=inserted_line_ids,
+                )
+                if auto_result["posted_count"]:
+                    logger.info(
+                        "[AUTO_POST] upload=%s posted=%d skipped=%d",
+                        upload_id,
+                        auto_result["posted_count"],
+                        auto_result["skipped_count"],
+                    )
+            except Exception:
+                logger.exception("[AUTO_POST] upload=%s failed — continuing", upload_id)
 
         closing = header.get("closing_balance")
         upload_patch = {
