@@ -465,6 +465,8 @@ def score_invoice_suggestions(
 
 
 RULE_FIELDS = {"description", "raw_text", "counterparty", "reference", "bank_reference"}
+TEXT_OPERATORS = {"contains", "starts_with", "ends_with", "exact"}
+AMOUNT_OPERATORS = {"eq", "gt", "gte", "lt", "lte", "between"}
 
 
 def bank_rule_search_fields(line: dict[str, Any]) -> dict[str, str]:
@@ -477,19 +479,62 @@ def bank_rule_search_fields(line: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def normalize_rule_criteria(criteria: Any) -> list[dict[str, str]]:
+def _match_text(text: str, operator: str, value: str) -> bool:
+    t, v = text.lower(), value.lower()
+    if operator == "starts_with":
+        return t.startswith(v)
+    if operator == "ends_with":
+        return t.endswith(v)
+    if operator == "exact":
+        return t == v
+    return v in t
+
+
+def _match_amount(amount: Decimal, operator: str, value: str, value2: str | None) -> bool:
+    try:
+        v = Decimal(value)
+        a = abs(amount)
+        if operator == "eq":
+            return a == v
+        if operator == "gt":
+            return a > v
+        if operator == "gte":
+            return a >= v
+        if operator == "lt":
+            return a < v
+        if operator == "lte":
+            return a <= v
+        if operator == "between" and value2:
+            return Decimal(value2) >= a >= v
+    except Exception:
+        pass
+    return False
+
+
+def normalize_rule_criteria(criteria: Any) -> list[dict[str, Any]]:
     if not isinstance(criteria, list):
         return []
-    normalized: list[dict[str, str]] = []
+    normalized: list[dict[str, Any]] = []
     for item in criteria:
         if not isinstance(item, dict):
             continue
         field = normalize_text(item.get("field")).lower()
         operator = normalize_text(item.get("operator") or "contains").lower()
         value = normalize_text(item.get("value"))
-        if field not in RULE_FIELDS or operator != "contains" or not value:
-            continue
-        normalized.append({"field": field, "operator": "contains", "value": value})
+        if field == "amount":
+            if operator not in AMOUNT_OPERATORS or not value:
+                continue
+            entry: dict[str, Any] = {"field": "amount", "operator": operator, "value": value}
+            if operator == "between":
+                value2 = normalize_text(item.get("value2"))
+                if not value2:
+                    continue
+                entry["value2"] = value2
+            normalized.append(entry)
+        else:
+            if field not in RULE_FIELDS or operator not in TEXT_OPERATORS or not value:
+                continue
+            normalized.append({"field": field, "operator": operator, "value": value})
     return normalized
 
 
@@ -517,11 +562,18 @@ def rule_matches_criteria(rule: dict[str, Any], line: dict[str, Any]) -> bool:
     if not criteria:
         return False
     mode = normalize_text(rule.get("criteria_mode") or "and").lower()
-    fields = bank_rule_search_fields(line)
-    matches = [
-        normalize_text(item["value"]).lower() in fields.get(item["field"], "")
-        for item in criteria
-    ]
+    text_fields = bank_rule_search_fields(line)
+    signed_amount = money(line.get("signed_amount"))
+
+    def _item_matches(item: dict[str, Any]) -> bool:
+        field = item["field"]
+        operator = item["operator"]
+        value = item["value"]
+        if field == "amount":
+            return _match_amount(signed_amount, operator, value, item.get("value2"))
+        return _match_text(text_fields.get(field, ""), operator, value)
+
+    matches = [_item_matches(item) for item in criteria]
     if mode == "or":
         return any(matches)
     return all(matches)
@@ -532,7 +584,13 @@ def rule_criteria_rationale(rule: dict[str, Any]) -> str:
     if not criteria:
         return f"matched rule: {rule.get('name')}"
     mode = normalize_text(rule.get("criteria_mode") or "and").upper()
-    joined = f" {mode} ".join(f"{item['field']} contains '{item['value']}'" for item in criteria)
+    def _describe(item: dict[str, Any]) -> str:
+        op = item.get("operator", "contains").replace("_", " ")
+        val = item["value"]
+        v2 = item.get("value2")
+        return f"{item['field']} {op} '{val}'" + (f" and '{v2}'" if v2 else "")
+
+    joined = f" {mode} ".join(_describe(item) for item in criteria)
     return f"matched rule: {rule.get('name')} ({joined})"
 
 

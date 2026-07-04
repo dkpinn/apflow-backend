@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from typing import Any, Literal, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query
+
+logger = logging.getLogger(__name__)
 from pydantic import BaseModel, Field, field_validator
 
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
 from app.routers.bank import _auth, _one, log_bank_event, now_iso
+from app.services.bank.auto_post import auto_post_matched_lines
 from app.services.bank_rules import list_bank_rules, preview_bank_rule_matches
 from app.services.bank_statement_service import normalize_rule_criteria
 from app.services.protected_accounts import assert_manual_posting_account_allowed
@@ -161,6 +165,40 @@ def create_rule(payload: BankRuleCreate, auth: UserAuth):
         criteria=criteria,
         criteria_mode=payload.criteria_mode,
     )
+
+    # Retroactively auto-post existing unposted lines that match this new rule.
+    if payload.auto_post and payload.bank_account_id:
+        try:
+            bank_account_id_str = str(payload.bank_account_id)
+            existing = (
+                db.table("bank_statement_lines")
+                .select("id")
+                .eq("organisation_id", organisation_id)
+                .eq("bank_account_id", bank_account_id_str)
+                .eq("posting_status", "unposted")
+                .eq("duplicate_status", "clear")
+                .limit(2000)
+                .execute()
+                .data
+                or []
+            )
+            existing_ids = [str(r["id"]) for r in existing]
+            if existing_ids:
+                auto_result = auto_post_matched_lines(
+                    db,
+                    organisation_id=organisation_id,
+                    bank_account_id=bank_account_id_str,
+                    line_ids=existing_ids,
+                )
+                if auto_result["posted_count"]:
+                    logger.info(
+                        "create_rule retroactive auto_post: rule=%s posted=%d",
+                        rule["id"],
+                        auto_result["posted_count"],
+                    )
+        except Exception:
+            logger.exception("create_rule: retroactive auto_post failed for rule=%s", rule["id"])
+
     return {"success": True, "rule": rule}
 
 
@@ -268,3 +306,29 @@ def test_rule(rule_id: str, payload: BankRuleTestRequest, auth: UserAuth):
         match_count=result["match_count"],
     )
     return {"success": True, **result}
+
+
+@router.delete("/rules/{rule_id}")
+def delete_rule(rule_id: str, organisation_id: str, auth: UserAuth):
+    user_id, db = _auth(auth)
+    ensure_org_write(user_id, organisation_id)
+    _one(
+        db.table("bank_transaction_rules")
+        .select("id")
+        .eq("id", rule_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Bank rule not found",
+    )
+    db.table("bank_transaction_rules").update({"active": False, "updated_at": now_iso()}).eq(
+        "id", rule_id
+    ).eq("organisation_id", organisation_id).execute()
+    log_bank_event(
+        db,
+        organisation_id=organisation_id,
+        event_type="bank_rule_deleted",
+        actor_user_id=user_id,
+        rule_id=rule_id,
+    )
+    return {"success": True}
