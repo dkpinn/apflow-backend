@@ -167,6 +167,7 @@ def create_rule(payload: BankRuleCreate, auth: UserAuth):
     )
 
     # Retroactively auto-post existing unposted lines that match this new rule.
+    retroactive: dict[str, Any] = {}
     if payload.auto_post and payload.bank_account_id:
         try:
             bank_account_id_str = str(payload.bank_account_id)
@@ -190,6 +191,7 @@ def create_rule(payload: BankRuleCreate, auth: UserAuth):
                     bank_account_id=bank_account_id_str,
                     line_ids=existing_ids,
                 )
+                retroactive = auto_result
                 if auto_result["posted_count"]:
                     logger.info(
                         "create_rule retroactive auto_post: rule=%s posted=%d",
@@ -199,7 +201,7 @@ def create_rule(payload: BankRuleCreate, auth: UserAuth):
         except Exception:
             logger.exception("create_rule: retroactive auto_post failed for rule=%s", rule["id"])
 
-    return {"success": True, "rule": rule}
+    return {"success": True, "rule": rule, "retroactive": retroactive}
 
 
 @router.get("/rules")

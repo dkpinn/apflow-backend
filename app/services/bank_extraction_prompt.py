@@ -31,7 +31,18 @@ DEFAULT_VLM_PROMPT: str = (
     "Do not emit any row where both debit_amount and credit_amount are 0. "
     "Preserve beneficiary names, activity labels, bank references, and raw row text. "
     "For each activity row, set page_number to the 1-based index of the page it appears on "
-    "(matching the order the pages are provided in)."
+    "(matching the order the pages are provided in). "
+    "RUNNING BALANCE IS A CHECKSUM — this is the most important rule. Every activity row on a bank "
+    "statement prints a running balance in the Balance column. Copy that balance into balance_amount "
+    "for EVERY row, EXACTLY as printed, including the sign. The running balance must reconcile: for each "
+    "row, previous_row_balance + credit_amount - debit_amount MUST equal this row's balance_amount. "
+    "Before returning, walk this arithmetic down every row from the opening balance to the closing "
+    "balance. If any row does not reconcile, you have SKIPPED a transaction row or MISREAD an amount or "
+    "balance in that region — go back, re-read that part of the statement, and fix it before returning. "
+    "COMPLETENESS: extract every transaction on every page. Pages continue tables across page breaks — "
+    "the first row on page 2 follows the last row on page 1; never drop rows at a page boundary and never "
+    "restart numbering. If a value is genuinely illegible, still emit the row with your best reading rather "
+    "than dropping the row entirely."
 )
 
 _CACHE_TTL = 60.0  # seconds

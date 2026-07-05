@@ -152,9 +152,11 @@ class MemoryQuery:
         self._filters: list[tuple] = []
         self._in_filters: list[tuple] = []
         self._limit: int | None = None
+        self._count_mode: str | None = None
 
     def select(self, *_a, **_kw):
         self._op = "select"
+        self._count_mode = _kw.get("count")
         return self
 
     def insert(self, payload):
@@ -194,10 +196,10 @@ class MemoryQuery:
     def execute(self) -> StubResult:
         rows = self._client.tables.setdefault(self._table, [])
         if self._op == "select":
-            result = [r.copy() for r in rows if self._matches(r)]
-            if self._limit is not None:
-                result = result[: self._limit]
-            return StubResult(result)
+            matched = [r.copy() for r in rows if self._matches(r)]
+            total = len(matched)
+            result = matched[: self._limit] if self._limit is not None else matched
+            return StubResult(result, count=total if self._count_mode else None)
         if self._op == "insert":
             items = self._payload if isinstance(self._payload, list) else [self._payload]
             inserted: list[dict] = []

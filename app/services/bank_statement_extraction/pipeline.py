@@ -73,6 +73,135 @@ def _pdf_candidate_score(header: dict[str, Any], lines: list[ParsedBankLine]) ->
     return score
 
 
+def _first_balance_break(
+    header: dict[str, Any], lines: list[ParsedBankLine]
+) -> Optional[dict[str, Any]]:
+    """Return the first row where the running balance stops reconciling.
+
+    Used to build a targeted repair prompt. Returns None when the balance walk
+    is clean (or unverifiable). Kept local to avoid a circular import with
+    bank_statement_service.
+    """
+    if not lines:
+        return None
+    previous = money(header.get("opening_balance")) if header.get("opening_balance") is not None else None
+    for i, line in enumerate(lines):
+        balance = _line_value(line, "balance_amount")
+        if balance is None:
+            if previous is not None:
+                previous = previous + money(_line_value(line, "signed_amount", MONEY_ZERO))
+            continue
+        current = money(balance)
+        if previous is not None:
+            expected = previous + money(_line_value(line, "signed_amount", MONEY_ZERO))
+            if abs(expected - current) > Decimal("0.01"):
+                return {
+                    "row_index": i,
+                    "prev_balance": float(previous),
+                    "expected_balance": float(expected),
+                    "actual_balance": float(current),
+                    "date": str(_line_value(line, "line_date") or ""),
+                    "description": (_line_value(line, "description", "") or "")[:60],
+                }
+        previous = current
+    return None
+
+
+def _attempt_balance_repair(
+    file_bytes: bytes,
+    *,
+    header: dict[str, Any],
+    lines: list[ParsedBankLine],
+    mime_type: str,
+    bank_account_id: str,
+    currency: Optional[str],
+    parsing_hint: Optional[str],
+) -> tuple[dict[str, Any], list[ParsedBankLine]]:
+    """One targeted VLM re-read when the running balance won't reconcile.
+
+    The running balance is a checksum: a break means a row was dropped or an
+    amount misread. We re-prompt the VLM with the exact break location so it can
+    self-correct, then keep whichever candidate scores better on balance
+    integrity. Bounded to a single pass to cap latency/cost.
+    """
+    break_info = _first_balance_break(header, lines)
+    if break_info is None:
+        return header, lines
+
+    baseline_score = _pdf_candidate_score(header, lines)
+
+    from app.services.bank_extraction_prompt import get_active_vlm_prompt
+
+    base_prompt = (parsing_hint or get_active_vlm_prompt()).strip()
+    repair_addendum = (
+        "\n\nCRITICAL RE-READ INSTRUCTION: A previous extraction of this exact "
+        "statement produced a running balance that does not reconcile. "
+        f"Around transaction row {break_info['row_index'] + 1} "
+        f"(date {break_info['date'] or 'unknown'}, '{break_info['description']}'), "
+        f"the balance was {break_info['prev_balance']:.2f} before this row and "
+        f"{break_info['actual_balance']:.2f} on this row, but the extracted amount "
+        f"implies it should have been {break_info['expected_balance']:.2f}. "
+        "This almost always means a transaction row was SKIPPED, or a debit/credit/"
+        "balance was misread, in that region. Re-read the ENTIRE statement, every "
+        "page, every row in printed order. Do NOT skip, merge, or invent rows. For "
+        "each row copy the running balance EXACTLY as printed and ensure every row's "
+        "balance follows arithmetically as prev_balance + credit - debit."
+    )
+    repair_hint = base_prompt + repair_addendum
+
+    try:
+        logger.info(
+            "[EXTRACT] Balance repair pass: break at row %d (expected %.2f, actual %.2f)",
+            break_info["row_index"] + 1,
+            break_info["expected_balance"],
+            break_info["actual_balance"],
+        )
+        repair_header, repair_lines = parse_vlm_statement(
+            file_bytes,
+            mime_type=mime_type or "application/pdf",
+            bank_account_id=bank_account_id,
+            currency=currency,
+            parsing_hint=repair_hint,
+        )
+    except Exception as exc:
+        logger.warning("[EXTRACT] Balance repair pass failed: %s", exc)
+        header["balance_repair"] = {
+            "attempted": True,
+            "selected": "original",
+            "break_row_index": break_info["row_index"],
+            "error": str(exc),
+        }
+        return header, lines
+
+    repair_score = _pdf_candidate_score(repair_header, repair_lines)
+    if repair_lines and repair_score > baseline_score:
+        repair_header["parser_strategy"] = (
+            (header.get("parser_strategy") or "vlm") + "_balance_repaired"
+        )
+        repair_header["balance_repair"] = {
+            "attempted": True,
+            "selected": "repair",
+            "break_row_index": break_info["row_index"],
+            "baseline_score": baseline_score,
+            "repair_score": repair_score,
+        }
+        logger.info(
+            "[EXTRACT] Balance repair improved result (%d -> %d); using repaired extraction",
+            baseline_score,
+            repair_score,
+        )
+        return repair_header, repair_lines
+
+    header["balance_repair"] = {
+        "attempted": True,
+        "selected": "original",
+        "break_row_index": break_info["row_index"],
+        "baseline_score": baseline_score,
+        "repair_score": repair_score,
+    }
+    return header, lines
+
+
 def _record_pdf_rescue_metadata(
     header: dict[str, Any],
     *,
@@ -268,6 +397,21 @@ def extract_statement(
             currency=currency,
             parsing_hint=parsing_hint,
         )
+
+    # Balance-guided auto-repair: for VLM-capable sources (PDF / images) whose
+    # running balance still doesn't reconcile, do ONE targeted re-read before
+    # returning. CSV/XLSX are tabular and deterministic — no VLM repair needed.
+    if selection.source_format in {"pdf", "image"} and lines:
+        if _running_balance_status(header, lines) == "balance_walk_failed":
+            header, lines = _attempt_balance_repair(
+                file_bytes,
+                header=header,
+                lines=lines,
+                mime_type=mime_type,
+                bank_account_id=bank_account_id,
+                currency=currency,
+                parsing_hint=parsing_hint,
+            )
 
     return stamp_extractor_selection(
         header,

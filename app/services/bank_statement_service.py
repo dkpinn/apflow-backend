@@ -221,40 +221,115 @@ def validate_balances(
     return {"balance_status": "balanced", "expected_closing": dec_to_float(expected), "difference": 0}
 
 
-def validate_running_balance(lines: list[ParsedBankLine], header: dict[str, Any]) -> dict[str, Any]:
-    """Walk each line's balance column: prev_balance + credit - debit = curr_balance.
+# Single source of truth for balance reconciliation tolerance (one cent).
+BALANCE_TOLERANCE = Decimal("0.01")
 
-    Returns a summary dict included in extraction_evidence.
+
+def analyze_balance_integrity(
+    lines: list[ParsedBankLine], header: dict[str, Any]
+) -> dict[str, Any]:
+    """Walk the running-balance column and classify every row.
+
+    The running balance is an arithmetic checksum: for each row that carries a
+    balance, ``prev_balance + credit - debit`` must equal ``curr_balance``. When
+    that equation breaks it means one of two things:
+      * the row's own amount was misread (``amount_wrong``), or
+      * one or more transactions are MISSING between the previous balanced row
+        and this one (``row_missing_before``) — a dropped row makes the balance
+        jump by more than the row's own amount.
+
+    Returns per-row diagnostics (aligned to the extraction order, so the review
+    UI can highlight the exact row) plus a summary. ``row_index`` is 0-based and
+    matches the position in ``lines``.
     """
     if not lines:
-        return {"balance_walk_status": "no_lines", "balance_walk_mismatches": 0}
+        return {
+            "balance_walk_status": "no_lines",
+            "balance_walk_mismatches": 0,
+            "balance_walk_details": [],
+            "rows": [],
+            "first_break_row_index": None,
+            "missing_row_suspected": False,
+            "balance_missing_count": 0,
+        }
 
+    opening = header.get("opening_balance")
+    prev_balance: Optional[Decimal] = money(opening) if opening is not None else None
+
+    rows: list[dict] = []
     mismatches: list[dict] = []
-    prev_balance: Optional[Decimal] = (
-        money(header["opening_balance"]) if header.get("opening_balance") is not None else None
-    )
+    first_break_row_index: Optional[int] = None
+    missing_row_suspected = False
+    balance_missing_count = 0
 
     for i, line in enumerate(lines):
         balance_amount = _line_value(line, "balance_amount")
+        credit = money(_line_value(line, "credit_amount", MONEY_ZERO))
+        debit = money(_line_value(line, "debit_amount", MONEY_ZERO))
+        signed = credit - debit
+
+        row: dict[str, Any] = {
+            "row_index": i,
+            "date": str(_line_value(line, "line_date") or ""),
+            "description": (_line_value(line, "description", "") or "")[:60],
+            "amount": dec_to_float(signed),
+            "actual_balance": None,
+            "expected_balance": None,
+            "diff": None,
+            "status": "ok",
+        }
+
         if balance_amount is None:
+            # No balance evidence on this row — we cannot verify it. Report it
+            # rather than silently skipping (silent skips hid real breaks).
+            balance_missing_count += 1
+            row["status"] = "balance_missing"
+            rows.append(row)
+            # prev_balance is unchanged: we roll it forward by this row's amount
+            # so a run of balance-less rows can still be checked at the next one.
+            if prev_balance is not None:
+                prev_balance = prev_balance + signed
             continue
+
         curr = money(balance_amount)
+        row["actual_balance"] = dec_to_float(curr)
+
         if prev_balance is not None:
-            expected = (
-                prev_balance
-                + money(_line_value(line, "credit_amount", MONEY_ZERO))
-                - money(_line_value(line, "debit_amount", MONEY_ZERO))
-            )
+            expected = prev_balance + signed
             diff = abs(expected - curr)
-            if diff > Decimal("0.02"):
+            row["expected_balance"] = dec_to_float(expected)
+            row["diff"] = dec_to_float(diff)
+            if diff > BALANCE_TOLERANCE:
+                # The chain broke. Decide whether the row's amount is wrong or a
+                # transaction is missing before it.
+                actual_delta = curr - prev_balance
+                if abs(actual_delta - signed) > BALANCE_TOLERANCE:
+                    # The real balance movement doesn't match this row's amount.
+                    if abs(signed) <= BALANCE_TOLERANCE and abs(actual_delta) > BALANCE_TOLERANCE:
+                        # This row moved the balance but carries no amount → a
+                        # transaction is missing here.
+                        row["status"] = "row_missing_before"
+                        missing_row_suspected = True
+                    else:
+                        # The balance jumped by more than this row explains — the
+                        # most common cause is a dropped row just before it.
+                        row["status"] = "row_missing_before"
+                        missing_row_suspected = True
+                else:
+                    row["status"] = "amount_wrong"
+                if first_break_row_index is None:
+                    first_break_row_index = i
                 mismatches.append({
                     "row_index": i,
-                    "date": str(_line_value(line, "line_date") or ""),
-                    "description": (_line_value(line, "description", "") or "")[:60],
-                    "expected_balance": dec_to_float(expected),
-                    "actual_balance": dec_to_float(curr),
-                    "diff": dec_to_float(diff),
+                    "date": row["date"],
+                    "description": row["description"],
+                    "expected_balance": row["expected_balance"],
+                    "actual_balance": row["actual_balance"],
+                    "diff": row["diff"],
+                    "status": row["status"],
                 })
+
+        rows.append(row)
         prev_balance = curr
 
     status = "balanced" if not mismatches else "balance_walk_failed"
@@ -262,7 +337,20 @@ def validate_running_balance(lines: list[ParsedBankLine], header: dict[str, Any]
         "balance_walk_status": status,
         "balance_walk_mismatches": len(mismatches),
         "balance_walk_details": mismatches[:20],
+        "rows": rows,
+        "first_break_row_index": first_break_row_index,
+        "missing_row_suspected": missing_row_suspected,
+        "balance_missing_count": balance_missing_count,
     }
+
+
+def validate_running_balance(lines: list[ParsedBankLine], header: dict[str, Any]) -> dict[str, Any]:
+    """Backward-compatible summary wrapper around :func:`analyze_balance_integrity`.
+
+    Existing callers expect ``balance_walk_status`` / ``balance_walk_mismatches``
+    / ``balance_walk_details``; the richer analysis adds per-row diagnostics.
+    """
+    return analyze_balance_integrity(lines, header)
 
 
 def line_to_insert(

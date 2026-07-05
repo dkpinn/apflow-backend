@@ -314,6 +314,7 @@ def validate_extracted_statement_quality(
     header: dict[str, Any],
     duplicate_summary: Optional[dict[str, Any]],
     balance_summary: dict[str, Any],
+    balance_integrity: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Internal consistency checks for an extracted statement, independent of
     any gold file (used as the observational hook in the extraction flow)."""
@@ -367,6 +368,30 @@ def validate_extracted_statement_quality(
         for line in nonzero_lines
     ]
     running_balance_passed = _check_running_balance_continuity(opening_balance, transactions, critical_errors)
+
+    # Enforce the per-row balance-integrity walk (the arithmetic checksum). A
+    # broken chain or a suspected missing row is a hard block — this is what
+    # stops silently-dropped rows and misread amounts from reaching the user as
+    # "Extracted / Balanced".
+    if balance_integrity:
+        walk_status = balance_integrity.get("balance_walk_status")
+        if walk_status == "balance_walk_failed":
+            first_break = balance_integrity.get("first_break_row_index")
+            where = f" near row {first_break + 1}" if isinstance(first_break, int) else ""
+            if balance_integrity.get("missing_row_suspected"):
+                critical_errors.append(
+                    f"Running balance does not reconcile{where} — a transaction appears to be missing or misread"
+                )
+            else:
+                critical_errors.append(
+                    f"Running balance does not reconcile{where} — a transaction amount appears misread"
+                )
+            running_balance_passed = False
+        missing_balance_rows = int(balance_integrity.get("balance_missing_count", 0) or 0)
+        if missing_balance_rows:
+            warnings.append(
+                f"{missing_balance_rows} transaction(s) have no running-balance evidence to verify against"
+            )
 
     can_allocate = not bool(critical_errors)
     return {

@@ -7,11 +7,16 @@ bank.py does NOT import this module — no circular import risk.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import re
 from pathlib import Path
 from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 from app.db.supabase_client import get_fresh_supabase_client
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
@@ -23,6 +28,7 @@ from app.services.bank.extraction_gate import (
     upload_requires_corrected_fixture,
 )
 from app.services.bank_statement_service import (
+    analyze_balance_integrity,
     correct_amounts_from_balance,
     detect_line_duplicates,
     extract_statement,
@@ -47,6 +53,7 @@ from app.routers.bank import (
     lookup_parsing_hint,
     now_iso,
 )
+from app.services.bank_statement_extraction.common import transaction_fingerprint
 from app.services.bank_statement_extraction.vlm_bank_router import identify_bank
 
 logger = logging.getLogger(__name__)
@@ -226,7 +233,7 @@ def create_bank_upload(payload: BankUploadCreate, auth: UserAuth):
     return {"success": True, "upload": upload}
 
 
-def _approval_blockers(upload: dict, db=None, reviewer_id: str | None = None) -> list[str]:
+def _approval_blockers(upload: dict, db=None, reviewer_id: str | None = None, is_single_user: bool = False) -> list[str]:
     blockers: list[str] = []
     evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
     validation = evidence.get("validation") if isinstance(evidence.get("validation"), dict) else {}
@@ -265,7 +272,7 @@ def _approval_blockers(upload: dict, db=None, reviewer_id: str | None = None) ->
             blockers.append(
                 "PDF/image/VLM bank statement extraction requires a corrected gold fixture and passing benchmark"
             )
-        if upload_requires_corrected_fixture(upload) and fixture_rows and reviewer_id:
+        if upload_requires_corrected_fixture(upload) and fixture_rows and reviewer_id and not is_single_user:
             has_independent_verifier = any(
                 row.get("verified_by") and str(row.get("verified_by")) != str(reviewer_id)
                 for row in fixture_rows
@@ -284,7 +291,24 @@ def _approval_blockers(upload: dict, db=None, reviewer_id: str | None = None) ->
     return blockers
 
 
-def _reviewer_identity_blockers(upload: dict, reviewer_id: str) -> list[str]:
+def _is_single_user_org(db, organisation_id: str) -> bool:
+    result = (
+        db.table("organisation_users")
+        .select("id", count="exact")
+        .eq("organisation_id", organisation_id)
+        .execute()
+    )
+    # Prefer the exact server count, but fall back to the returned rows when the
+    # driver does not populate `count` (e.g. some stubs / older postgrest).
+    member_count = result.count
+    if member_count is None:
+        member_count = len(result.data or [])
+    return member_count <= 1
+
+
+def _reviewer_identity_blockers(upload: dict, reviewer_id: str, is_single_user: bool = False) -> list[str]:
+    if is_single_user:
+        return []
     evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
     extracted_by = evidence.get("extracted_by")
     if reviewer_id in {upload.get("uploaded_by"), extracted_by}:
@@ -377,6 +401,7 @@ def _review_workflow_state(
     upload: dict,
     account: dict,
     reviewer_id: str,
+    is_single_user: bool = False,
 ) -> dict:
     fixture_rows = corrected_fixture_rows_for_upload(
         db,
@@ -391,10 +416,10 @@ def _review_workflow_state(
         gold_file=latest_gold_file,
     )
     approval_blockers = (
-        _reviewer_identity_blockers(upload, reviewer_id)
+        _reviewer_identity_blockers(upload, reviewer_id, is_single_user=is_single_user)
         if upload.get("extraction_status") == "needs_review"
         else []
-    ) + _approval_blockers(upload, db, reviewer_id=reviewer_id)
+    ) + _approval_blockers(upload, db, reviewer_id=reviewer_id, is_single_user=is_single_user)
     requires_fixture = upload_requires_corrected_fixture(upload)
     status = _benchmark_status(
         upload=upload,
@@ -458,15 +483,16 @@ def approve_bank_upload_extraction(upload_id: str, payload: ApproveExtractionReq
     if upload.get("extraction_status") != "needs_review":
         raise HTTPException(status_code=400, detail="Only bank statement uploads needing review can be approved")
 
+    single_user = _is_single_user_org(db, organisation_id)
     evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
     extracted_by = evidence.get("extracted_by")
-    if user_id in {upload.get("uploaded_by"), extracted_by}:
+    if not single_user and user_id in {upload.get("uploaded_by"), extracted_by}:
         raise HTTPException(
             status_code=400,
             detail="Bank statement extraction must be approved by a different reviewer",
         )
 
-    blockers = _approval_blockers(upload, db, reviewer_id=user_id) + _attestation_blockers(payload)
+    blockers = _approval_blockers(upload, db, reviewer_id=user_id, is_single_user=single_user) + _attestation_blockers(payload)
     if blockers:
         raise HTTPException(status_code=400, detail={"message": "Bank statement extraction cannot be approved", "blockers": blockers})
 
@@ -557,6 +583,7 @@ def get_bank_upload_extraction_review(upload_id: str, organisation_id: str, auth
         upload=upload,
         account=account,
         reviewer_id=user_id,
+        is_single_user=_is_single_user_org(db, organisation_id),
     )
     return {
         "success": True,
@@ -690,6 +717,209 @@ def create_bank_upload_gold_file(
     return {"success": True, "gold_file": gold_file}
 
 
+class CorrectionVerifyRequest(BaseModel):
+    organisation_id: UUID
+    row_index: int
+    original_description: Optional[str] = None
+    original_amount: Optional[float] = None
+    corrected_date: Optional[str] = None
+    corrected_description: Optional[str] = None
+    corrected_debit: Optional[float] = None
+    corrected_credit: Optional[float] = None
+
+
+@router.post("/uploads/{upload_id}/verify-correction")
+def verify_bank_upload_correction(
+    upload_id: str,
+    payload: CorrectionVerifyRequest,
+    auth: UserAuth,
+):
+    user_id, db = _auth(auth)
+    organisation_id = str(payload.organisation_id)
+    ensure_org_read(user_id, organisation_id)
+
+    upload = _one(
+        db.table("bank_statement_uploads")
+        .select("*")
+        .eq("id", upload_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Bank statement upload not found",
+    )
+
+    storage_path = upload.get("storage_path")
+    if not storage_path:
+        raise HTTPException(status_code=400, detail="Upload has no associated file")
+
+    try:
+        file_bytes = db.storage.from_(upload.get("storage_bucket") or "statement-files").download(storage_path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not download upload file: {exc}") from exc
+
+    ext = Path(storage_path).suffix.lower()
+    mime_type = {
+        ".pdf": "application/pdf",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(ext, "application/pdf")
+
+    row_num = payload.row_index + 1
+    orig_desc = payload.original_description or "(unknown)"
+    orig_amt = payload.original_amount
+    corr_date = payload.corrected_date or "(unknown)"
+    corr_desc = payload.corrected_description or orig_desc
+    corr_debit = payload.corrected_debit
+    corr_credit = payload.corrected_credit
+
+    prompt = (
+        f"This is a bank statement document. Look at transaction row {row_num} (counting from the top of the transactions table, ignoring headers). "
+        f"The automated extraction produced: description='{orig_desc}', amount={orig_amt}. "
+        f"A user corrected it to: date='{corr_date}', description='{corr_desc}', "
+        f"debit={corr_debit}, credit={corr_credit}. "
+        "Based solely on what you can read in the document, does the corrected value match what is printed? "
+        "Return JSON with exactly these fields: "
+        "{\"confirmed_value\": \"<the value you can see printed in the document for the key disputed field>\", "
+        "\"confidence\": \"high\", \"medium\", or \"low\", "
+        "\"explanation\": \"<one sentence explaining what you found in the document>\"}"
+    )
+
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        logger.warning("verify_correction: GOOGLE_API_KEY not set, skipping AI verification")
+        return {"confirmed_value": None, "confidence": "low", "explanation": "AI verification not configured"}
+
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key)
+        model = os.getenv("GEMINI_VLM_MODEL") or "gemini-2.5-flash"
+        response = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+                prompt,
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.0,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = (response.text or "").strip()
+        # Extract first JSON object from the response
+        json_match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group())
+        else:
+            data = json.loads(text) if text else {}
+
+        confirmed_value = str(data.get("confirmed_value") or "")
+        confidence = data.get("confidence", "medium")
+        if confidence not in ("high", "medium", "low"):
+            confidence = "medium"
+        explanation = str(data.get("explanation") or "")
+        return {"confirmed_value": confirmed_value, "confidence": confidence, "explanation": explanation}
+
+    except Exception as exc:
+        logger.exception("verify_correction: AI call failed for upload=%s", upload_id)
+        return {"confirmed_value": None, "confidence": "low", "explanation": f"AI verification failed: {exc}"}
+
+
+class AcceptDuplicateRequest(BaseModel):
+    organisation_id: UUID
+    row_index: int
+
+
+@router.post("/uploads/{upload_id}/accept-duplicate")
+def accept_duplicate_row(upload_id: str, payload: AcceptDuplicateRequest, auth: UserAuth):
+    user_id, db = _auth(auth)
+    organisation_id = str(payload.organisation_id)
+    ensure_org_write(user_id, organisation_id)
+
+    upload = _one(
+        db.table("bank_statement_uploads")
+        .select("*")
+        .eq("id", upload_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Bank statement upload not found",
+    )
+
+    evidence = upload.get("extraction_evidence") or {}
+    review_snapshot = evidence.get("review_snapshot") or {}
+    lines = list(review_snapshot.get("lines") or [])
+    if payload.row_index >= len(lines):
+        raise HTTPException(status_code=400, detail="Row index out of range")
+
+    snap_line = lines[payload.row_index]
+    if snap_line.get("duplicate_status") != "possible_duplicate":
+        raise HTTPException(status_code=400, detail="Row is not flagged as a duplicate")
+
+    bank_account_id = str(upload["bank_account_id"])
+    signed_amount = snap_line.get("signed_amount") or 0
+
+    from decimal import Decimal as _Dec
+    txn_hash = transaction_fingerprint(
+        bank_account_id=bank_account_id,
+        line_date=snap_line.get("line_date"),
+        amount=_Dec(str(abs(float(signed_amount)))),
+        reference=snap_line.get("reference") or "",
+        description=snap_line.get("description") or "",
+        counterparty=snap_line.get("counterparty"),
+    )
+
+    insert_row = {
+        "organisation_id": organisation_id,
+        "bank_account_id": bank_account_id,
+        "bank_statement_upload_id": upload_id,
+        "line_date": snap_line.get("line_date"),
+        "value_date": snap_line.get("value_date"),
+        "description": snap_line.get("description"),
+        "reference": snap_line.get("reference"),
+        "counterparty": snap_line.get("counterparty"),
+        "transaction_type": None,
+        "bank_reference": None,
+        "raw_text": None,
+        "raw_lines": [],
+        "source_page": snap_line.get("source_page"),
+        "source_row_index": snap_line.get("source_row_index"),
+        "extraction_confidence": snap_line.get("extraction_confidence"),
+        "extraction_warnings": snap_line.get("extraction_warnings") or [],
+        "debit_amount": snap_line.get("debit_amount") or 0,
+        "credit_amount": snap_line.get("credit_amount") or 0,
+        "signed_amount": float(signed_amount),
+        "balance_amount": snap_line.get("balance_amount"),
+        "currency": snap_line.get("currency"),
+        "transaction_hash": txn_hash,
+        "duplicate_status": "clear",
+        "match_status": "unmatched",
+        "allocation_status": "unallocated",
+        "posting_status": "unposted",
+    }
+    db.table("bank_statement_lines").insert(insert_row).execute()
+
+    # Update the snapshot so the review dialog reflects the accepted status
+    lines[payload.row_index] = {**snap_line, "duplicate_status": "clear", "import_status": "stored"}
+    review_snapshot["lines"] = lines
+    evidence["review_snapshot"] = review_snapshot
+    db.table("bank_statement_uploads").update({"extraction_evidence": evidence}).eq("id", upload_id).execute()
+
+    log_bank_event(
+        db,
+        organisation_id=organisation_id,
+        event_type="bank_upload_duplicate_accepted",
+        actor_user_id=user_id,
+        bank_account_id=bank_account_id,
+        bank_statement_upload_id=upload_id,
+    )
+    return {"success": True}
+
+
 @router.post("/uploads/{upload_id}/extract")
 def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: UserAuth):
     user_id, db = _auth(auth)
@@ -758,12 +988,14 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             parsing_hint=parsing_hint,
         )
         correction_summary = correct_amounts_from_balance(lines, bank_account_id=account["id"])
-        running_balance_result = validate_running_balance(lines, header)
+        running_balance_result = analyze_balance_integrity(lines, header)
         if running_balance_result["balance_walk_mismatches"]:
             logger.warning(
-                "[BALANCE] Running balance walk failed for upload %s: %d mismatches",
+                "[BALANCE] Running balance walk failed for upload %s: %d mismatches (first break row=%s, missing_row_suspected=%s)",
                 upload_id,
                 running_balance_result["balance_walk_mismatches"],
+                running_balance_result.get("first_break_row_index"),
+                running_balance_result.get("missing_row_suspected"),
             )
         # Refresh the DB connection after the long extraction call (Gemini VLM can take
         # 30-60s) — the persistent HTTP/2 connection may have gone stale while waiting.
@@ -789,6 +1021,7 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             header=header,
             duplicate_summary=duplicate_summary,
             balance_summary=balance_summary,
+            balance_integrity=running_balance_result,
         )
 
         nil_line_count = sum(
@@ -805,10 +1038,23 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
         duplicate_summary["nil_line_count"] = nil_line_count
         duplicate_summary["raw_extracted_transaction_count"] = raw_extracted_transaction_count
         duplicate_summary["stored_line_count"] = stored_line_count
-        review_snapshot_lines = [
-            _review_snapshot_line(wrapper, row_number)
-            for row_number, wrapper in enumerate(line_wrappers, start=1)
-        ]
+        # Map each line's balance-integrity diagnosis (aligned to extraction
+        # order) so the review UI can highlight the exact row where the running
+        # balance breaks or a transaction appears to be missing.
+        balance_rows_by_index = {
+            int(r["row_index"]): r
+            for r in (running_balance_result.get("rows") or [])
+            if r.get("row_index") is not None
+        }
+        review_snapshot_lines = []
+        for row_number, wrapper in enumerate(line_wrappers, start=1):
+            snap = _review_snapshot_line(wrapper, row_number)
+            diag = balance_rows_by_index.get(row_number - 1)
+            if diag:
+                snap["balance_status"] = diag.get("status")
+                snap["balance_expected"] = diag.get("expected_balance")
+                snap["balance_diff"] = diag.get("diff")
+            review_snapshot_lines.append(snap)
 
         inserts = [
             line_to_insert(
@@ -887,6 +1133,11 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
                     "stored_line_count": stored_line_count,
                     "nil_line_count": nil_line_count,
                     "duplicate_line_count": duplicate_line_count,
+                    "balance_walk_status": running_balance_result.get("balance_walk_status"),
+                    "balance_walk_mismatches": running_balance_result.get("balance_walk_mismatches"),
+                    "first_break_row_index": running_balance_result.get("first_break_row_index"),
+                    "missing_row_suspected": running_balance_result.get("missing_row_suspected"),
+                    "balance_missing_count": running_balance_result.get("balance_missing_count"),
                 },
             },
             "extraction_status": "extracted" if validation_result["can_allocate"] else "needs_review",

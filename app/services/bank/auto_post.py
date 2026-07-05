@@ -197,6 +197,7 @@ def auto_post_matched_lines(
 
     posted_count = 0
     skipped_count = 0
+    block_messages: list[str] = []
 
     for line in lines:
         line_id = str(line["id"])
@@ -279,8 +280,17 @@ def auto_post_matched_lines(
                 matched_rule.get("id"),
                 matched_rule.get("name"),
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("auto_post: failed to post line %s", line_id)
             skipped_count += 1
+            # Collect unique human-readable block reasons from DB trigger errors.
+            # postgrest APIError stores the payload dict as args[0].
+            raw = exc.args[0] if exc.args else None
+            if isinstance(raw, dict):
+                msg = raw.get("message") or ""
+            else:
+                msg = str(exc)
+            if msg and msg not in block_messages:
+                block_messages.append(msg)
 
-    return {"posted_count": posted_count, "skipped_count": skipped_count}
+    return {"posted_count": posted_count, "skipped_count": skipped_count, "block_messages": block_messages}

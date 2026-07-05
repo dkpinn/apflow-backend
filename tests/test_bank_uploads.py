@@ -525,6 +525,10 @@ def test_get_bank_upload_extraction_review_flags_same_gold_verifier(monkeypatch)
         "bank_accounts": [_account_row()],
         "bank_statement_lines": [],
         "bank_audit_events": [],
+        "organisation_users": [
+            {"id": "ou-1", "organisation_id": ORG_ID, "user_id": "extractor-1"},
+            {"id": "ou-2", "organisation_id": ORG_ID, "user_id": "reviewer-1"},
+        ],
         "bank_statement_gold_files": [
             {
                 "id": "gold-1",
@@ -938,6 +942,10 @@ def test_approve_bank_upload_extraction_requires_independent_gold_verifier(monke
     )
     db = MemoryDB({
         "bank_statement_uploads": [upload],
+        "organisation_users": [
+            {"id": "ou-1", "organisation_id": ORG_ID, "user_id": "extractor-1"},
+            {"id": "ou-2", "organisation_id": ORG_ID, "user_id": "reviewer-1"},
+        ],
         "bank_statement_gold_files": [
             {
                 "id": "gold-1",
@@ -972,7 +980,13 @@ def test_approve_bank_upload_extraction_requires_independent_gold_verifier(monke
 
 
 def test_approve_bank_upload_extraction_blocks_self_approval(monkeypatch):
-    db = MemoryDB({"bank_statement_uploads": [_reviewable_upload()]})
+    db = MemoryDB({
+        "bank_statement_uploads": [_reviewable_upload()],
+        "organisation_users": [
+            {"id": "ou-1", "organisation_id": ORG_ID, "user_id": "extractor-1"},
+            {"id": "ou-2", "organisation_id": ORG_ID, "user_id": "reviewer-9"},
+        ],
+    })
     monkeypatch.setattr(bu, "_auth", lambda _: ("extractor-1", db))
     monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
 
