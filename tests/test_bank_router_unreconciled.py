@@ -591,3 +591,68 @@ def test_bank_extraction_runs_rls_blocks_direct_upload_linked_writes():
     assert 'CREATE POLICY "bank_extraction_runs_delete_ad_hoc"' in migration
     assert "bank_statement_upload_id IS NULL" in migration
     assert "FOR INSERT TO authenticated" in migration
+
+
+def test_extracted_upload_with_failed_benchmark_is_not_blocked_by_default(monkeypatch):
+    # After approval the upload is 'extracted'. A saved gold fixture whose benchmark
+    # failed must NOT keep its lines out of reconciliation in the default
+    # optional/internal fixture mode — the lines should appear and the banner clear.
+    db = _DB(
+        {
+            "bank_accounts": [
+                {"id": "bank-1", "organisation_id": "org-1", "name": "Cheque Account"},
+            ],
+            "bank_statement_lines": [
+                {
+                    "id": "approved-line",
+                    "organisation_id": "org-1",
+                    "bank_account_id": "bank-1",
+                    "bank_statement_upload_id": "upload-extracted",
+                    "line_date": "2024-04-02",
+                    "source_row_index": 0,
+                    "posting_status": "unposted",
+                    "allocation_status": "unallocated",
+                    "review_status": "pending",
+                },
+            ],
+            "bank_statement_uploads": [
+                {
+                    "id": "upload-extracted",
+                    "organisation_id": "org-1",
+                    "bank_account_id": "bank-1",
+                    "original_filename": "scan.pdf",
+                    "uploaded_at": "2026-05-31T12:00:00Z",
+                    "extraction_status": "extracted",
+                    "source_format": "pdf",
+                    "extraction_evidence": {"parser_strategy": "vlm", "pdf_rescue": {"selected": "vlm"}},
+                },
+            ],
+            "bank_statement_gold_files": [
+                {
+                    "id": "gold-1",
+                    "organisation_id": "org-1",
+                    "document_id": "scan",
+                    "gold_json": {"_apflow_source_upload_id": "upload-extracted"},
+                },
+            ],
+            "bank_statement_extraction_runs": [
+                {
+                    "id": "run-1",
+                    "organisation_id": "org-1",
+                    "bank_statement_upload_id": "upload-extracted",
+                    "document_id": "scan",
+                    "can_allocate": False,
+                },
+            ],
+            "bank_audit_events": [],
+            "bank_transaction_suggestions": [],
+        }
+    )
+    calls = []
+    _patch_auth(monkeypatch, db, calls)
+
+    result = bank.list_bank_account_unreconciled_lines("bank-1", "org-1", auth=("user-1", None))
+
+    assert [line["id"] for line in result["lines"]] == ["approved-line"]
+    assert result["blocked_extraction_line_count"] == 0
+    assert result["blocked_extraction_upload_count"] == 0

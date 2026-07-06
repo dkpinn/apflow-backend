@@ -1166,3 +1166,105 @@ def test_approve_bank_upload_extraction_blocks_failed_corrected_fixture_benchmar
 
     assert exc_info.value.status_code == 400
     assert "benchmark did not match" in exc_info.value.detail["blockers"][0]
+
+
+def test_accept_duplicate_clears_the_duplicate_approval_blocker(monkeypatch):
+    # Regression: accepting a "possible duplicate" stored the row but left
+    # duplicate_line_count untouched, so the "Duplicate transaction rows are still
+    # present" blocker never cleared and Approve stayed disabled forever.
+    upload = {
+        "id": UPLOAD_ID,
+        "organisation_id": ORG_ID,
+        "bank_account_id": ACCOUNT_ID,
+        "extraction_status": "needs_review",
+        "duplicate_line_count": 1,
+        "extracted_line_count": 2,
+        "duplicate_status": "possible_duplicate",
+        "duplicate_summary": {"duplicate_line_count": 1, "stored_line_count": 2},
+        "extraction_evidence": {
+            "review_snapshot": {
+                "lines": [
+                    {
+                        "row_number": 1,
+                        "import_status": "duplicate_filtered",
+                        "duplicate_status": "possible_duplicate",
+                        "line_date": "2024-01-13",
+                        "description": "CHEQUE CARD PURCHASE",
+                        "signed_amount": -330.0,
+                        "debit_amount": 330.0,
+                        "credit_amount": 0,
+                    },
+                ]
+            },
+        },
+    }
+    db = MemoryDB({
+        "bank_statement_uploads": [upload],
+        "bank_statement_lines": [],
+        "bank_audit_events": [],
+    })
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bu, "log_bank_event", lambda _db, **kw: None)
+
+    result = bu.accept_duplicate_row(
+        UPLOAD_ID,
+        bu.AcceptDuplicateRequest(organisation_id=ORG_ID, row_index=0),
+        AUTH,
+    )
+    assert result["success"] is True
+
+    stored = db.tables["bank_statement_uploads"][0]
+    assert stored["duplicate_line_count"] == 0
+    assert stored["duplicate_summary"]["duplicate_line_count"] == 0
+    assert stored["duplicate_status"] == "clear"
+    assert stored["extracted_line_count"] == 3
+    # The blocker that trapped the reviewer is gone; the row was stored.
+    assert bu._structural_blockers(stored) == []
+    assert len(db.tables["bank_statement_lines"]) == 1
+
+
+def test_accept_duplicate_preserves_duplicate_file_status(monkeypatch):
+    # A whole-file duplicate flag must not be flipped to "clear" by accepting one row.
+    upload = {
+        "id": UPLOAD_ID,
+        "organisation_id": ORG_ID,
+        "bank_account_id": ACCOUNT_ID,
+        "extraction_status": "needs_review",
+        "duplicate_line_count": 1,
+        "extracted_line_count": 2,
+        "duplicate_status": "duplicate_file",
+        "duplicate_summary": {"duplicate_line_count": 1, "duplicate_status": "duplicate_file"},
+        "extraction_evidence": {
+            "review_snapshot": {
+                "lines": [
+                    {
+                        "row_number": 1,
+                        "duplicate_status": "possible_duplicate",
+                        "line_date": "2024-01-13",
+                        "description": "CHEQUE CARD PURCHASE",
+                        "signed_amount": -330.0,
+                        "debit_amount": 330.0,
+                        "credit_amount": 0,
+                    },
+                ]
+            },
+        },
+    }
+    db = MemoryDB({
+        "bank_statement_uploads": [upload],
+        "bank_statement_lines": [],
+        "bank_audit_events": [],
+    })
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bu, "log_bank_event", lambda _db, **kw: None)
+
+    bu.accept_duplicate_row(
+        UPLOAD_ID,
+        bu.AcceptDuplicateRequest(organisation_id=ORG_ID, row_index=0),
+        AUTH,
+    )
+    stored = db.tables["bank_statement_uploads"][0]
+    assert stored["duplicate_status"] == "duplicate_file"
+    assert stored["duplicate_line_count"] == 0

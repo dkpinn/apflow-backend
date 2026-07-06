@@ -7,7 +7,10 @@ from fastapi import HTTPException
 from app.schemas.bank import BankAccountCreate, BankBalanceSummary
 from app.services.bank_account_summary import build_bank_balance_summary
 from app.services.bank_statement_service import money
-from app.services.bank.extraction_gate import corrected_fixture_benchmark_blockers
+from app.services.bank.extraction_gate import (
+    corrected_fixture_benchmark_blockers,
+    upload_requires_corrected_fixture,
+)
 from app.services.protected_accounts import assert_manual_posting_account_allowed
 
 
@@ -89,17 +92,26 @@ def get_unreconciled_lines_payload(
     except Exception:
         upload_rows = []
     uploads_by_id = {str(row.get("id")): row for row in upload_rows if row.get("id")}
-    blocked_upload_ids = {
-        str(upload.get("id"))
-        for upload in upload_rows
-        if str(upload.get("extraction_status") or "").lower() != "extracted"
-        or bool(
+    def _is_blocked(upload: dict[str, Any]) -> bool:
+        # Not yet reviewed/approved → blocked.
+        if str(upload.get("extraction_status") or "").lower() != "extracted":
+            return True
+        # A failed/stale benchmark only blocks reconciliation when a corrected gold
+        # fixture is actually required (strict mode). In the default optional/internal
+        # mode a saved-but-failing internal benchmark must not keep approved lines out
+        # of reconciliation — consistent with the approval gate.
+        if not upload_requires_corrected_fixture(upload):
+            return False
+        return bool(
             corrected_fixture_benchmark_blockers(
                 db,
                 organisation_id=organisation_id,
                 upload_id=str(upload.get("id")),
             )
         )
+
+    blocked_upload_ids = {
+        str(upload.get("id")) for upload in upload_rows if _is_blocked(upload)
     }
     candidate_lines = [row for row in rows if is_unreconciled_bank_line(row)]
     blocked_lines = [

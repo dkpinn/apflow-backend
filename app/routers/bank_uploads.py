@@ -937,8 +937,38 @@ def accept_duplicate_row(upload_id: str, payload: AcceptDuplicateRequest, auth: 
     # Update the snapshot so the review dialog reflects the accepted status
     lines[payload.row_index] = {**snap_line, "duplicate_status": "clear", "import_status": "stored"}
     review_snapshot["lines"] = lines
+
+    # The row is now stored and no longer an outstanding duplicate. Decrement the
+    # counts the approval gate checks (duplicate_line_count / duplicate_summary),
+    # otherwise the "Duplicate transaction rows are still present" blocker never
+    # clears no matter how many duplicates the reviewer accepts.
+    duplicate_summary = dict(upload.get("duplicate_summary")) if isinstance(upload.get("duplicate_summary"), dict) else {}
+    prev_duplicate_count = int(
+        upload.get("duplicate_line_count")
+        or duplicate_summary.get("duplicate_line_count")
+        or 0
+    )
+    new_duplicate_count = max(0, prev_duplicate_count - 1)
+    new_stored_count = int(upload.get("extracted_line_count") or 0) + 1
+
+    duplicate_summary["duplicate_line_count"] = new_duplicate_count
+    duplicate_summary["stored_line_count"] = new_stored_count
+    if new_duplicate_count == 0 and duplicate_summary.get("duplicate_status") != "duplicate_file":
+        duplicate_summary["duplicate_status"] = "clear"
+
+    review_snapshot["duplicate_line_count"] = new_duplicate_count
+    review_snapshot["stored_line_count"] = new_stored_count
     evidence["review_snapshot"] = review_snapshot
-    db.table("bank_statement_uploads").update({"extraction_evidence": evidence}).eq("id", upload_id).execute()
+
+    upload_update: dict = {
+        "extraction_evidence": evidence,
+        "duplicate_line_count": new_duplicate_count,
+        "extracted_line_count": new_stored_count,
+        "duplicate_summary": duplicate_summary,
+    }
+    if new_duplicate_count == 0 and str(upload.get("duplicate_status") or "") != "duplicate_file":
+        upload_update["duplicate_status"] = "clear"
+    db.table("bank_statement_uploads").update(upload_update).eq("id", upload_id).execute()
 
     log_bank_event(
         db,
