@@ -341,7 +341,28 @@ def get_account_opening_balance(
         organisation_id=organisation_id,
         account_id=str(account.get("id")),
     )
-    journal = _singleton_opening_balance_journal(db, organisation_id=organisation_id)
+    duplicate_warning: dict[str, Any] | None = None
+    journals = _active_opening_balance_journals_any_date(db, organisation_id=organisation_id)
+    if len(journals) > 1:
+        dates = sorted({str(j.get("journal_date")) for j in journals if j.get("journal_date")})
+        duplicate_warning = {
+            "code": "duplicate_opening_balance_journals",
+            "message": (
+                "More than one active opening balance journal exists. "
+                "Consolidate the duplicates before editing opening balances."
+            ),
+            "dates": dates,
+        }
+        journals = sorted(
+            journals,
+            key=lambda row: (
+                str(row.get("journal_date") or ""),
+                str(row.get("id") or ""),
+            ),
+        )
+        journal = journals[0]
+    else:
+        journal = journals[0] if journals else None
     # The opening-balance journal owns its own as-at date; surface that (not the
     # date the caller happened to ask with) so the editor shows the real date.
     if journal and journal.get("journal_date"):
@@ -383,7 +404,7 @@ def get_account_opening_balance(
             "name": retained.get("name"),
             "system_key": retained.get("system_key"),
         },
-        "editable": not is_retained and protected_reason is None,
+        "editable": not duplicate_warning and not is_retained and protected_reason is None,
         "protected_reason": protected_reason,
         "side": side,
         "amount": _out(amount),
@@ -391,7 +412,7 @@ def get_account_opening_balance(
         "normal_amount": _out(normal_amount),
         "debit_amount": _out(debit),
         "credit_amount": _out(credit),
-        "warnings": [],
+        "warnings": [duplicate_warning] if duplicate_warning else [],
     }
 
 

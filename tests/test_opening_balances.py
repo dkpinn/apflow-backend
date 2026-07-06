@@ -491,7 +491,33 @@ def test_get_account_opening_balance_reports_the_real_journal_date():
     assert result["amount"] == 1000.0
 
 
-def test_get_account_opening_balance_blocks_when_duplicates_exist():
+def test_get_account_opening_balance_warns_when_duplicates_exist():
+    db = MemoryDB(_account_level_tables())
+    db.tables["gl_journals"].extend([
+        {"id": "ob-1", "organisation_id": ORG_ID, "source_type": "opening_balance", "status": "posted", "journal_date": "2026-03-01"},
+        {"id": "ob-2", "organisation_id": ORG_ID, "source_type": "opening_balance", "status": "posted", "journal_date": "2026-07-06"},
+    ])
+
+    result = get_account_opening_balance(
+        db,
+        organisation_id=ORG_ID,
+        account_id=ASSET_ID,
+        as_at_date="2026-07-06",
+    )
+
+    assert result["editable"] is False
+    assert result["as_at_date"] == "2026-03-01"
+    assert result["warnings"] == [{
+        "code": "duplicate_opening_balance_journals",
+        "message": (
+            "More than one active opening balance journal exists. "
+            "Consolidate the duplicates before editing opening balances."
+        ),
+        "dates": ["2026-03-01", "2026-07-06"],
+    }]
+
+
+def test_upsert_account_opening_balance_still_blocks_when_duplicates_exist():
     db = MemoryDB(_account_level_tables())
     db.tables["gl_journals"].extend([
         {"id": "ob-1", "organisation_id": ORG_ID, "source_type": "opening_balance", "status": "posted", "journal_date": "2026-03-01"},
@@ -499,11 +525,14 @@ def test_get_account_opening_balance_blocks_when_duplicates_exist():
     ])
 
     with pytest.raises(ValueError, match="More than one active opening balance journal"):
-        get_account_opening_balance(
+        upsert_account_opening_balance(
             db,
             organisation_id=ORG_ID,
             account_id=ASSET_ID,
             as_at_date="2026-07-06",
+            side="debit",
+            amount="100",
+            user_id="user-1",
         )
 
 
