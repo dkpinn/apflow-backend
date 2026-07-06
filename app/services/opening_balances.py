@@ -197,6 +197,60 @@ def _active_opening_balance_journals(db, *, organisation_id: str, as_at_date: st
     return [row for row in rows if row.get("status") != "reversed"]
 
 
+def _active_opening_balance_journals_any_date(db, *, organisation_id: str) -> list[dict[str, Any]]:
+    """All non-reversed opening-balance journals for the org, regardless of date.
+
+    Opening balances are conceptually a single per-org journal (the conversion
+    snapshot). The account-level editor must target that one journal wherever it
+    lives, otherwise editing on a different day silently posts a SECOND opening
+    journal and the trial balance double-counts. See _singleton_opening_balance_journal.
+    """
+    rows = (
+        db.table("gl_journals")
+        .select("id, status, journal_date, description")
+        .eq("organisation_id", organisation_id)
+        .eq("source_type", OPENING_BALANCE_SOURCE)
+        .execute()
+        .data
+        or []
+    )
+    return [row for row in rows if row.get("status") != "reversed"]
+
+
+def _singleton_opening_balance_journal(db, *, organisation_id: str) -> dict[str, Any] | None:
+    """Return the org's single active opening-balance journal, or None.
+
+    Raises when more than one exists so the caller refuses to edit (and the user
+    is pointed at consolidation) rather than compounding a duplicate.
+    """
+    journals = _active_opening_balance_journals_any_date(db, organisation_id=organisation_id)
+    if len(journals) > 1:
+        dates = ", ".join(sorted({str(j.get("journal_date")) for j in journals}))
+        raise ValueError(
+            "More than one active opening balance journal exists "
+            f"({dates}). Consolidate the duplicates before editing opening balances."
+        )
+    return journals[0] if journals else None
+
+
+def get_opening_balance_summary(db, *, organisation_id: str) -> dict[str, Any]:
+    """Org-level opening-balance snapshot for initialising the editor.
+
+    Tolerant of the duplicate state (does not raise) so the settings page can
+    still load and default its date to the real opening date while flagging that
+    consolidation is needed.
+    """
+    journals = _active_opening_balance_journals_any_date(db, organisation_id=organisation_id)
+    dates = sorted({str(j.get("journal_date")) for j in journals if j.get("journal_date")})
+    return {
+        "organisation_id": organisation_id,
+        "exists": bool(journals),
+        "as_at_date": dates[0] if dates else None,
+        "journal_count": len(journals),
+        "duplicate_dates": dates if len(dates) > 1 else [],
+    }
+
+
 def _fetch_journal_lines(db, *, organisation_id: str, journal_id: str) -> list[dict[str, Any]]:
     return (
         db.table("gl_journal_lines")
@@ -287,18 +341,15 @@ def get_account_opening_balance(
         organisation_id=organisation_id,
         account_id=str(account.get("id")),
     )
-    journals = _active_opening_balance_journals(
-        db,
-        organisation_id=organisation_id,
-        as_at_date=parsed_date,
-    )
-    if len(journals) > 1:
-        raise ValueError(f"More than one active opening balance journal exists for {parsed_date}")
+    journal = _singleton_opening_balance_journal(db, organisation_id=organisation_id)
+    # The opening-balance journal owns its own as-at date; surface that (not the
+    # date the caller happened to ask with) so the editor shows the real date.
+    if journal and journal.get("journal_date"):
+        parsed_date = str(journal["journal_date"])
 
     debit = ZERO
     credit = ZERO
     line_id = None
-    journal = journals[0] if journals else None
     if journal:
         lines = _fetch_journal_lines(db, organisation_id=organisation_id, journal_id=str(journal["id"]))
         if is_retained:
@@ -408,27 +459,25 @@ def upsert_account_opening_balance(
     if account.get("active") is False and amount_dec:
         raise ValueError("Inactive accounts cannot be given an opening balance")
 
+    # Opening balances are a single per-org journal. Edit whichever one already
+    # exists (at its own as-at date) instead of keying off the caller's date, so
+    # editing on a different day never posts a duplicate that the TB double-counts.
+    journal = _singleton_opening_balance_journal(db, organisation_id=organisation_id)
+    effective_date = str(journal["journal_date"]) if journal and journal.get("journal_date") else parsed_date
+
     assert_accounting_period_unlocked(
         db,
         organisation_id=organisation_id,
-        transaction_date=parsed_date,
+        transaction_date=effective_date,
         action="Update opening balance",
     )
-
-    journals = _active_opening_balance_journals(
-        db,
-        organisation_id=organisation_id,
-        as_at_date=parsed_date,
-    )
-    if len(journals) > 1:
-        raise ValueError(f"More than one active opening balance journal exists for {parsed_date}")
 
     debit = amount_dec if side == "debit" else ZERO
     credit = amount_dec if side == "credit" else ZERO
     target_description = (description or "").strip() or f"Opening balance - {account.get('code') or account.get('name')}"
     retained_description = f"Opening balance balancing entry - {retained.get('code') or retained.get('name')}"
 
-    if not journals:
+    if journal is None:
         if not amount_dec:
             return {
                 "success": True,
@@ -492,7 +541,6 @@ def upsert_account_opening_balance(
             ),
         }
 
-    journal = journals[0]
     if str(journal.get("status") or "").lower() != "posted":
         raise ValueError("Account-level opening balance editing only supports posted opening balance journals")
     journal_id = str(journal["id"])

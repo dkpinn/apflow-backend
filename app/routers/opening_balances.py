@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
 from app.services.opening_balances import (
     get_account_opening_balance,
+    get_opening_balance_summary,
     post_opening_balance,
     preview_opening_balance,
     upsert_account_opening_balance,
@@ -78,6 +79,17 @@ def get_account_opening_balance_route(
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/summary")
+def get_opening_balance_summary_route(organisation_id: UUID, auth: UserAuth):
+    user_id, db = auth
+    org_id = str(organisation_id)
+    ensure_org_read(str(user_id), org_id)
+    return {
+        "success": True,
+        "summary": get_opening_balance_summary(db, organisation_id=org_id),
+    }
 
 
 @router.put("/account")

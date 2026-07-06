@@ -6,6 +6,7 @@ from fastapi import HTTPException
 import app.routers.opening_balances as ob_router
 from app.services.opening_balances import (
     get_account_opening_balance,
+    get_opening_balance_summary,
     post_opening_balance,
     preview_opening_balance,
     upsert_account_opening_balance,
@@ -426,3 +427,102 @@ def test_upsert_account_opening_balance_route_enforces_write_permission(monkeypa
 
     assert result["success"] is True
     assert calls == [("user-1", ORG_ID)]
+
+
+def test_editing_on_a_different_date_updates_the_same_journal_not_a_duplicate():
+    # Regression: opening balances captured at the conversion date, then edited on
+    # a different day (the settings editor used to default to today). Must UPDATE
+    # the existing journal, not post a second opening-balance journal that the
+    # trial balance would double-count.
+    db = MemoryDB(_account_level_tables())
+    upsert_account_opening_balance(
+        db,
+        organisation_id=ORG_ID,
+        account_id=ASSET_ID,
+        as_at_date="2026-03-01",  # conversion date
+        side="debit",
+        amount="1000",
+        user_id="user-1",
+    )
+
+    upsert_account_opening_balance(
+        db,
+        organisation_id=ORG_ID,
+        account_id=ASSET_ID,
+        as_at_date="2026-07-06",  # edited "today" — a different date
+        side="debit",
+        amount="1500",
+        user_id="user-1",
+    )
+
+    # Exactly one opening-balance journal, still at the original conversion date.
+    opening_journals = [
+        j for j in db.tables["gl_journals"] if j.get("source_type") == "opening_balance"
+    ]
+    assert len(opening_journals) == 1
+    assert opening_journals[0]["journal_date"] == "2026-03-01"
+
+    # The value was replaced (1500), not stacked (would be 2500).
+    by_account = {row["account_id"]: row for row in db.tables["gl_journal_lines"]}
+    assert by_account[ASSET_ID]["debit_amount"] == 1500.0
+    assert by_account[RETAINED_ID]["credit_amount"] == 1500.0
+
+
+def test_get_account_opening_balance_reports_the_real_journal_date():
+    db = MemoryDB(_account_level_tables())
+    upsert_account_opening_balance(
+        db,
+        organisation_id=ORG_ID,
+        account_id=ASSET_ID,
+        as_at_date="2026-03-01",
+        side="debit",
+        amount="1000",
+        user_id="user-1",
+    )
+
+    # Even when queried with today's date, the real conversion date comes back.
+    result = get_account_opening_balance(
+        db,
+        organisation_id=ORG_ID,
+        account_id=ASSET_ID,
+        as_at_date="2026-07-06",
+    )
+    assert result["as_at_date"] == "2026-03-01"
+    assert result["amount"] == 1000.0
+
+
+def test_get_account_opening_balance_blocks_when_duplicates_exist():
+    db = MemoryDB(_account_level_tables())
+    db.tables["gl_journals"].extend([
+        {"id": "ob-1", "organisation_id": ORG_ID, "source_type": "opening_balance", "status": "posted", "journal_date": "2026-03-01"},
+        {"id": "ob-2", "organisation_id": ORG_ID, "source_type": "opening_balance", "status": "posted", "journal_date": "2026-07-06"},
+    ])
+
+    with pytest.raises(ValueError, match="More than one active opening balance journal"):
+        get_account_opening_balance(
+            db,
+            organisation_id=ORG_ID,
+            account_id=ASSET_ID,
+            as_at_date="2026-07-06",
+        )
+
+
+def test_opening_balance_summary_reports_date_and_duplicates():
+    db = MemoryDB(_account_level_tables())
+    assert get_opening_balance_summary(db, organisation_id=ORG_ID) == {
+        "organisation_id": ORG_ID,
+        "exists": False,
+        "as_at_date": None,
+        "journal_count": 0,
+        "duplicate_dates": [],
+    }
+
+    db.tables["gl_journals"].extend([
+        {"id": "ob-1", "organisation_id": ORG_ID, "source_type": "opening_balance", "status": "posted", "journal_date": "2026-03-01"},
+        {"id": "ob-2", "organisation_id": ORG_ID, "source_type": "opening_balance", "status": "posted", "journal_date": "2026-07-06"},
+    ])
+    summary = get_opening_balance_summary(db, organisation_id=ORG_ID)
+    assert summary["exists"] is True
+    assert summary["as_at_date"] == "2026-03-01"
+    assert summary["journal_count"] == 2
+    assert summary["duplicate_dates"] == ["2026-03-01", "2026-07-06"]
