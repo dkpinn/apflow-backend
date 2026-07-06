@@ -23,7 +23,6 @@ DECLARE
   account_row public.bank_accounts%ROWTYPE;
   latest_upload public.bank_statement_uploads%ROWTYPE;
   upload_latest_line_date date;
-  upload_movement numeric := 0;
   all_imported_movement numeric := 0;
   tb_balance numeric;
   coa_opening_balance numeric := 0;
@@ -59,8 +58,8 @@ BEGIN
    LIMIT 1;
 
   IF latest_upload.id IS NOT NULL THEN
-    SELECT max(line_date), coalesce(sum(signed_amount), 0)
-      INTO upload_latest_line_date, upload_movement
+    SELECT max(line_date)
+      INTO upload_latest_line_date
       FROM public.bank_statement_lines
      WHERE organisation_id = p_org_id
        AND bank_account_id = p_bank_account_id
@@ -97,16 +96,7 @@ BEGIN
   bank_statement_balance := coalesce(latest_upload.closing_balance, coa_opening_balance);
 
   calculated_imported_balance :=
-    CASE
-      WHEN latest_upload.id IS NOT NULL
-       AND latest_upload.opening_balance IS NOT NULL
-       AND latest_upload.balance_status = 'balanced'
-       AND latest_upload.opening_balance + upload_movement <> latest_upload.closing_balance
-        THEN latest_upload.closing_balance
-      WHEN latest_upload.id IS NOT NULL AND latest_upload.opening_balance IS NOT NULL
-        THEN latest_upload.opening_balance + upload_movement
-      ELSE coa_opening_balance + all_imported_movement
-    END;
+    coa_opening_balance + all_imported_movement;
 
   current_tb_balance := tb_balance;
   latest_statement_upload_id := latest_upload.id;

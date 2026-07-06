@@ -352,3 +352,52 @@ def test_summary_uses_latest_valid_statement_closing_balance():
     assert summary["calculated_imported_balance"] == 4839.79
     assert summary["current_tb_balance"] == 4489.79
     assert summary["latest_statement_upload_id"] == "latest"
+
+
+def test_summary_imported_balance_uses_all_imported_rows_not_only_latest_upload():
+    summary = build_bank_balance_summary(
+        _DB({
+            "gl_journal_lines": [
+                {
+                    "organisation_id": "org-1",
+                    "account_id": "bank-gl",
+                    "gl_journal_id": "opening",
+                    "debit_amount": "1000.00",
+                    "credit_amount": "0",
+                }
+            ],
+            "gl_journals": [
+                {"id": "opening", "organisation_id": "org-1", "status": "posted", "source_type": "opening_balance"}
+            ],
+        }),
+        organisation_id="org-1",
+        account={
+            "id": "bank-1",
+            "gl_account_id": "bank-gl",
+        },
+        lines=[
+            {"bank_statement_upload_id": "older", "signed_amount": "500.00", "line_date": "2026-05-31"},
+            {"bank_statement_upload_id": "latest", "signed_amount": "25.00", "line_date": "2026-06-30"},
+        ],
+        uploads=[
+            {
+                "id": "older",
+                "extraction_status": "extracted",
+                "statement_period_to": "2026-05-31",
+                "opening_balance": "1000.00",
+                "closing_balance": "1500.00",
+                "uploaded_at": "2026-06-01T00:00:00Z",
+            },
+            {
+                "id": "latest",
+                "extraction_status": "extracted",
+                "statement_period_to": "2026-06-30",
+                "opening_balance": "1000.00",
+                "closing_balance": "1525.00",
+                "uploaded_at": "2026-07-01T00:00:00Z",
+            },
+        ],
+    )
+
+    assert summary["bank_statement_balance"] == 1525.0
+    assert summary["calculated_imported_balance"] == 1525.0

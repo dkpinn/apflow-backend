@@ -389,8 +389,8 @@ def test_latest_statement_summary_rpc_uses_valid_closing_balance():
 
     assert "u.extraction_status = 'extracted'" in migration
     assert "u.closing_balance IS NOT NULL" in migration
-    assert "latest_upload.balance_status = 'balanced'" in migration
-    assert "THEN latest_upload.closing_balance" in migration
+    assert "coalesce(sum(signed_amount), 0)" in migration
+    assert "calculated_imported_balance :=\n    coa_opening_balance + all_imported_movement" in migration
 
 
 def test_skip_is_audited_without_changing_review_status(monkeypatch):

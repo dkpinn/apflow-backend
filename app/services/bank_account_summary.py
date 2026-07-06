@@ -205,7 +205,7 @@ def build_bank_balance_summary(
     uploads: list[dict[str, Any]],
 ) -> dict[str, Any]:
     latest_upload, latest_transaction_date = select_latest_statement(uploads, lines)
-    bank_balance, imported_balance = calculate_statement_balances(latest_upload, lines)
+    bank_balance, _ = calculate_statement_balances(latest_upload, lines)
     gl_account_id = str(account.get("gl_account_id")) if account.get("gl_account_id") else None
     coa_opening_balance = _money(posted_gl_opening_balance(
         db,
@@ -214,9 +214,8 @@ def build_bank_balance_summary(
     ))
     if bank_balance is None:
         bank_balance = float(coa_opening_balance)
-    if imported_balance is None:
-        movement = sum((_money(line.get("signed_amount")) for line in lines), ZERO)
-        imported_balance = float((coa_opening_balance + movement).quantize(Decimal("0.01")))
+    movement = sum((_money(line.get("signed_amount")) for line in lines), ZERO)
+    imported_balance = float((coa_opening_balance + movement).quantize(Decimal("0.01")))
     tb_balance = posted_gl_balance(
         db,
         organisation_id=organisation_id,
