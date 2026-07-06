@@ -887,6 +887,67 @@ def test_approve_bank_upload_extraction_pdf_without_fixture_succeeds_by_default(
     assert db.tables["bank_statement_uploads"][0]["extraction_status"] == "extracted"
 
 
+def test_approve_bank_upload_extraction_attestation_overrides_soft_balance_issues(monkeypatch):
+    # A poorly-read scan whose automatic balance walk does not reconcile. With all
+    # four checks ticked, the reviewer's attestation is the authority and approval
+    # succeeds; the balance issues are surfaced as warnings, not hard blocks.
+    upload = _reviewable_upload(
+        source_format="pdf",
+        balance_status="closing_mismatch",
+        extraction_evidence={
+            "extracted_by": "extractor-1",
+            "source_format": "pdf",
+            "parser_strategy": "pdf_text_blocks_then_vlm",
+            "raw_extracted_transaction_count": 2,
+            "validation": {"closing_balance_passed": False, "running_balance_passed": False},
+            "running_balance": {"balance_walk_status": "balance_walk_failed"},
+            "review_snapshot": {
+                "lines": [
+                    {"row_number": 1, "import_status": "stored"},
+                    {"row_number": 2, "import_status": "stored"},
+                ]
+            },
+        },
+    )
+    db = MemoryDB({
+        "bank_statement_uploads": [upload],
+        "bank_accounts": [_account_row(current_reconciled_balance=1000.0)],
+        "bank_audit_events": [],
+        "bank_statement_gold_files": [],
+        "bank_statement_extraction_runs": [],
+    })
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bu, "log_bank_event", lambda _db, **kw: None)
+    monkeypatch.setattr(bu, "now_iso", lambda: "2026-07-07T12:00:00+02:00")
+
+    result = bu.approve_bank_upload_extraction(UPLOAD_ID, _approval_payload(), AUTH)
+
+    assert result["success"] is True
+    assert db.tables["bank_statement_uploads"][0]["extraction_status"] == "extracted"
+
+    # And the soft issues are reported as warnings (not blockers) for the reviewer.
+    warnings = bu._soft_blockers(upload)
+    assert any("Running balance walk" in w for w in warnings)
+    assert bu._structural_blockers(upload) == []
+
+
+def test_approve_bank_upload_extraction_still_blocks_structural_problem(monkeypatch):
+    # No importable rows is structural — attestation cannot wave it away.
+    db = MemoryDB({
+        "bank_statement_uploads": [_reviewable_upload(source_format="pdf", extracted_line_count=0)],
+    })
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        bu.approve_bank_upload_extraction(UPLOAD_ID, _approval_payload(), AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert any("importable transaction rows" in b for b in exc_info.value.detail["blockers"])
+    assert db.tables["bank_statement_uploads"][0]["extraction_status"] == "needs_review"
+
+
 def test_approve_bank_upload_extraction_requires_attestation(monkeypatch):
     db = MemoryDB({"bank_statement_uploads": [_reviewable_upload()]})
     monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))

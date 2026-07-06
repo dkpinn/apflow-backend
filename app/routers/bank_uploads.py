@@ -234,21 +234,41 @@ def create_bank_upload(payload: BankUploadCreate, auth: UserAuth):
     return {"success": True, "upload": upload}
 
 
-def _approval_blockers(upload: dict, db=None, reviewer_id: str | None = None, is_single_user: bool = False) -> list[str]:
-    blockers: list[str] = []
+def _soft_blockers(upload: dict) -> list[str]:
+    """Balance signals the reviewer's attestation can override.
+
+    For a statement in manual review, the human comparing against the source
+    document is the authority — these automatic checks are shown as warnings, not
+    hard blocks, so a poorly-read scan doesn't trap the reviewer forever. They are
+    covered by the reviewer's `balances_checked` attestation at approval time.
+    """
+    warnings: list[str] = []
     evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
     validation = evidence.get("validation") if isinstance(evidence.get("validation"), dict) else {}
     running_balance = evidence.get("running_balance") if isinstance(evidence.get("running_balance"), dict) else {}
-    duplicate_summary = upload.get("duplicate_summary") if isinstance(upload.get("duplicate_summary"), dict) else {}
 
     if upload.get("balance_status") != "balanced":
-        blockers.append("Statement opening/closing balances are not reconciled")
+        warnings.append("Statement opening/closing balances are not reconciled")
     if validation.get("closing_balance_passed") is not True:
-        blockers.append("Closing balance validation has not passed")
+        warnings.append("Closing balance validation has not passed")
     if validation.get("running_balance_passed") is not True:
-        blockers.append("Running balance validation has not passed")
+        warnings.append("Running balance validation has not passed")
     if running_balance.get("balance_walk_status") not in {None, "balanced"}:
-        blockers.append("Running balance walk has not passed")
+        warnings.append("Running balance walk has not passed")
+    return warnings
+
+
+def _structural_blockers(upload: dict, db=None, reviewer_id: str | None = None, is_single_user: bool = False) -> list[str]:
+    """Hard blockers that no attestation can wave away.
+
+    These are structural integrity problems (nothing to import, an incomplete
+    review snapshot, unresolved duplicates) plus — only under strict gold-fixture
+    mode — the fixture/benchmark/independent-verifier controls.
+    """
+    blockers: list[str] = []
+    evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
+    duplicate_summary = upload.get("duplicate_summary") if isinstance(upload.get("duplicate_summary"), dict) else {}
+
     if int(upload.get("extracted_line_count") or 0) <= 0:
         blockers.append("No importable transaction rows were stored")
     review_snapshot = evidence.get("review_snapshot") if isinstance(evidence.get("review_snapshot"), dict) else {}
@@ -424,7 +444,8 @@ def _review_workflow_state(
         _reviewer_identity_blockers(upload, reviewer_id, is_single_user=is_single_user)
         if upload.get("extraction_status") == "needs_review"
         else []
-    ) + _approval_blockers(upload, db, reviewer_id=reviewer_id, is_single_user=is_single_user)
+    ) + _structural_blockers(upload, db, reviewer_id=reviewer_id, is_single_user=is_single_user)
+    approval_warnings = _soft_blockers(upload)
     requires_fixture = upload_requires_corrected_fixture(upload)
     status = _benchmark_status(
         upload=upload,
@@ -457,6 +478,7 @@ def _review_workflow_state(
         "has_independent_gold_verifier": has_independent_gold_verifier,
         "benchmark_status": status,
         "approval_blockers": approval_blockers,
+        "approval_warnings": approval_warnings,
         "actions": {
             "can_save_gold_file": gold_draft is not None,
             "can_run_benchmark": latest_gold_file is not None,
@@ -497,7 +519,10 @@ def approve_bank_upload_extraction(upload_id: str, payload: ApproveExtractionReq
             detail="Bank statement extraction must be approved by a different reviewer",
         )
 
-    blockers = _approval_blockers(upload, db, reviewer_id=user_id, is_single_user=single_user) + _attestation_blockers(payload)
+    # Only structural problems hard-block. The soft balance signals are covered by
+    # the reviewer's four attestations (below) — for a manually reviewed statement
+    # the human comparing against the source document is the authority.
+    blockers = _structural_blockers(upload, db, reviewer_id=user_id, is_single_user=single_user) + _attestation_blockers(payload)
     if blockers:
         raise HTTPException(status_code=400, detail={"message": "Bank statement extraction cannot be approved", "blockers": blockers})
 
@@ -605,6 +630,7 @@ def get_bank_upload_extraction_review(upload_id: str, organisation_id: str, auth
         "review_snapshot": review_snapshot,
         "stored_lines": stored_lines,
         "approval_blockers": review_workflow["approval_blockers"],
+        "approval_warnings": review_workflow["approval_warnings"],
         "review_workflow": review_workflow,
     }
 
