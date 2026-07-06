@@ -83,6 +83,54 @@ def _numeric_or_none(value) -> float | None:
         return None
 
 
+def _auto_post_upload_lines(
+    db,
+    *,
+    organisation_id: str,
+    bank_account_id: str,
+    upload_id: str,
+    line_ids: list[str] | None = None,
+) -> None:
+    """Run the rule-based auto-post engine for an upload's lines.
+
+    MUST be called only AFTER the upload is marked 'extracted': the
+    prevent_unverified_bank_transaction_journal DB trigger blocks posting a
+    journal for a source line whose upload has not yet been reviewed/approved.
+    Never raises — auto-posting is best-effort and must not abort extraction/approval.
+    """
+    if line_ids is None:
+        rows = (
+            db.table("bank_statement_lines")
+            .select("id")
+            .eq("organisation_id", organisation_id)
+            .eq("bank_statement_upload_id", upload_id)
+            .eq("posting_status", "unposted")
+            .limit(5000)
+            .execute()
+            .data
+            or []
+        )
+        line_ids = [str(row["id"]) for row in rows if row.get("id")]
+    if not line_ids:
+        return
+    try:
+        auto_result = auto_post_matched_lines(
+            db,
+            organisation_id=organisation_id,
+            bank_account_id=bank_account_id,
+            line_ids=line_ids,
+        )
+        if auto_result.get("posted_count"):
+            logger.info(
+                "[AUTO_POST] upload=%s posted=%d skipped=%d",
+                upload_id,
+                auto_result["posted_count"],
+                auto_result["skipped_count"],
+            )
+    except Exception:
+        logger.exception("[AUTO_POST] upload=%s failed — continuing", upload_id)
+
+
 def _review_snapshot_line(wrapper: dict, row_number: int) -> dict:
     line = wrapper["line"]
     duplicate_status = wrapper.get("duplicate_status") or "clear"
@@ -557,6 +605,15 @@ def approve_bank_upload_extraction(upload_id: str, payload: ApproveExtractionReq
             "current_reconciled_balance": upload.get("closing_balance"),
             "last_statement_upload_id": upload_id,
         }).eq("id", upload.get("bank_account_id")).eq("organisation_id", organisation_id).execute()
+    # Now that the upload is 'extracted', auto-post any rule-matched lines that
+    # could not be posted at extraction time (the DB trigger blocks posting before
+    # approval).
+    _auto_post_upload_lines(
+        db,
+        organisation_id=organisation_id,
+        bank_account_id=str(upload.get("bank_account_id")),
+        upload_id=upload_id,
+    )
     log_bank_event(
         db,
         organisation_id=organisation_id,
@@ -1144,24 +1201,6 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
                 str(row["id"]) for row in (insert_result.data or []) if row.get("id")
             ]
 
-        if inserted_line_ids:
-            try:
-                auto_result = auto_post_matched_lines(
-                    db,
-                    organisation_id=organisation_id,
-                    bank_account_id=account["id"],
-                    line_ids=inserted_line_ids,
-                )
-                if auto_result["posted_count"]:
-                    logger.info(
-                        "[AUTO_POST] upload=%s posted=%d skipped=%d",
-                        upload_id,
-                        auto_result["posted_count"],
-                        auto_result["skipped_count"],
-                    )
-            except Exception:
-                logger.exception("[AUTO_POST] upload=%s failed — continuing", upload_id)
-
         closing = header.get("closing_balance")
         upload_patch = {
             "file_sha256": file_hash,
@@ -1228,6 +1267,20 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             ),
         }
         db.table("bank_statement_uploads").update(upload_patch).eq("id", upload_id).execute()
+
+        # Auto-post rule-matched lines only once the upload is 'extracted' (trusted
+        # imports). Statements routed to needs_review are auto-posted after a human
+        # approves them (see approve_bank_upload_extraction). Running this before the
+        # status update above is what tripped the prevent_unverified_bank_transaction_
+        # journal trigger.
+        if validation_result["can_allocate"]:
+            _auto_post_upload_lines(
+                db,
+                organisation_id=organisation_id,
+                bank_account_id=account["id"],
+                upload_id=upload_id,
+                line_ids=inserted_line_ids,
+            )
 
         if validation_result["can_allocate"] and balance_summary["balance_status"] == "balanced" and closing is not None:
             db.table("bank_accounts").update({

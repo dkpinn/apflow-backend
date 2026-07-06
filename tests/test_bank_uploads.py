@@ -1268,3 +1268,30 @@ def test_accept_duplicate_preserves_duplicate_file_status(monkeypatch):
     stored = db.tables["bank_statement_uploads"][0]
     assert stored["duplicate_status"] == "duplicate_file"
     assert stored["duplicate_line_count"] == 0
+
+
+def test_approve_runs_auto_post_after_marking_extracted(monkeypatch):
+    # Regression: auto-post must run only once the upload is 'extracted', otherwise
+    # the prevent_unverified_bank_transaction_journal DB trigger rejects the journal
+    # ("Bank transaction journal is blocked until the statement extraction is
+    # reviewed and approved").
+    db = MemoryDB({
+        "bank_statement_uploads": [_reviewable_upload(source_format="pdf")],
+        "bank_accounts": [_account_row(current_reconciled_balance=1000.0)],
+        "bank_audit_events": [],
+    })
+    seen_status = []
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bu, "log_bank_event", lambda _db, **kw: None)
+    monkeypatch.setattr(bu, "now_iso", lambda: "2026-07-07T12:00:00+02:00")
+
+    def _record_auto_post(db_, **_kwargs):
+        seen_status.append(db_.tables["bank_statement_uploads"][0]["extraction_status"])
+
+    monkeypatch.setattr(bu, "_auto_post_upload_lines", _record_auto_post)
+
+    bu.approve_bank_upload_extraction(UPLOAD_ID, _approval_payload(), AUTH)
+
+    # Auto-post ran exactly once, and only after the upload was marked 'extracted'.
+    assert seen_status == ["extracted"]
