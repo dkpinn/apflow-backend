@@ -1,8 +1,20 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from app.services.bank_extraction_validation import source_requires_manual_review
+
+
+def _gold_fixture_required_globally() -> bool:
+    """Whether a corrected gold fixture + passing benchmark is a hard prerequisite
+    for reconciling/posting a PDF/image upload.
+
+    Off by default: gold files and benchmarks remain available as an internal
+    accuracy tool, but they no longer gate everyday imports. Set
+    BANK_REQUIRE_GOLD_FIXTURE=1 to restore the strict per-upload requirement.
+    """
+    return os.getenv("BANK_REQUIRE_GOLD_FIXTURE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _upload_id_for_line(line: dict[str, Any]) -> str | None:
@@ -56,6 +68,8 @@ def corrected_fixture_rows_for_upload(
 
 
 def upload_requires_corrected_fixture(upload: dict[str, Any]) -> bool:
+    if not _gold_fixture_required_globally():
+        return False
     evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
     raw_extraction = upload.get("raw_extraction") if isinstance(upload.get("raw_extraction"), dict) else {}
     pdf_rescue = evidence.get("pdf_rescue")
@@ -155,6 +169,11 @@ def assert_upload_corrected_fixtures_benchmarked(
         raise ValueError(
             f"{action} is blocked: PDF/image/VLM bank statement extraction requires a corrected gold fixture and passing benchmark"
         )
+    # Only enforce benchmark freshness when gold fixtures are a hard requirement.
+    # With the default (optional/internal) mode, an un-benchmarked gold file saved
+    # for accuracy testing must never block an everyday reconcile/post.
+    if not _gold_fixture_required_globally():
+        return
     blockers = corrected_fixture_benchmark_blockers(
         db,
         organisation_id=organisation_id,

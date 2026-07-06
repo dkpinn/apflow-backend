@@ -149,6 +149,125 @@ def correct_amounts_from_balance(
     return summary
 
 
+def _parse_iso_date(value: Any) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_date(year: int, month: int, day: int) -> Optional[date]:
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None  # e.g. 29 Feb on a non-leap year
+
+
+def _set_line_date(line: ParsedBankLine, new_iso: str, bank_account_id: str) -> None:
+    """Overwrite a line's date and recompute its dedup fingerprint (hash includes the date)."""
+    amount = money(_line_value(line, "signed_amount", MONEY_ZERO))
+    new_hash = transaction_fingerprint(
+        bank_account_id=bank_account_id,
+        line_date=new_iso,
+        amount=amount,
+        reference=_line_value(line, "reference"),
+        counterparty=_line_value(line, "counterparty"),
+        bank_reference=_line_value(line, "bank_reference"),
+        description=_line_value(line, "description"),
+    )
+    if isinstance(line, dict):
+        line["line_date"] = new_iso
+        line["transaction_hash"] = new_hash
+    else:
+        line.line_date = new_iso
+        line.transaction_hash = new_hash
+
+
+def normalize_dates_from_period(
+    lines: list[ParsedBankLine],
+    header: dict[str, Any],
+    *,
+    bank_account_id: str,
+) -> dict[str, Any]:
+    """Derive each transaction's YEAR from the statement period.
+
+    The statement period is ground truth: every transaction must fall within it.
+    VLM extractions frequently attach the wrong year (e.g. December 2025 on a
+    statement running 11 Dec 2024 – 11 Jan 2025) and nothing downstream checks
+    dates, so the error reaches the user unflagged. We keep each row's month and
+    day but recompute the year from the period, using chronological monotonicity
+    to resolve the Dec→Jan boundary, and flag any date that still cannot be
+    placed inside the period.
+    """
+    summary: dict[str, Any] = {
+        "status": "no_period",
+        "line_count": len(lines),
+        "corrections_applied": 0,
+        "out_of_period_count": 0,
+        "out_of_period_row_indexes": [],
+        "corrections": [],
+    }
+    period_from = header.get("statement_period_from")
+    period_to = header.get("statement_period_to")
+    from_date = _parse_iso_date(period_from)
+    to_date = _parse_iso_date(period_to)
+    if not lines or from_date is None or to_date is None:
+        return summary
+    if to_date < from_date:
+        summary["status"] = "invalid_period"
+        return summary
+
+    tol = timedelta(days=5)  # allow a few edge-posting days on each end
+    lo, hi = from_date - tol, to_date + tol
+    candidate_years = sorted({from_date.year, to_date.year})
+
+    summary["status"] = "applied"
+    prev_date: Optional[date] = None
+    applied = 0
+    out_of_period_rows: list[int] = []
+
+    for row_index, line in enumerate(lines):
+        cur = _parse_iso_date(_line_value(line, "line_date"))
+        if cur is None:
+            continue
+        candidates = [c for c in (_safe_date(y, cur.month, cur.day) for y in candidate_years) if c is not None]
+        if not candidates:
+            continue
+
+        in_range = [c for c in candidates if lo <= c <= hi]
+        if in_range:
+            if prev_date is not None:
+                forward = [c for c in in_range if c >= prev_date]
+                chosen = min(forward) if forward else min(in_range, key=lambda c: abs((c - prev_date).days))
+            else:
+                chosen = min(in_range)
+        else:
+            chosen = cur  # cannot be placed in the period — keep, but flag below
+
+        if lo <= chosen <= hi:
+            prev_date = chosen
+        else:
+            out_of_period_rows.append(row_index)
+
+        new_iso = chosen.isoformat()
+        if new_iso != cur.isoformat():
+            _set_line_date(line, new_iso, bank_account_id)
+            summary["corrections"].append({
+                "row_index": row_index,
+                "from": cur.isoformat(),
+                "to": new_iso,
+                "description": (_line_value(line, "description", "") or "")[:80],
+            })
+            applied += 1
+
+    summary["corrections_applied"] = applied
+    summary["out_of_period_count"] = len(out_of_period_rows)
+    summary["out_of_period_row_indexes"] = out_of_period_rows
+    return summary
+
+
 def detect_line_duplicates(
     *,
     db,

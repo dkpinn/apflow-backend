@@ -304,6 +304,40 @@ def source_requires_manual_review(header: dict[str, Any]) -> bool:
     return _source_requires_manual_review(header)
 
 
+def extraction_is_trusted_deterministic(
+    header: dict[str, Any],
+    balance_summary: Optional[dict[str, Any]] = None,
+    balance_integrity: Optional[dict[str, Any]] = None,
+) -> bool:
+    """A clean text PDF that reconciles is trusted enough to skip manual review.
+
+    True only when the extraction came from the deterministic PDF text-layer path
+    (no VLM anywhere) AND the statement reconciles on both checks we compute:
+    opening+transactions == closing (`balance_summary`) and the per-row running
+    balance walk (`balance_integrity`). Any AI involvement, a scanned/image source,
+    or a broken balance chain makes it untrusted and it falls back to `needs_review`.
+    """
+    source_format = normalize_text(header.get("source_format")).lower()
+    if source_format != "pdf":
+        return False
+
+    parser_strategy = normalize_text(header.get("parser_strategy")).lower()
+    if "vlm" in parser_strategy:
+        return False
+
+    pdf_rescue = header.get("pdf_rescue") if isinstance(header.get("pdf_rescue"), dict) else {}
+    if normalize_text(pdf_rescue.get("selected")).lower() != "deterministic":
+        return False
+
+    if (balance_summary or {}).get("balance_status") != "balanced":
+        return False
+
+    if not balance_integrity or balance_integrity.get("balance_walk_status") != "balanced":
+        return False
+
+    return True
+
+
 def _count_line_warnings(lines: list[ParsedBankLine]) -> int:
     return sum(len(_line_value(line, "extraction_warnings", []) or []) for line in lines)
 
@@ -327,7 +361,9 @@ def validate_extracted_statement_quality(
     if not nonzero_lines:
         critical_errors.append("No non-zero transaction lines were extracted")
 
-    if _source_requires_manual_review(header):
+    if _source_requires_manual_review(header) and not extraction_is_trusted_deterministic(
+        header, balance_summary, balance_integrity
+    ):
         critical_errors.append("PDF/image/VLM bank statement extraction requires manual review before allocation")
 
     if not header.get("statement_period_from") or not header.get("statement_period_to"):

@@ -182,6 +182,7 @@ def test_suggest_bank_line_blocks_unapproved_upload(monkeypatch):
 
 
 def test_suggest_bank_line_blocks_pdf_without_corrected_fixture(monkeypatch):
+    monkeypatch.setenv("BANK_REQUIRE_GOLD_FIXTURE", "1")  # strict-mode coverage; default is optional/internal
     db = MemoryDB({
         "bank_statement_lines": [_line_row()],
         "bank_statement_uploads": [
@@ -310,6 +311,7 @@ def test_review_bank_line_400_when_upload_not_approved(monkeypatch):
 
 
 def test_review_bank_line_blocks_failed_corrected_fixture_benchmark(monkeypatch):
+    monkeypatch.setenv("BANK_REQUIRE_GOLD_FIXTURE", "1")  # strict-mode coverage; default is optional/internal
     db = MemoryDB({
         "bank_statement_lines": [_line_row()],
         "bank_statement_uploads": [_upload_row()],
@@ -329,6 +331,7 @@ def test_review_bank_line_blocks_failed_corrected_fixture_benchmark(monkeypatch)
 
 
 def test_review_bank_line_blocks_stale_benchmark_after_gold_correction(monkeypatch):
+    monkeypatch.setenv("BANK_REQUIRE_GOLD_FIXTURE", "1")  # strict-mode coverage; default is optional/internal
     db = MemoryDB({
         "bank_statement_lines": [_line_row()],
         "bank_statement_uploads": [_upload_row(extracted_at="2026-07-03T10:00:00+00:00")],
@@ -353,6 +356,7 @@ def test_review_bank_line_blocks_stale_benchmark_after_gold_correction(monkeypat
 
 
 def test_review_bank_line_blocks_stale_benchmark_after_reextraction(monkeypatch):
+    monkeypatch.setenv("BANK_REQUIRE_GOLD_FIXTURE", "1")  # strict-mode coverage; default is optional/internal
     db = MemoryDB({
         "bank_statement_lines": [_line_row()],
         "bank_statement_uploads": [_upload_row(extracted_at="2026-07-03T12:00:00+00:00")],
@@ -377,6 +381,7 @@ def test_review_bank_line_blocks_stale_benchmark_after_reextraction(monkeypatch)
 
 
 def test_review_bank_line_blocks_failed_fixture_linked_by_audit_event(monkeypatch):
+    monkeypatch.setenv("BANK_REQUIRE_GOLD_FIXTURE", "1")  # strict-mode coverage; default is optional/internal
     gold_file = _gold_file_row(gold_json={"transactions": [{"transaction_index": 1}]})
     db = MemoryDB({
         "bank_statement_lines": [_line_row()],

@@ -410,6 +410,7 @@ def test_get_bank_upload_extraction_review_returns_source_snapshot_and_lines(mon
 
 
 def test_get_bank_upload_extraction_review_returns_resumable_workflow_state(monkeypatch):
+    monkeypatch.setenv("BANK_REQUIRE_GOLD_FIXTURE", "1")  # strict-mode coverage; default is optional/internal
     upload = _reviewable_upload(
         source_format="pdf",
         extracted_at="2026-07-03T10:00:00+00:00",
@@ -499,6 +500,7 @@ def test_get_bank_upload_extraction_review_returns_resumable_workflow_state(monk
 
 
 def test_get_bank_upload_extraction_review_flags_same_gold_verifier(monkeypatch):
+    monkeypatch.setenv("BANK_REQUIRE_GOLD_FIXTURE", "1")  # strict-mode coverage; default is optional/internal
     upload = _reviewable_upload(
         source_format="pdf",
         extracted_at="2026-07-03T10:00:00+00:00",
@@ -864,6 +866,27 @@ def test_approve_bank_upload_extraction_records_independent_review(monkeypatch):
     assert events[0]["event_type"] == "bank_statement_extraction_approved"
 
 
+def test_approve_bank_upload_extraction_pdf_without_fixture_succeeds_by_default(monkeypatch):
+    # Default (optional/internal) mode: a scanned/PDF extraction can be approved by
+    # the attestation checklist alone — no corrected gold fixture or benchmark required.
+    db = MemoryDB({
+        "bank_statement_uploads": [_reviewable_upload(source_format="pdf")],
+        "bank_accounts": [_account_row(current_reconciled_balance=1000.0)],
+        "bank_audit_events": [],
+        "bank_statement_gold_files": [],
+        "bank_statement_extraction_runs": [],
+    })
+    monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
+    monkeypatch.setattr(bu, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bu, "log_bank_event", lambda _db, **kw: None)
+    monkeypatch.setattr(bu, "now_iso", lambda: "2026-07-06T12:00:00+02:00")
+
+    result = bu.approve_bank_upload_extraction(UPLOAD_ID, _approval_payload(), AUTH)
+
+    assert result["success"] is True
+    assert db.tables["bank_statement_uploads"][0]["extraction_status"] == "extracted"
+
+
 def test_approve_bank_upload_extraction_requires_attestation(monkeypatch):
     db = MemoryDB({"bank_statement_uploads": [_reviewable_upload()]})
     monkeypatch.setattr(bu, "_auth", lambda _: ("reviewer-1", db))
@@ -882,6 +905,7 @@ def test_approve_bank_upload_extraction_requires_attestation(monkeypatch):
 
 
 def test_approve_bank_upload_extraction_requires_gold_fixture_for_pdf(monkeypatch):
+    monkeypatch.setenv("BANK_REQUIRE_GOLD_FIXTURE", "1")  # strict-mode coverage; default is optional/internal
     upload = _reviewable_upload(
         source_format="pdf",
         extraction_evidence={
@@ -920,6 +944,7 @@ def test_approve_bank_upload_extraction_requires_gold_fixture_for_pdf(monkeypatc
 
 
 def test_approve_bank_upload_extraction_requires_independent_gold_verifier(monkeypatch):
+    monkeypatch.setenv("BANK_REQUIRE_GOLD_FIXTURE", "1")  # strict-mode coverage; default is optional/internal
     upload = _reviewable_upload(
         source_format="pdf",
         extraction_evidence={
@@ -1022,8 +1047,9 @@ def test_approve_bank_upload_extraction_requires_complete_review_snapshot(monkey
 
 
 def test_approve_bank_upload_extraction_blocks_unbenchmarked_corrected_fixture(monkeypatch):
+    monkeypatch.setenv("BANK_REQUIRE_GOLD_FIXTURE", "1")  # strict-mode coverage; default is optional/internal
     db = MemoryDB({
-        "bank_statement_uploads": [_reviewable_upload()],
+        "bank_statement_uploads": [_reviewable_upload(source_format="pdf")],
         "bank_statement_gold_files": [
             {
                 "id": "gold-1",
@@ -1048,8 +1074,9 @@ def test_approve_bank_upload_extraction_blocks_unbenchmarked_corrected_fixture(m
 
 
 def test_approve_bank_upload_extraction_blocks_failed_corrected_fixture_benchmark(monkeypatch):
+    monkeypatch.setenv("BANK_REQUIRE_GOLD_FIXTURE", "1")  # strict-mode coverage; default is optional/internal
     db = MemoryDB({
-        "bank_statement_uploads": [_reviewable_upload()],
+        "bank_statement_uploads": [_reviewable_upload(source_format="pdf")],
         "bank_statement_gold_files": [
             {
                 "id": "gold-1",

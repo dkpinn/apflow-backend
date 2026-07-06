@@ -139,20 +139,36 @@ def _parse_vlm_transaction_date(
     statement_period_to: Optional[str],
 ) -> Optional[str]:
     parsed = parse_date(value)
-    if parsed or not statement_period_from:
+    if not statement_period_from:
         return parsed
 
-    start_year = int(statement_period_from[:4])
-    parsed = parse_date(value, year=start_year)
-    if not parsed:
-        return None
+    # A full date that already sits inside the statement period is trusted as-is.
+    if parsed and (not statement_period_to or statement_period_from <= parsed <= statement_period_to):
+        return parsed
 
+    # Otherwise anchor the year to the statement period. This covers both a
+    # day/month-only value AND a full date with the wrong year (e.g. the VLM
+    # returning 2025-12-12 on a statement that runs Dec 2024 – Jan 2025). Prefer
+    # whichever candidate lands inside the period. The backend
+    # normalize_dates_from_period pass is the authoritative correction; this is
+    # a first line of defence at extraction time.
+    years = [int(statement_period_from[:4])]
     if statement_period_to and statement_period_to[:4] != statement_period_from[:4]:
-        end_year = int(statement_period_to[:4])
-        end_year_candidate = parse_date(value, year=end_year)
-        if end_year_candidate and statement_period_from <= end_year_candidate <= statement_period_to:
-            return end_year_candidate
-    return parsed
+        years.append(int(statement_period_to[:4]))
+
+    candidates: list[str] = []
+    for y in years:
+        # Full date with wrong year → swap the year in the fixed-width ISO string;
+        # day/month-only → anchor the year via parse_date.
+        cand = f"{y:04d}{parsed[4:]}" if parsed else parse_date(value, year=y)
+        if cand and cand not in candidates:
+            candidates.append(cand)
+
+    if statement_period_to:
+        in_range = [c for c in candidates if statement_period_from <= c <= statement_period_to]
+        if in_range:
+            return min(in_range)
+    return candidates[0] if candidates else parsed
 
 
 def _call_openrouter_bank_vlm(

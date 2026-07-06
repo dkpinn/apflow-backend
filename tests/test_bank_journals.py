@@ -254,6 +254,7 @@ def test_draft_bank_journal_blocks_unapproved_upload(monkeypatch):
 
 
 def test_draft_bank_journal_blocks_failed_corrected_fixture_benchmark(monkeypatch):
+    monkeypatch.setenv("BANK_REQUIRE_GOLD_FIXTURE", "1")  # strict-mode coverage; default is optional/internal
     db = MemoryDB({
         "bank_statement_lines": [_line()],
         "bank_statement_uploads": [_upload()],
@@ -316,6 +317,7 @@ def test_post_bank_journal_blocks_unapproved_upload(monkeypatch):
 
 
 def test_post_bank_journal_blocks_failed_corrected_fixture_benchmark(monkeypatch):
+    monkeypatch.setenv("BANK_REQUIRE_GOLD_FIXTURE", "1")  # strict-mode coverage; default is optional/internal
     db = MemoryDB({
         "gl_journals": [_journal(status="draft")],
         "gl_journal_lines": [

@@ -33,6 +33,7 @@ from app.services.bank_statement_service import (
     detect_line_duplicates,
     extract_statement,
     line_to_insert,
+    normalize_dates_from_period,
     validate_balances,
     validate_running_balance,
 )
@@ -281,13 +282,17 @@ def _approval_blockers(upload: dict, db=None, reviewer_id: str | None = None, is
                 blockers.append(
                     "PDF/image/VLM bank statement extraction approval must be performed by a reviewer different from the corrected gold fixture verifier"
                 )
-        blockers.extend(
-            corrected_fixture_benchmark_blockers(
-                db,
-                organisation_id=str(upload.get("organisation_id")),
-                upload_id=str(upload.get("id")),
+        # Benchmark freshness only gates approval when gold fixtures are a hard
+        # requirement. In the default optional/internal mode a saved-but-unbenchmarked
+        # gold file must not block approval of an eyeballed extraction.
+        if upload_requires_corrected_fixture(upload):
+            blockers.extend(
+                corrected_fixture_benchmark_blockers(
+                    db,
+                    organisation_id=str(upload.get("organisation_id")),
+                    upload_id=str(upload.get("id")),
+                )
             )
-        )
     return blockers
 
 
@@ -458,7 +463,7 @@ def _review_workflow_state(
             "can_approve": (
                 upload.get("extraction_status") == "needs_review"
                 and not approval_blockers
-                and status in {"passed", "not_required"}
+                and (not requires_fixture or status in {"passed", "not_required"})
             ),
         },
     }
@@ -988,6 +993,14 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             parsing_hint=parsing_hint,
         )
         correction_summary = correct_amounts_from_balance(lines, bank_account_id=account["id"])
+        date_correction_summary = normalize_dates_from_period(lines, header, bank_account_id=account["id"])
+        if date_correction_summary.get("corrections_applied"):
+            logger.info(
+                "[DATE] Normalized %d transaction date(s) to the statement period for upload %s (out_of_period=%d)",
+                date_correction_summary["corrections_applied"],
+                upload_id,
+                date_correction_summary.get("out_of_period_count", 0),
+            )
         running_balance_result = analyze_balance_integrity(lines, header)
         if running_balance_result["balance_walk_mismatches"]:
             logger.warning(
@@ -1046,6 +1059,7 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
             for r in (running_balance_result.get("rows") or [])
             if r.get("row_index") is not None
         }
+        out_of_period_rows = set(date_correction_summary.get("out_of_period_row_indexes") or [])
         review_snapshot_lines = []
         for row_number, wrapper in enumerate(line_wrappers, start=1):
             snap = _review_snapshot_line(wrapper, row_number)
@@ -1054,6 +1068,7 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
                 snap["balance_status"] = diag.get("status")
                 snap["balance_expected"] = diag.get("expected_balance")
                 snap["balance_diff"] = diag.get("diff")
+            snap["date_status"] = "out_of_period" if (row_number - 1) in out_of_period_rows else "ok"
             review_snapshot_lines.append(snap)
 
         inserts = [
@@ -1126,6 +1141,7 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
                 "validation": validation_result,
                 "running_balance": running_balance_result,
                 "amount_correction": correction_summary,
+                "date_correction": date_correction_summary,
                 "pdf_rescue": header.get("pdf_rescue"),
                 "review_snapshot": {
                     "lines": review_snapshot_lines,
@@ -1138,6 +1154,10 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
                     "first_break_row_index": running_balance_result.get("first_break_row_index"),
                     "missing_row_suspected": running_balance_result.get("missing_row_suspected"),
                     "balance_missing_count": running_balance_result.get("balance_missing_count"),
+                    "dates_corrected_count": date_correction_summary.get("corrections_applied", 0),
+                    "dates_out_of_period_count": date_correction_summary.get("out_of_period_count", 0),
+                    "statement_period_from": header.get("statement_period_from"),
+                    "statement_period_to": header.get("statement_period_to"),
                 },
             },
             "extraction_status": "extracted" if validation_result["can_allocate"] else "needs_review",
