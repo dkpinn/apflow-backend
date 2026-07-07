@@ -102,7 +102,16 @@ def parse_date(value: Any, *, year: Optional[int] = None) -> Optional[str]:
                     return datetime.strptime(f"{raw}-{year}", fmt).date().isoformat()
                 except ValueError:
                     pass
-    return raw if re.match(r"^\d{4}-\d{2}-\d{2}$", raw) else None
+    # Final fallback: accept an ISO-shaped string only if it is a REAL date.
+    # Checking the shape alone let invalid dates through (e.g. "2023-02-29",
+    # a 29 Feb on a non-leap year), which then crashed the bank_statement_lines
+    # insert and failed the whole import.
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+        try:
+            return date.fromisoformat(raw).isoformat()
+        except ValueError:
+            return None
+    return None
 
 
 def infer_column(fieldnames: Iterable[str], candidates: Iterable[str]) -> Optional[str]:

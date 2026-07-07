@@ -396,6 +396,29 @@ def test_parse_date_full_date_unaffected_by_year_kwarg():
     assert parse_date("28/01/2024", year=2024) == "2024-01-28"
 
 
+def test_parse_date_accepts_valid_leap_day():
+    assert parse_date("29/02/2024") == "2024-02-29"
+    assert parse_date("2024-02-29") == "2024-02-29"
+
+
+def test_parse_date_rejects_impossible_dates():
+    # A 29 Feb on a non-leap year (and other impossible dates) must be rejected,
+    # not passed through as a broken string that fails the DB insert.
+    assert parse_date("2023-02-29") is None
+    assert parse_date("2024-02-30") is None
+    assert parse_date("29/02/2023") is None
+
+
+def test_vlm_leap_day_wrong_year_is_anchored_to_period_leap_year():
+    # The VLM commonly tags a 29 Feb line with a non-leap year; it must be
+    # re-anchored to the leap year actually in the statement period.
+    frm, to = "2024-02-01", "2024-02-29"
+    for value in ("2025-02-29", "29/02/2025", "29 Feb", "29/02"):
+        assert _parse_vlm_transaction_date(
+            value, statement_period_from=frm, statement_period_to=to
+        ) == "2024-02-29"
+
+
 def test_infer_statement_year_finds_first_year():
     text = "Standard Bank\nStatement Period: 01 Jan 2024 to 31 Jan 2024\nPage 1"
     assert _infer_statement_year(text) == 2024

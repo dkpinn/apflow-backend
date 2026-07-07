@@ -132,6 +132,24 @@ def _vlm_statement_period_dates(
     return date_from, date_to
 
 
+_YEAR_TOKEN_RE = re.compile(r"(?:19|20)\d{2}")
+
+
+def _reanchor_to_year(value: Any, year: int) -> Optional[str]:
+    """Rebuild a date onto `year` and validate it.
+
+    Swaps any explicit 4-digit year in the raw value for `year` (so a 29 Feb the
+    model tagged with the wrong, non-leap year is retried against the leap year in
+    the statement period), or anchors a day/month-only value. Returns a valid ISO
+    date or None — an impossible combination (29 Feb on a non-leap year) is dropped
+    rather than propagated as a broken date string that would fail the DB insert.
+    """
+    raw = normalize_text(value)
+    if _YEAR_TOKEN_RE.search(raw):
+        return parse_date(_YEAR_TOKEN_RE.sub(f"{year:04d}", raw, count=1))
+    return parse_date(value, year=year)
+
+
 def _parse_vlm_transaction_date(
     value: Any,
     *,
@@ -146,21 +164,18 @@ def _parse_vlm_transaction_date(
     if parsed and (not statement_period_to or statement_period_from <= parsed <= statement_period_to):
         return parsed
 
-    # Otherwise anchor the year to the statement period. This covers both a
-    # day/month-only value AND a full date with the wrong year (e.g. the VLM
-    # returning 2025-12-12 on a statement that runs Dec 2024 – Jan 2025). Prefer
-    # whichever candidate lands inside the period. The backend
-    # normalize_dates_from_period pass is the authoritative correction; this is
-    # a first line of defence at extraction time.
+    # Otherwise anchor the year to the statement period. This covers a day/month-only
+    # value, a full date with the wrong year (e.g. the VLM returning 2025-12-12 on a
+    # statement that runs Dec 2024 – Jan 2025), AND a 29 Feb that the VLM tagged with
+    # a non-leap year — reanchoring validates each candidate so it lands on the leap
+    # year actually in the period. Prefer whichever candidate lands inside the period.
     years = [int(statement_period_from[:4])]
     if statement_period_to and statement_period_to[:4] != statement_period_from[:4]:
         years.append(int(statement_period_to[:4]))
 
     candidates: list[str] = []
     for y in years:
-        # Full date with wrong year → swap the year in the fixed-width ISO string;
-        # day/month-only → anchor the year via parse_date.
-        cand = f"{y:04d}{parsed[4:]}" if parsed else parse_date(value, year=y)
+        cand = _reanchor_to_year(value, y)
         if cand and cand not in candidates:
             candidates.append(cand)
 
