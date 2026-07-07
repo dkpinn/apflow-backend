@@ -27,6 +27,15 @@ DECLARE
   tb_balance numeric;
   coa_opening_balance numeric := 0;
 BEGIN
+  IF auth.role() IS DISTINCT FROM 'service_role'
+     AND (
+       auth.uid() IS NULL
+       OR NOT public.is_org_member(p_org_id)
+     )
+  THEN
+    RAISE EXCEPTION 'You do not have access to this organisation';
+  END IF;
+
   SELECT *
     INTO account_row
     FROM public.bank_accounts

@@ -12,7 +12,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from app.dependencies import authenticated_user
+from app.dependencies import authenticated_user, ensure_org_read, ensure_org_write
 from app.db.supabase_client import get_supabase_client
 from app.services.audit_log import log_invoice_event
 from app.services.invoice_readiness import evaluate_invoice_readiness
@@ -25,6 +25,7 @@ from app.services.invoice_data_builders import utc_now_iso
 from app.services.invoice_extraction_service import (
     get_raw_invoice,
     process_next_queued_invoice_job,
+    queue_invoice_job,
     run_extract_worker_until_empty,
 )
 
@@ -34,6 +35,62 @@ try:
     supabase = get_supabase_client()
 except Exception:
     supabase = None  # will fail on first API call; create .env with SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY
+
+
+def _require_org_read(auth: UserAuth, organisation_id: Optional[str]) -> str:
+    user_id, _db = auth
+    ensure_org_read(user_id, organisation_id)
+    return str(organisation_id)
+
+
+def _require_org_write(auth: UserAuth, organisation_id: Optional[str]) -> str:
+    user_id, _db = auth
+    ensure_org_write(user_id, organisation_id)
+    return str(organisation_id)
+
+
+def _load_raw_invoice_for_auth(
+    invoice_raw_id: str,
+    auth: UserAuth,
+    *,
+    requested_org_id: Optional[str] = None,
+    write: bool = False,
+) -> tuple[dict, str]:
+    raw = get_raw_invoice(invoice_raw_id)
+    organisation_id = raw.get("organisation_id")
+    if not organisation_id:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if requested_org_id and str(requested_org_id) != str(organisation_id):
+        raise HTTPException(status_code=400, detail="Invoice does not belong to organisation_id")
+    if write:
+        _require_org_write(auth, organisation_id)
+    else:
+        _require_org_read(auth, organisation_id)
+    return raw, str(organisation_id)
+
+
+def _load_extracted_invoice_for_write(
+    invoice_extracted_id: str,
+    requested_org_id: Optional[str],
+    auth: UserAuth,
+    *,
+    select: str = "id, organisation_id",
+) -> dict:
+    result = (
+        supabase.table("invoices_extracted")
+        .select(select)
+        .eq("id", invoice_extracted_id)
+        .limit(1)
+        .execute()
+    )
+    invoice = result.data[0] if result.data else None
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    organisation_id = invoice.get("organisation_id")
+    if requested_org_id and str(requested_org_id) != str(organisation_id):
+        raise HTTPException(status_code=400, detail="Invoice does not belong to organisation_id")
+    _require_org_write(auth, organisation_id)
+    return invoice
 
 
 class ProcessNextJobRequest(BaseModel):
@@ -54,13 +111,16 @@ class GeneratePreviewRequest(BaseModel):
 
 
 @router.post("/jobs/process-next")
-def process_next_invoice_job(payload: ProcessNextJobRequest):
+def process_next_invoice_job(payload: ProcessNextJobRequest, auth: UserAuth):
+    if not payload.organisation_id:
+        raise HTTPException(status_code=400, detail="organisation_id is required")
+    _require_org_write(auth, payload.organisation_id)
     return process_next_queued_invoice_job(organisation_id=payload.organisation_id)
 
 
 @router.get("/raw/{invoice_raw_id}/file")
-def get_invoice_raw_file(invoice_raw_id: str):
-    raw = get_raw_invoice(invoice_raw_id)
+def get_invoice_raw_file(invoice_raw_id: str, auth: UserAuth):
+    raw, _organisation_id = _load_raw_invoice_for_auth(invoice_raw_id, auth)
     file_path = raw.get("file_path")
     file_type = raw.get("file_type") or "application/pdf"
 
@@ -82,8 +142,8 @@ def get_invoice_raw_file(invoice_raw_id: str):
 
 
 @router.get("/raw/{invoice_raw_id}/preview-image")
-def get_invoice_preview_image(invoice_raw_id: str, page: int = 0):
-    raw = get_raw_invoice(invoice_raw_id)
+def get_invoice_preview_image(invoice_raw_id: str, auth: UserAuth, page: int = 0):
+    raw, _organisation_id = _load_raw_invoice_for_auth(invoice_raw_id, auth)
     file_path = raw.get("file_path")
     file_type = raw.get("file_type") or "application/pdf"
 
@@ -123,12 +183,20 @@ def get_invoice_preview_image(invoice_raw_id: str, page: int = 0):
 
 
 @router.post("/save-line-items")
-def save_invoice_line_items(req: SaveLineItemsRequest):
+def save_invoice_line_items(req: SaveLineItemsRequest, auth: UserAuth):
     """
     Persist user-edited line items and recompute invoices_extracted totals.
     Line items are the source of truth: subtotal = SUM(line_total), VAT = subtotal * rate,
     total = subtotal + VAT.  Rounding differences vs document_total are absorbed automatically.
     """
+    existing_inv = _load_extracted_invoice_for_write(
+        req.invoice_extracted_id,
+        req.organisation_id,
+        auth,
+        select="id, organisation_id, tax_amount",
+    )
+    organisation_id = str(existing_inv.get("organisation_id"))
+
     # 1. Determine VAT rate — only if supplier is a VAT vendor (has vat_number)
     vat_rate = 0.0
     if req.supplier_id:
@@ -142,14 +210,7 @@ def save_invoice_line_items(req: SaveLineItemsRequest):
 
     # 3. Fetch document-extracted tax_amount — this is the source-of-truth from VLM/OCR
     # and must NOT be overwritten by a re-calculation from line items.
-    existing_inv = (
-        supabase.table("invoices_extracted")
-        .select("tax_amount")
-        .eq("id", req.invoice_extracted_id)
-        .single()
-        .execute()
-    )
-    existing_tax = round(float((existing_inv.data or {}).get("tax_amount") or 0), 2)
+    existing_tax = round(float(existing_inv.get("tax_amount") or 0), 2)
 
     # computed_vat is used only for rounding/reconciliation logic below; it is
     # never written back to invoices_extracted.tax_amount.
@@ -183,7 +244,7 @@ def save_invoice_line_items(req: SaveLineItemsRequest):
         diagnostics = replace_invoice_line_items(
             supabase,
             invoice_extracted_id=req.invoice_extracted_id,
-            organisation_id=req.organisation_id,
+            organisation_id=organisation_id,
             line_items=final_line_items,
             invoice_total=computed_total,
             delete_when_empty=True,
@@ -205,12 +266,12 @@ def save_invoice_line_items(req: SaveLineItemsRequest):
     if needs_review:
         patch["validation_status"] = "needs_review"
 
-    supabase.table("invoices_extracted").update(patch).eq("id", req.invoice_extracted_id).execute()
+    supabase.table("invoices_extracted").update(patch).eq("id", req.invoice_extracted_id).eq("organisation_id", organisation_id).execute()
 
     readiness = evaluate_invoice_readiness(
         supabase,
         invoice_extracted_id=req.invoice_extracted_id,
-        organisation_id=req.organisation_id,
+        organisation_id=organisation_id,
         reason="Line items saved.",
         actor_type="api",
     )
@@ -232,7 +293,8 @@ class ReapplyRulesRequest(BaseModel):
 
 
 @router.post("/reapply-supplier-rules")
-def reapply_supplier_rules_endpoint(req: ReapplyRulesRequest):
+def reapply_supplier_rules_endpoint(req: ReapplyRulesRequest, auth: UserAuth):
+    _load_extracted_invoice_for_write(req.invoice_extracted_id, req.organisation_id, auth)
     result = (
         supabase.table("invoices_extracted")
         .select("*, supplier:suppliers(*)")
@@ -318,7 +380,7 @@ class MergeInvoicesPayload(BaseModel):
 
 
 @router.post("/merge")
-def merge_invoices(payload: MergeInvoicesPayload, background_tasks: BackgroundTasks):
+def merge_invoices(payload: MergeInvoicesPayload, background_tasks: BackgroundTasks, auth: UserAuth):
     """
     Merge two or more single-page invoice uploads into one multi-page document and
     trigger a fresh extraction.  Old raw records (and all dependent data) are deleted.
@@ -327,6 +389,7 @@ def merge_invoices(payload: MergeInvoicesPayload, background_tasks: BackgroundTa
 
     if len(payload.invoice_raw_ids) < 2:
         raise HTTPException(status_code=400, detail="At least two invoice_raw_ids are required")
+    _require_org_write(auth, payload.organisation_id)
 
     # Step 1 — fetch raw records in caller-specified page order
     rows_result = (
@@ -436,13 +499,14 @@ def merge_invoices(payload: MergeInvoicesPayload, background_tasks: BackgroundTa
 
 
 @router.post("/{raw_id}/split-into-pages")
-def split_invoice_into_pages(raw_id: str, organisation_id: str, background_tasks: BackgroundTasks):
+def split_invoice_into_pages(raw_id: str, organisation_id: str, background_tasks: BackgroundTasks, auth: UserAuth):
     """
     Split a multi-page PDF into individual single-page invoices, one per page.
     Each page is uploaded as a new invoices_raw record and queued for extraction.
     The original record and all dependent data are deleted.
     """
     import time as _time
+    _load_raw_invoice_for_auth(raw_id, auth, requested_org_id=organisation_id, write=True)
 
     # Step 1 — fetch the raw record
     row_result = (
@@ -562,7 +626,7 @@ class ProcessPageGroupsPayload(BaseModel):
 
 
 @router.post("/process-page-groups")
-def process_page_groups(payload: ProcessPageGroupsPayload, background_tasks: BackgroundTasks):
+def process_page_groups(payload: ProcessPageGroupsPayload, background_tasks: BackgroundTasks, auth: UserAuth):
     """
     Split a multi-page PDF into one output PDF per group, where each group is a user-defined
     set of full pages and/or cropped regions.  Supports both "each page is a doc" and
@@ -572,6 +636,12 @@ def process_page_groups(payload: ProcessPageGroupsPayload, background_tasks: Bac
 
     if not payload.groups:
         raise HTTPException(status_code=400, detail="At least one group is required")
+    _load_raw_invoice_for_auth(
+        payload.invoice_raw_id,
+        auth,
+        requested_org_id=payload.organisation_id,
+        write=True,
+    )
 
     # Step 1 — fetch original raw record
     row_result = (
@@ -689,7 +759,7 @@ def process_page_groups(payload: ProcessPageGroupsPayload, background_tasks: Bac
 
 
 @router.post("/generate-preview")
-def generate_invoice_preview(req: GeneratePreviewRequest):
+def generate_invoice_preview(req: GeneratePreviewRequest, auth: UserAuth):
     """
     Render preview images for an invoice without running VLM extraction (~1s).
     Saves images to Supabase Storage and upserts document_pages rows.
@@ -701,10 +771,13 @@ def generate_invoice_preview(req: GeneratePreviewRequest):
     from app.services.invoice_extraction.receipt_preprocessing import generate_preview_images
     from app.services.invoice_previews import upload_invoice_preview_image
 
-    raw_res = supabase.table("invoices_raw").select("file_path, file_type").eq("id", req.invoice_raw_id).single().execute()
+    raw_res = supabase.table("invoices_raw").select("file_path, file_type, organisation_id").eq("id", req.invoice_raw_id).single().execute()
     if not raw_res.data:
         raise HTTPException(status_code=404, detail="Invoice not found")
     raw = raw_res.data
+    if str(raw.get("organisation_id")) != str(req.organisation_id):
+        raise HTTPException(status_code=400, detail="Invoice does not belong to organisation_id")
+    _require_org_write(auth, req.organisation_id)
     file_path = raw.get("file_path")
     if not file_path:
         raise HTTPException(status_code=400, detail="No file_path on invoices_raw record")

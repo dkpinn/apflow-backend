@@ -80,8 +80,9 @@ def test_get_invoice_review_data_found_by_extracted_id(monkeypatch):
     monkeypatch.setattr(rv, "build_extracted_document_profile", lambda inv: {"line_items": []})
     monkeypatch.setattr(rv, "build_extracted_supplier_profile", lambda inv: {})
     monkeypatch.setattr(rv, "build_supplier_create_payload", lambda **_kw: {})
+    monkeypatch.setattr(rv, "ensure_org_read", lambda *_args: None)
 
-    result = rv.get_invoice_review_data("inv-1")
+    result = rv.get_invoice_review_data("inv-1", AUTH)
 
     assert result["success"] is True
     assert result["invoice_extracted_id"] == "inv-1"
@@ -104,8 +105,9 @@ def test_get_invoice_review_data_falls_back_to_raw_id(monkeypatch):
     monkeypatch.setattr(rv, "build_extracted_document_profile", lambda inv: {"line_items": []})
     monkeypatch.setattr(rv, "build_extracted_supplier_profile", lambda inv: {})
     monkeypatch.setattr(rv, "build_supplier_create_payload", lambda **_kw: {})
+    monkeypatch.setattr(rv, "ensure_org_read", lambda *_args: None)
 
-    result = rv.get_invoice_review_data("raw-1")
+    result = rv.get_invoice_review_data("raw-1", AUTH)
 
     assert result["success"] is True
     assert result["resolved_by"] == "invoice_raw_id"
@@ -117,9 +119,32 @@ def test_get_invoice_review_data_404_when_not_found(monkeypatch):
     monkeypatch.setattr(rv, "supabase", db)
 
     with pytest.raises(HTTPException) as exc_info:
-        rv.get_invoice_review_data("nonexistent")
+        rv.get_invoice_review_data("nonexistent", AUTH)
 
     assert exc_info.value.status_code == 404
+
+
+def test_get_invoice_review_data_requires_org_read(monkeypatch):
+    db = StubDB({
+        "invoices_extracted": [_invoice_row()],
+        "invoices_raw": [],
+        "suppliers": [],
+        "supplier_branches": [],
+        "document_pages": [],
+        "invoice_line_items": [],
+        "invoice_audit_events": [],
+    })
+    monkeypatch.setattr(rv, "supabase", db)
+    monkeypatch.setattr(rv, "fetch_parse_attempts", lambda db, invoice_raw_id: ([], None))
+    monkeypatch.setattr(rv, "build_extracted_document_profile", lambda inv: {"line_items": []})
+    monkeypatch.setattr(rv, "build_extracted_supplier_profile", lambda inv: {})
+    monkeypatch.setattr(rv, "build_supplier_create_payload", lambda **_kw: {})
+    monkeypatch.setattr(rv, "ensure_org_read", lambda *_args: (_ for _ in ()).throw(HTTPException(status_code=403, detail="denied")))
+
+    with pytest.raises(HTTPException) as exc_info:
+        rv.get_invoice_review_data("inv-1", AUTH)
+
+    assert exc_info.value.status_code == 403
 
 
 # ── get_invoice_agent_review ─────────────────────────────────────────────────

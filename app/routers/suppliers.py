@@ -74,12 +74,50 @@ KYC_DOCUMENT_TYPES = {
 # Route handlers
 # ---------------------------------------------------------------------------
 
+def _org_for_invoice_raw(invoice_raw_id: str) -> Optional[str]:
+    res = (
+        supabase
+        .table("invoices_raw")
+        .select("organisation_id")
+        .eq("id", invoice_raw_id)
+        .limit(1)
+        .execute()
+    )
+    return str(res.data[0]["organisation_id"]) if res.data else None
+
+
+def _resolve_supplier_link_organisation(payload: SupplierLinkRequest) -> str:
+    invoice_org_id: Optional[str] = None
+    if payload.invoice_extracted_id:
+        invoice = get_extracted_invoice(payload.invoice_extracted_id)
+        invoice_org_id = invoice.get("organisation_id")
+    elif payload.invoice_raw_id:
+        invoice = get_extracted_invoice_by_raw(payload.invoice_raw_id)
+        invoice_org_id = (invoice or {}).get("organisation_id") or _org_for_invoice_raw(payload.invoice_raw_id)
+
+    organisation_id = payload.organisation_id or invoice_org_id
+    if invoice_org_id and payload.organisation_id and str(invoice_org_id) != str(payload.organisation_id):
+        raise HTTPException(status_code=400, detail="Invoice does not belong to organisation_id")
+    if not organisation_id:
+        raise HTTPException(status_code=400, detail="Unable to determine invoice organisation")
+
+    supplier_org_id = _org_for_supplier(payload.supplier_id)
+    if not supplier_org_id:
+        raise HTTPException(status_code=404, detail="Supplier not found")
+    if str(supplier_org_id) != str(organisation_id):
+        raise HTTPException(status_code=400, detail="Supplier does not belong to organisation_id")
+    return str(organisation_id)
+
+
 @router.get("")
 def list_suppliers(
     organisation_id: str = Query(...),
     search: Optional[str] = None,
     limit: int = Query(default=25, ge=1, le=100),
+    auth: UserAuth = ...,
 ):
+    user_id, _db = auth
+    ensure_org_read(user_id, organisation_id)
     query = (
         supabase
         .table("suppliers")
@@ -96,8 +134,10 @@ def list_suppliers(
 
 
 @router.get("/from-invoice/{invoice_extracted_id}")
-def get_supplier_profile_from_invoice(invoice_extracted_id: str):
+def get_supplier_profile_from_invoice(invoice_extracted_id: str, auth: UserAuth):
     invoice = get_extracted_invoice(invoice_extracted_id)
+    user_id, _db = auth
+    ensure_org_read(user_id, invoice.get("organisation_id"))
     return {
         "success": True,
         "invoice_extracted_id": invoice_extracted_id,
@@ -114,7 +154,7 @@ def get_supplier_profile_from_invoice(invoice_extracted_id: str):
 
 
 @router.get("/match-suggest")
-def suggest_supplier_match(invoice_extracted_id: str):
+def suggest_supplier_match(invoice_extracted_id: str, auth: UserAuth):
     """Return best fuzzy name match suggestion for an unlinked invoice."""
     inv_res = (
         supabase.table("invoices_extracted")
@@ -131,6 +171,8 @@ def suggest_supplier_match(invoice_extracted_id: str):
     if not inv_res.data:
         raise HTTPException(status_code=404, detail="Invoice not found")
     inv = inv_res.data[0]
+    user_id, _db = auth
+    ensure_org_read(user_id, inv.get("organisation_id"))
     if inv.get("supplier_id"):
         return {"suggestion": None}
 
@@ -152,10 +194,12 @@ def suggest_supplier_match(invoice_extracted_id: str):
 
 
 @router.post("/match-profile")
-def match_supplier_profile(payload: SupplierMatchProfileRequest):
+def match_supplier_profile(payload: SupplierMatchProfileRequest, auth: UserAuth):
     """Return the best supplier match for extracted supplier identity fields."""
     from app.services.supplier_matcher import find_supplier_match_result
 
+    user_id, _db = auth
+    ensure_org_read(user_id, payload.organisation_id)
     suggestion = find_supplier_match_result(
         supabase,
         org_id=payload.organisation_id,
@@ -536,14 +580,17 @@ def create_supplier_from_invoice(payload: SupplierFromInvoiceRequest, auth: User
 
 @router.post("/link")
 @router.post("/link-invoice")
-def link_supplier(payload: SupplierLinkRequest):
+def link_supplier(payload: SupplierLinkRequest, auth: UserAuth):
     if not payload.invoice_extracted_id and not payload.invoice_raw_id:
         raise HTTPException(status_code=400, detail="Provide invoice_extracted_id or invoice_raw_id")
 
+    user_id, _db = auth
+    organisation_id = _resolve_supplier_link_organisation(payload)
+    ensure_org_write(user_id, organisation_id)
     linked = _link_supplier_to_invoice(
         supplier_id=payload.supplier_id,
         invoice_extracted_id=payload.invoice_extracted_id,
         invoice_raw_id=payload.invoice_raw_id,
-        organisation_id=payload.organisation_id,
+        organisation_id=organisation_id,
     )
     return {"success": True, "linked": linked}

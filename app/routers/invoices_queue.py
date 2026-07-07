@@ -16,6 +16,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.db.supabase_client import get_supabase_client
+from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
 from app.routers.organisations import ExtractionStrategy
 from app.services.audit_log import log_invoice_event
 from app.services.invoice_extraction_service import (
@@ -41,6 +42,34 @@ try:
     supabase = get_supabase_client()
 except Exception:
     supabase = None
+
+
+def _resolve_raw_invoice(
+    invoice_raw_id: str,
+    requested_org_id: Optional[str] = None,
+) -> tuple[dict, str]:
+    raw = get_raw_invoice(invoice_raw_id)
+    organisation_id = raw.get("organisation_id")
+    if not organisation_id:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if requested_org_id and str(requested_org_id) != str(organisation_id):
+        raise HTTPException(status_code=400, detail="Invoice does not belong to organisation_id")
+    return raw, str(organisation_id)
+
+
+def _ensure_raw_write(auth: UserAuth, invoice_raw_id: str, requested_org_id: Optional[str] = None) -> tuple[dict, str]:
+    raw, organisation_id = _resolve_raw_invoice(invoice_raw_id, requested_org_id)
+    user_id, _db = auth
+    ensure_org_write(user_id, organisation_id)
+    return raw, organisation_id
+
+
+def _ensure_job_read(auth: UserAuth, job: dict) -> None:
+    organisation_id = job.get("organisation_id")
+    if not organisation_id and job.get("invoice_raw_id"):
+        _raw, organisation_id = _resolve_raw_invoice(str(job["invoice_raw_id"]))
+    user_id, _db = auth
+    ensure_org_read(user_id, organisation_id)
 
 
 class ExtractInvoiceRequest(BaseModel):
@@ -75,6 +104,7 @@ class ReExtractInvoiceRequest(BaseModel):
 def extract_invoice(
     payload: ExtractInvoiceRequest,
     background_tasks: BackgroundTasks,
+    auth: UserAuth,
     sync: bool = Query(False),
 ):
     """
@@ -84,16 +114,17 @@ def extract_invoice(
     does not wait on a long OCR request. Use ?sync=true for the old blocking
     behavior during debugging.
     """
+    _raw, organisation_id = _ensure_raw_write(auth, payload.invoice_raw_id, payload.organisation_id)
     if sync:
         return run_invoice_extraction(
             invoice_raw_id=payload.invoice_raw_id,
-            organisation_id=payload.organisation_id,
+            organisation_id=organisation_id,
             extraction_strategy=payload.extraction_strategy,
         )
 
     job = queue_invoice_job(
         invoice_raw_id=payload.invoice_raw_id,
-        organisation_id=payload.organisation_id,
+        organisation_id=organisation_id,
         batch_id=payload.batch_id,
         extraction_strategy=payload.extraction_strategy,
     )
@@ -109,10 +140,11 @@ def extract_invoice(
 
 
 @router.get("/extract/{job_id}/status")
-def get_extract_status(job_id: str):
+def get_extract_status(job_id: str, auth: UserAuth):
     job = get_processing_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Extraction job not found")
+    _ensure_job_read(auth, job)
     return build_extract_job_status(job)
 
 
@@ -120,19 +152,17 @@ def get_extract_status(job_id: str):
 def re_extract_invoice(
     payload: ReExtractInvoiceRequest,
     background_tasks: BackgroundTasks,
+    auth: UserAuth,
     sync: bool = Query(False),
 ):
+    raw, org_id = _ensure_raw_write(auth, payload.invoice_raw_id, payload.organisation_id)
     if sync:
         return run_invoice_re_extraction(
             invoice_raw_id=payload.invoice_raw_id,
-            organisation_id=payload.organisation_id,
+            organisation_id=org_id,
             force_update=payload.force_update,
         )
 
-    raw = get_raw_invoice(payload.invoice_raw_id)
-    org_id = payload.organisation_id or raw.get("organisation_id")
-    if not org_id:
-        raise HTTPException(status_code=400, detail="Missing organisation_id")
     if not raw.get("file_path"):
         log_reextract_failure(
             payload_data={**payload.model_dump(), "organisation_id": org_id},
@@ -172,18 +202,20 @@ def re_extract_invoice(
 
 
 @router.get("/re-extract/{job_id}/status")
-def get_re_extract_status(job_id: str):
+def get_re_extract_status(job_id: str, auth: UserAuth):
     status = get_reextract_job_status(job_id)
     if not status:
         raise HTTPException(status_code=404, detail="Re-extract job not found")
+    _ensure_job_read(auth, status)
     return status
 
 
 @router.post("/queue")
-def queue_invoice(payload: QueueInvoiceRequest):
+def queue_invoice(payload: QueueInvoiceRequest, auth: UserAuth):
+    _raw, organisation_id = _ensure_raw_write(auth, payload.invoice_raw_id, payload.organisation_id)
     job = queue_invoice_job(
         invoice_raw_id=payload.invoice_raw_id,
-        organisation_id=payload.organisation_id,
+        organisation_id=organisation_id,
         batch_id=payload.batch_id,
         extraction_strategy=payload.extraction_strategy,
         priority=payload.priority,
@@ -198,8 +230,10 @@ def queue_invoice(payload: QueueInvoiceRequest):
 
 
 @router.get("/raw/{invoice_raw_id}/audit-events")
-def get_invoice_audit_events(invoice_raw_id: str):
-    raw = get_raw_invoice(invoice_raw_id)
+def get_invoice_audit_events(invoice_raw_id: str, auth: UserAuth):
+    raw, organisation_id = _resolve_raw_invoice(invoice_raw_id)
+    user_id, _db = auth
+    ensure_org_read(user_id, organisation_id)
 
     events_res = (
         supabase
@@ -215,7 +249,7 @@ def get_invoice_audit_events(invoice_raw_id: str):
     return {
         "success": True,
         "invoice_raw_id": invoice_raw_id,
-        "organisation_id": raw.get("organisation_id"),
+        "organisation_id": organisation_id,
         "event_count": len(events),
         "events": events,
     }

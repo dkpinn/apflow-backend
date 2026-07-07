@@ -118,6 +118,7 @@ def _reextract_row_to_payload(row: dict) -> dict:
         "stage_label": REEXTRACT_STAGE_LABELS.get(stage, stage.replace("_", " ").title()),
         "progress": REEXTRACT_STAGE_PROGRESS.get(stage, 0),
         "invoice_raw_id": row.get("invoice_raw_id"),
+        "organisation_id": row.get("organisation_id"),
         "extracted_invoice_id": row.get("extracted_invoice_id"),
         "error": row.get("last_error"),
         "diagnostic": {

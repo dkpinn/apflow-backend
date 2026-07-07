@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.db.supabase_client import get_supabase_client
-from app.dependencies import UserAuth
+from app.dependencies import UserAuth, ensure_org_read
 from app.services.audit_log import log_invoice_event
 from app.services.invoice_data_builders import (
     build_extracted_document_profile,
@@ -67,7 +67,14 @@ class SupplierComparisonIgnoreRequest(BaseModel):
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @router.get("/{invoice_id}/review-data")
-def get_invoice_review_data(invoice_id: str):
+def get_invoice_review_data(invoice_id: str, auth: UserAuth):
+    review_data = _build_invoice_review_data(invoice_id)
+    user_id, _db = auth
+    ensure_org_read(user_id, review_data.get("organisation_id"))
+    return review_data
+
+
+def _build_invoice_review_data(invoice_id: str):
     """
     Return the complete invoice review payload for the frontend detail page.
 
@@ -316,7 +323,7 @@ def get_invoice_review_data(invoice_id: str):
 # ── Private helpers ────────────────────────────────────────────────────────────
 
 def _fetch_agent_context(invoice_id: str) -> dict:
-    review_data = get_invoice_review_data(invoice_id)
+    review_data = _build_invoice_review_data(invoice_id)
     organisation_id = review_data.get("organisation_id")
     invoice = review_data.get("invoice") or {}
     supplier = invoice.get("supplier") if isinstance(invoice.get("supplier"), dict) else None
