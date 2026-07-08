@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from calendar import monthrange
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
@@ -67,20 +68,14 @@ def _advance(current: date, schedule: str, day: int | None) -> date:
     if schedule == "weekly":
         return current + timedelta(weeks=1)
     if schedule == "monthly":
-        try:
-            return (current + relativedelta(months=1)).replace(day=day)
-        except ValueError:
-            return current + relativedelta(months=1)
+        target = current + relativedelta(months=1)
+        return target.replace(day=min(day, monthrange(target.year, target.month)[1]))
     if schedule == "quarterly":
-        try:
-            return (current + relativedelta(months=3)).replace(day=day)
-        except ValueError:
-            return current + relativedelta(months=3)
+        target = current + relativedelta(months=3)
+        return target.replace(day=min(day, monthrange(target.year, target.month)[1]))
     if schedule == "annually":
-        try:
-            return (current + relativedelta(years=1)).replace(day=day)
-        except ValueError:
-            return current + relativedelta(years=1)
+        target = current + relativedelta(years=1)
+        return target.replace(day=min(day, monthrange(target.year, target.month)[1]))
     return current + timedelta(weeks=1)
 
 

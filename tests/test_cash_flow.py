@@ -3,6 +3,7 @@ from fastapi import HTTPException
 
 from app.routers import reports
 from app.services.cash_flow import generate_cash_flow
+from app.services.cash_flow_forecast import _advance
 
 
 class _Response:
@@ -177,6 +178,13 @@ def test_cash_flow_rejects_invalid_date_range():
             date_from="2026-07-01",
             date_to="2026-06-30",
         )
+
+
+def test_cash_flow_forecast_recurring_advance_clamps_non_leap_february():
+    from datetime import date
+
+    assert _advance(date(2026, 1, 29), "monthly", 29).isoformat() == "2026-02-28"
+    assert _advance(date(2024, 1, 29), "monthly", 29).isoformat() == "2024-02-29"
 
 
 def test_cash_flow_route_uses_reports_view_permission(monkeypatch):

@@ -366,7 +366,9 @@ from app.services.bank_statement_extraction.common import parse_date
 from app.services.bank_statement_extraction.pdf_parser import (
     DATE_ANCHOR_RE,
     _TAIL_RE,
+    _infer_statement_period,
     _infer_statement_year,
+    _parse_columnar_block_date,
     parse_text_statement_from_text,
 )
 
@@ -417,6 +419,81 @@ def test_vlm_leap_day_wrong_year_is_anchored_to_period_leap_year():
         assert _parse_vlm_transaction_date(
             value, statement_period_from=frm, statement_period_to=to
         ) == "2024-02-29"
+
+
+def test_standard_bank_compact_date_uses_statement_period_leap_year():
+    assert _parse_columnar_block_date(
+        "02 29",
+        date_format="month_day",
+        statement_year=2026,
+        statement_period_from="2024-02-01",
+        statement_period_to="2024-02-29",
+        previous_line_date=None,
+    ) == "2024-02-29"
+
+
+def test_standard_bank_compact_date_rejects_non_leap_feb_29():
+    assert _parse_columnar_block_date(
+        "02 29",
+        date_format="month_day",
+        statement_year=2026,
+        statement_period_from="2026-02-01",
+        statement_period_to="2026-02-28",
+        previous_line_date=None,
+    ) is None
+
+
+def test_standard_bank_statement_date_from_to_is_inferred():
+    assert _infer_statement_period(
+        "Standard Bank\nStatement date: 01 February 2024 to 29 February 2024\n"
+    ) == ("2024-02-01", "2024-02-29")
+
+
+def test_standard_bank_statement_from_to_beats_print_date_year():
+    text = (
+        "STANDARD BANK\n"
+        "26 Jun 2026\n"
+        "Statement from 11 February 2024 to 11 March 2024\n"
+    )
+
+    assert _infer_statement_year(text) == 2026
+    assert _infer_statement_period(text) == ("2024-02-11", "2024-03-11")
+    assert _parse_columnar_block_date(
+        "02 12",
+        date_format="month_day",
+        statement_year=_infer_statement_year(text),
+        statement_period_from="2024-02-11",
+        statement_period_to="2024-03-11",
+    ) == "2024-02-12"
+
+
+def test_standard_bank_text_dates_are_normalized_to_statement_from_period():
+    text = (
+        "STANDARD BANK\n"
+        "26 Jun 2026\n"
+        "Statement from 11 February 2024 to 11 March 2024\n"
+        "\n"
+        "12 Feb IB TRANSFER FROM ******5155224 15H23 *****9064 5000.00 6328.19\n"
+        "13 Feb CHEQUE CARD PURCHASE A C HARDWARE 736.91 6091.28\n"
+    )
+
+    header, lines = parse_text_statement_from_text(text, bank_account_id="bank-1")
+    summary = facade.normalize_dates_from_period(lines, header, bank_account_id="bank-1")
+
+    assert header["statement_period_from"] == "2024-02-11"
+    assert header["statement_period_to"] == "2024-03-11"
+    assert summary["corrections_applied"] == 2
+    assert [line.line_date for line in lines] == ["2024-02-12", "2024-02-13"]
+
+
+def test_vlm_statement_from_to_period_is_detected():
+    statement_from, statement_to = _vlm_statement_period_dates(
+        {"transactions": [], "confidence_score": 0.9},
+        "STANDARD BANK\n26 Jun 2026\nStatement from 11 February 2024 to 11 March 2024\n",
+    )
+
+    assert statement_from == "2024-02-11"
+    assert statement_to == "2024-03-11"
 
 
 def test_infer_statement_year_finds_first_year():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -61,6 +62,13 @@ _TAIL_RE = re.compile(
 PAGE_BREAK_MARKER = "__PAGE_BREAK__"
 
 _YEAR_RE = re.compile(r"\b(20\d{2})\b")
+_STATEMENT_PERIOD_RE = re.compile(
+    r"(?:statement\s+(?:period|date|from)|date\s+from)\s*:?\s*"
+    r"(?P<date_from>\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]+\s+\d{4})"
+    r"\s*(?:to|-|–|—)\s*"
+    r"(?P<date_to>\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+    re.IGNORECASE,
+)
 
 # Detects "Cr" or "Dr" immediately after a money token — indicates FNB-style
 # running balances where the suffix is printed directly after the number.
@@ -72,6 +80,13 @@ def _infer_statement_year(text: str) -> Optional[int]:
     for match in _YEAR_RE.finditer(text[:2000]):
         return int(match.group(1))
     return None
+
+
+def _infer_statement_period(text: str) -> tuple[Optional[str], Optional[str]]:
+    match = _STATEMENT_PERIOD_RE.search(text[:4000])
+    if not match:
+        return None, None
+    return parse_date(match.group("date_from")), parse_date(match.group("date_to"))
 
 
 def extract_pdf_text(file_bytes: bytes) -> str:
@@ -312,18 +327,52 @@ def _parse_columnar_block_date(
     *,
     date_format: Optional[str],
     statement_year: Optional[int],
-    previous_line_date: Optional[str],
+    statement_period_from: Optional[str] = None,
+    statement_period_to: Optional[str] = None,
+    previous_line_date: Optional[str] = None,
 ) -> Optional[str]:
     if date_format == "month_day":
         match = _STANDARD_BANK_COMPACT_DATE_RE.match(raw_date)
-        if not match or statement_year is None:
+        if not match:
             return None
         month = int(match.group("month"))
         day = int(match.group("day"))
-        year = statement_year
+        years: list[int] = []
+        for period_date in (statement_period_from, statement_period_to):
+            if period_date:
+                year = int(period_date[:4])
+                if year not in years:
+                    years.append(year)
+        if statement_year is not None and statement_year not in years:
+            years.append(statement_year)
         if previous_line_date and int(previous_line_date[5:7]) == 12 and month == 1:
-            year += 1
-        return f"{year:04d}-{month:02d}-{day:02d}"
+            rollover_year = int(previous_line_date[:4]) + 1
+            if rollover_year not in years:
+                years.insert(0, rollover_year)
+
+        candidates: list[str] = []
+        for year in years:
+            try:
+                candidate = date(year, month, day).isoformat()
+            except ValueError:
+                continue
+            if candidate not in candidates:
+                candidates.append(candidate)
+        if not candidates:
+            return None
+
+        if statement_period_from and statement_period_to:
+            in_period = [
+                candidate for candidate in candidates
+                if statement_period_from <= candidate <= statement_period_to
+            ]
+            if in_period:
+                if previous_line_date:
+                    forward = [candidate for candidate in in_period if candidate >= previous_line_date]
+                    return min(forward) if forward else min(in_period)
+                return min(in_period)
+
+        return candidates[0]
 
     line_date = parse_date(raw_date, year=statement_year)
     if (
@@ -412,6 +461,8 @@ def _build_statement_from_blocks(
     bank_account_id: str,
     currency: Optional[str] = None,
     statement_year: Optional[int] = None,
+    statement_period_from: Optional[str] = None,
+    statement_period_to: Optional[str] = None,
 ) -> tuple[dict[str, Any], list[ParsedBankLine]]:
     warnings: list[dict[str, Any]] = []
     if not blocks:
@@ -485,6 +536,8 @@ def _build_statement_from_blocks(
             block["date"],
             date_format=block.get("date_format"),
             statement_year=statement_year,
+            statement_period_from=statement_period_from,
+            statement_period_to=statement_period_to,
             previous_line_date=lines[-1].line_date if lines else None,
         )
 
@@ -525,8 +578,8 @@ def _build_statement_from_blocks(
         opening_balance = dec_to_float(lines[0].balance_amount - lines[0].signed_amount)
     confidence_score = min((line.extraction_confidence or 0.65 for line in lines), default=0.65)
     header = {
-        "statement_period_from": next((line.line_date for line in lines if line.line_date), None),
-        "statement_period_to": next((line.line_date for line in reversed(lines) if line.line_date), None),
+        "statement_period_from": statement_period_from or next((line.line_date for line in lines if line.line_date), None),
+        "statement_period_to": statement_period_to or next((line.line_date for line in reversed(lines) if line.line_date), None),
         "opening_balance": opening_balance,
         "closing_balance": dec_to_float(lines[-1].balance_amount) if lines[-1].balance_amount is not None else None,
         "currency": currency,
@@ -558,12 +611,15 @@ def parse_text_statement_from_text(
     currency: Optional[str] = None,
 ) -> tuple[dict[str, Any], list[ParsedBankLine]]:
     statement_year = _infer_statement_year(text)
+    statement_period_from, statement_period_to = _infer_statement_period(text)
     blocks = parse_transaction_blocks(text)
     return _build_statement_from_blocks(
         blocks, "pdf_text_blocks", text,
         bank_account_id=bank_account_id,
         currency=currency,
         statement_year=statement_year,
+        statement_period_from=statement_period_from,
+        statement_period_to=statement_period_to,
     )
 
 
@@ -575,6 +631,7 @@ def parse_text_statement(
 ) -> tuple[dict[str, Any], list[ParsedBankLine]]:
     text = extract_pdf_text(file_bytes)
     statement_year = _infer_statement_year(text)
+    statement_period_from, statement_period_to = _infer_statement_period(text)
     blocks = parse_transaction_blocks(text)
     parser_strategy = "pdf_text_blocks"
     columnar_blocks = parse_columnar_transaction_blocks(extract_pdf_words_by_page(file_bytes))
@@ -590,4 +647,6 @@ def parse_text_statement(
         bank_account_id=bank_account_id,
         currency=currency,
         statement_year=statement_year,
+        statement_period_from=statement_period_from,
+        statement_period_to=statement_period_to,
     )

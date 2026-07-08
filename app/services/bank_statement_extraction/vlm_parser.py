@@ -109,9 +109,10 @@ def _is_retryable(exc: Exception) -> bool:
 
 
 _STATEMENT_PERIOD_RE = re.compile(
-    r"statement\s+period\s*:\s*"
-    r"(?P<date_from>\d{1,2}\s+[A-Za-z]+\s+\d{4})\s+to\s+"
-    r"(?P<date_to>\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+    r"(?:statement\s+(?:period|date|from)|date\s+from)\s*:?\s*"
+    r"(?P<date_from>\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]+\s+\d{4})"
+    r"\s*(?:to|-|–|—)\s*"
+    r"(?P<date_to>\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]+\s+\d{4})",
     re.IGNORECASE,
 )
 

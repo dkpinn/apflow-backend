@@ -224,6 +224,29 @@ def test_create_template_route_returns_400_for_invalid_type(monkeypatch):
     assert "Invalid transaction_type" in exc.value.detail
 
 
+def test_create_template_route_rejects_impossible_end_date(monkeypatch):
+    monkeypatch.setattr(recurring_router, "ensure_org_write", lambda *_args: None)
+    db = _DB({"recurring_transaction_templates": []})
+
+    with pytest.raises(HTTPException) as exc:
+        recurring_router.create_template_route(
+            auth=(USER_ID, db),
+            organisation_id=ORG_ID,
+            payload={
+                "name": "Bad recurring transaction",
+                "transaction_type": "supplier_invoice",
+                "schedule_type": "monthly",
+                "start_date": "2026-01-29",
+                "end_date": "2026-02-29",
+                "amount": 100,
+            },
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "end_date must be a valid YYYY-MM-DD date"
+    assert db.tables["recurring_transaction_templates"] == []
+
+
 def test_list_drafts_route_filters_pending_drafts(monkeypatch):
     monkeypatch.setattr(recurring_router, "ensure_org_read", lambda *_args: None)
     db = _DB({
@@ -291,6 +314,38 @@ def test_generate_due_drafts_creates_pending_draft_and_advances_template():
     assert draft["status"] == "pending"
     assert draft["draft_data"]["supplier_id"] == SUPPLIER_ID
     assert db.tables["recurring_transaction_templates"][0]["next_due_date"] == "2000-02-01"
+
+
+def test_generate_due_drafts_clamps_29_feb_on_non_leap_year():
+    db = _DB({
+        "recurring_transaction_templates": [
+            _template(next_due_date="2026-01-29", schedule_day=29),
+        ],
+        "recurring_transaction_drafts": [],
+    })
+
+    generated = recurring_service.generate_due_drafts(db)
+
+    assert generated == 1
+    assert db.tables["recurring_transaction_drafts"][0]["due_date"] == "2026-01-29"
+    assert db.tables["recurring_transaction_templates"][0]["next_due_date"] == "2026-02-28"
+
+
+def test_update_template_route_validates_schedule_day_and_end_date(monkeypatch):
+    monkeypatch.setattr(recurring_router, "ensure_org_write", lambda *_args: None)
+    db = _DB({"recurring_transaction_templates": [_template()], "recurring_transaction_drafts": []})
+
+    with pytest.raises(HTTPException) as exc:
+        recurring_router.update_template_route(
+            template_id=TEMPLATE_ID,
+            auth=(USER_ID, db),
+            organisation_id=ORG_ID,
+            payload={"schedule_day": 32, "end_date": "2026-02-29"},
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "schedule_day must be between 1 and 31"
+    assert db.tables["recurring_transaction_templates"][0]["schedule_day"] == 1
 
 
 def test_generate_due_drafts_completes_expired_template_without_draft():

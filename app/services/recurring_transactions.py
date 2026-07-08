@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from calendar import monthrange
 from datetime import date, timedelta
 from typing import Any, Optional
 from uuid import uuid4
@@ -20,6 +21,35 @@ VALID_TYPES = {
 VALID_SCHEDULES = {"weekly", "monthly", "quarterly", "annually"}
 
 
+def _parse_date_field(value: Any, field_name: str) -> date:
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (ValueError, TypeError):
+        raise ValueError(f"{field_name} must be a valid YYYY-MM-DD date") from None
+
+
+def _parse_optional_date_field(value: Any, field_name: str) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    return _parse_date_field(value, field_name).isoformat()
+
+
+def _normalize_schedule_day(value: Any, fallback: int) -> int:
+    day = fallback if value in (None, "") else value
+    try:
+        parsed = int(day)
+    except (TypeError, ValueError):
+        raise ValueError("schedule_day must be a number between 1 and 31") from None
+    if parsed < 1 or parsed > 31:
+        raise ValueError("schedule_day must be between 1 and 31")
+    return parsed
+
+
+def _with_scheduled_day(base: date, schedule_day: int) -> date:
+    last_day = monthrange(base.year, base.month)[1]
+    return base.replace(day=min(schedule_day, last_day))
+
+
 def _compute_next_due(start: date, schedule_type: str, schedule_day: Optional[int]) -> date:
     today = date.today()
     if schedule_type == "weekly":
@@ -28,7 +58,7 @@ def _compute_next_due(start: date, schedule_type: str, schedule_day: Optional[in
             candidate += timedelta(weeks=1)
         return candidate
     if schedule_type in ("monthly", "quarterly", "annually"):
-        day = schedule_day or start.day
+        day = _normalize_schedule_day(schedule_day, start.day)
         if schedule_type == "monthly":
             delta = relativedelta(months=1)
         elif schedule_type == "quarterly":
@@ -37,33 +67,21 @@ def _compute_next_due(start: date, schedule_type: str, schedule_day: Optional[in
             delta = relativedelta(years=1)
         candidate = start
         while candidate <= today:
-            try:
-                candidate = (candidate + delta).replace(day=day)
-            except ValueError:
-                candidate = candidate + delta
+            candidate = _with_scheduled_day(candidate + delta, day)
         return candidate
     return start
 
 
 def _advance_due_date(current: date, schedule_type: str, schedule_day: Optional[int]) -> date:
-    day = schedule_day or current.day
+    day = _normalize_schedule_day(schedule_day, current.day)
     if schedule_type == "weekly":
         return current + timedelta(weeks=1)
     if schedule_type == "monthly":
-        try:
-            return (current + relativedelta(months=1)).replace(day=day)
-        except ValueError:
-            return current + relativedelta(months=1)
+        return _with_scheduled_day(current + relativedelta(months=1), day)
     if schedule_type == "quarterly":
-        try:
-            return (current + relativedelta(months=3)).replace(day=day)
-        except ValueError:
-            return current + relativedelta(months=3)
+        return _with_scheduled_day(current + relativedelta(months=3), day)
     if schedule_type == "annually":
-        try:
-            return (current + relativedelta(years=1)).replace(day=day)
-        except ValueError:
-            return current + relativedelta(years=1)
+        return _with_scheduled_day(current + relativedelta(years=1), day)
     return current
 
 
@@ -104,8 +122,9 @@ def create_template(db, organisation_id: str, user_id: str, payload: dict) -> di
     if schedule_type not in VALID_SCHEDULES:
         raise ValueError(f"Invalid schedule_type: {schedule_type}")
 
-    start_date = date.fromisoformat(str(payload["start_date"]))
-    schedule_day = payload.get("schedule_day") or start_date.day
+    start_date = _parse_date_field(payload.get("start_date"), "start_date")
+    schedule_day = _normalize_schedule_day(payload.get("schedule_day"), start_date.day)
+    end_date = _parse_optional_date_field(payload.get("end_date"), "end_date")
     next_due = _compute_next_due(start_date, schedule_type, schedule_day)
 
     row = {
@@ -124,7 +143,7 @@ def create_template(db, organisation_id: str, user_id: str, payload: dict) -> di
         "template_data": payload.get("template_data") or {},
         "status": "active",
         "start_date": start_date.isoformat(),
-        "end_date": payload["end_date"] if payload.get("end_date") else None,
+        "end_date": end_date,
         "next_due_date": next_due.isoformat(),
         "created_by": user_id,
     }
@@ -133,7 +152,7 @@ def create_template(db, organisation_id: str, user_id: str, payload: dict) -> di
 
 
 def update_template(db, organisation_id: str, template_id: str, payload: dict) -> dict:
-    get_template(db, organisation_id, template_id)  # raises if not found
+    existing = get_template(db, organisation_id, template_id)  # raises if not found
     allowed = {
         "name", "amount", "currency", "supplier_id", "customer_id",
         "description", "reference", "template_data", "status",
@@ -142,6 +161,13 @@ def update_template(db, organisation_id: str, template_id: str, payload: dict) -
     update = {k: v for k, v in payload.items() if k in allowed}
     if not update:
         raise ValueError("No updatable fields provided")
+    if "schedule_type" in update and update["schedule_type"] not in VALID_SCHEDULES:
+        raise ValueError(f"Invalid schedule_type: {update['schedule_type']}")
+    if "schedule_day" in update:
+        fallback = int(existing.get("schedule_day") or 1)
+        update["schedule_day"] = _normalize_schedule_day(update["schedule_day"], fallback)
+    if "end_date" in update:
+        update["end_date"] = _parse_optional_date_field(update["end_date"], "end_date")
     db.table("recurring_transaction_templates").update(update).eq("id", template_id).execute()
     return get_template(db, organisation_id, template_id)
 
