@@ -29,6 +29,7 @@ from app.routers import bank_journals
 from app.routers import bank_rules
 from app.routers import bank_uploads
 from app.routers import bank_lines
+from app.routers import bank_attachments
 from app.routers import bank_extraction_benchmark
 from app.routers import bank_extraction_admin
 from app.routers import reports
@@ -403,6 +404,7 @@ app.include_router(bank_journals.router)
 app.include_router(bank_rules.router)
 app.include_router(bank_uploads.router)
 app.include_router(bank_lines.router)
+app.include_router(bank_attachments.router)
 app.include_router(bank_extraction_benchmark.router)
 app.include_router(bank_extraction_admin.router)
 app.include_router(reports.router)

@@ -219,6 +219,114 @@ def test_suggest_bank_line_404_when_line_missing(monkeypatch):
     assert exc_info.value.status_code == 404
 
 
+# ── suggest_bank_line_ai ──────────────────────────────────────────────────────
+
+def test_suggest_bank_line_ai_inserts_and_reports_available(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row()],
+        "bank_statement_gold_files": [],
+        "bank_statement_extraction_runs": [],
+        "bank_audit_events": [],
+        "bank_transaction_suggestions": [],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(
+        bl,
+        "score_ai_suggestions",
+        lambda _db, **_kw: [{"suggestion_type": "ai", "suggested_account_id": "acc-1", "confidence_score": 0.8}],
+    )
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+
+    from app.routers.bank import ExtractUploadRequest
+    result = bl.suggest_bank_line_ai(LINE_ID, ExtractUploadRequest(organisation_id=ORG_ID), AUTH)
+
+    assert result["success"] is True
+    assert result["ai_available"] is True
+    assert len(result["suggestions"]) == 1
+    assert db.tables["bank_transaction_suggestions"][0]["suggestion_type"] == "ai"
+
+
+def test_suggest_bank_line_ai_reports_unavailable_without_key(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row()],
+        "bank_statement_gold_files": [],
+        "bank_statement_extraction_runs": [],
+        "bank_audit_events": [],
+        "bank_transaction_suggestions": [],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+    # Scorer returns nothing (AI unavailable) — endpoint must not raise and must
+    # report ai_available=False so the UI can message it cleanly.
+    monkeypatch.setattr(bl, "score_ai_suggestions", lambda _db, **_kw: [])
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+    from app.routers.bank import ExtractUploadRequest
+    result = bl.suggest_bank_line_ai(LINE_ID, ExtractUploadRequest(organisation_id=ORG_ID), AUTH)
+
+    assert result["success"] is True
+    assert result["ai_available"] is False
+    assert result["suggestions"] == []
+    assert len(db.tables["bank_transaction_suggestions"]) == 0
+
+
+def test_suggest_bank_line_ai_replaces_only_ai_suggestions(monkeypatch):
+    # A prior rule suggestion must survive a re-run of AI suggest.
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row()],
+        "bank_statement_gold_files": [],
+        "bank_statement_extraction_runs": [],
+        "bank_audit_events": [],
+        "bank_transaction_suggestions": [
+            {
+                "id": "sug-rule",
+                "organisation_id": ORG_ID,
+                "bank_statement_line_id": LINE_ID,
+                "suggestion_type": "rule",
+                "status": "open",
+            },
+            {
+                "id": "sug-ai-old",
+                "organisation_id": ORG_ID,
+                "bank_statement_line_id": LINE_ID,
+                "suggestion_type": "ai",
+                "status": "open",
+            },
+        ],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(
+        bl,
+        "score_ai_suggestions",
+        lambda _db, **_kw: [{"suggestion_type": "ai", "suggested_account_id": "acc-9", "confidence_score": 0.7}],
+    )
+
+    from app.routers.bank import ExtractUploadRequest
+    bl.suggest_bank_line_ai(LINE_ID, ExtractUploadRequest(organisation_id=ORG_ID), AUTH)
+
+    rows = db.tables["bank_transaction_suggestions"]
+    types = sorted(r["suggestion_type"] for r in rows)
+    assert types == ["ai", "rule"]  # old ai replaced, rule preserved
+    assert any(r.get("suggested_account_id") == "acc-9" for r in rows)
+
+
+def test_score_ai_suggestions_returns_empty_without_key(monkeypatch):
+    from app.services.bank import ai_suggestions
+
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    result = ai_suggestions.score_ai_suggestions(
+        db=None,
+        organisation_id=ORG_ID,
+        line=_line_row(),
+    )
+    assert result == []
+
+
 # ── review_bank_line ──────────────────────────────────────────────────────────
 
 def test_review_bank_line_sets_reviewed_status(monkeypatch):

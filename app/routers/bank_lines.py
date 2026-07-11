@@ -8,6 +8,7 @@ bank.py does NOT import this module — no circular import risk.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
@@ -25,6 +26,7 @@ from app.services.sales_invoices import post_customer_receipt
 from app.services.protected_accounts import assert_manual_posting_account_allowed
 from app.services.organisation_vat import vat_applicability
 from app.services.bank.extraction_gate import assert_bank_line_upload_extracted, assert_bank_lines_uploads_extracted
+from app.services.bank.ai_suggestions import score_ai_suggestions
 
 from app.routers.bank import (
     BulkDeleteLinesRequest,
@@ -103,6 +105,49 @@ def suggest_bank_line(line_id: str, payload: ExtractUploadRequest, auth: UserAut
         db.table("bank_transaction_suggestions").insert(inserts).execute()
         db.table("bank_statement_lines").update({"match_status": "suggested"}).eq("id", line_id).execute()
     return {"success": True, "suggestions": inserts}
+
+
+@router.post("/lines/{line_id}/suggest-ai")
+def suggest_bank_line_ai(line_id: str, payload: ExtractUploadRequest, auth: UserAuth):
+    """On-demand AI allocation suggestion for a single bank line.
+
+    Kept separate from ``/suggest`` so the (paid) Gemini call is only made when a
+    user explicitly asks. Emits a ``suggestion_type="ai"`` row into
+    ``bank_transaction_suggestions`` so it surfaces through the normal
+    unreconciled-lines enrichment. Degrades gracefully (empty ``suggestions``)
+    when the AI is unavailable.
+    """
+    user_id, db = _auth(auth)
+    organisation_id = str(payload.organisation_id)
+    ensure_org_write(user_id, organisation_id)
+    line = _one(
+        db.table("bank_statement_lines").select("*").eq("id", line_id).eq("organisation_id", organisation_id).limit(1).execute(),
+        "Bank statement line not found",
+    )
+    try:
+        assert_bank_line_upload_extracted(
+            db,
+            organisation_id=organisation_id,
+            line=line,
+            action="Suggest bank allocation",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    suggestions = score_ai_suggestions(db, organisation_id=organisation_id, line=line)
+    # Replace only prior AI suggestions for this line so rule/invoice suggestions survive.
+    db.table("bank_transaction_suggestions").delete().eq("bank_statement_line_id", line_id).eq(
+        "status", "open"
+    ).eq("suggestion_type", "ai").execute()
+    inserts = [{**s, "organisation_id": organisation_id, "bank_statement_line_id": line_id} for s in suggestions]
+    if inserts:
+        db.table("bank_transaction_suggestions").insert(inserts).execute()
+        db.table("bank_statement_lines").update({"match_status": "suggested"}).eq("id", line_id).execute()
+    return {
+        "success": True,
+        "suggestions": inserts,
+        "ai_available": bool(os.getenv("GOOGLE_API_KEY")),
+    }
 
 
 @router.post("/lines/{line_id}/review")
