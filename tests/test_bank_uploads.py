@@ -927,9 +927,9 @@ def test_approve_bank_upload_extraction_attestation_overrides_soft_balance_issue
     assert db.tables["bank_statement_uploads"][0]["extraction_status"] == "extracted"
 
     # And the soft issues are reported as warnings (not blockers) for the reviewer.
-    warnings = bu._soft_blockers(upload)
+    warnings = bu.rw.soft_blockers(upload)
     assert any("Running balance walk" in w for w in warnings)
-    assert bu._structural_blockers(upload) == []
+    assert bu.rw.structural_blockers(upload) == []
 
 
 def test_approve_bank_upload_extraction_still_blocks_structural_problem(monkeypatch):
@@ -1220,7 +1220,7 @@ def test_accept_duplicate_clears_the_duplicate_approval_blocker(monkeypatch):
     assert stored["duplicate_status"] == "clear"
     assert stored["extracted_line_count"] == 3
     # The blocker that trapped the reviewer is gone; the row was stored.
-    assert bu._structural_blockers(stored) == []
+    assert bu.rw.structural_blockers(stored) == []
     assert len(db.tables["bank_statement_lines"]) == 1
 
 

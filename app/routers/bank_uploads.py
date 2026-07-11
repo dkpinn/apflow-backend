@@ -39,6 +39,7 @@ from app.services.bank_statement_service import (
 )
 from app.services.extraction_foundation import file_sha256
 from app.services.bank.auto_post import auto_post_matched_lines
+from app.services.bank import review_workflow as rw
 
 from app.routers.bank import (
     BankUploadCreate,
@@ -60,27 +61,6 @@ from app.services.bank_statement_extraction.vlm_bank_router import identify_bank
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/bank", tags=["bank"])
-
-
-def _line_signed_amount(line) -> float:
-    if isinstance(line, dict):
-        return float(line.get("signed_amount") or 0)
-    return float(getattr(line, "signed_amount", 0) or 0)
-
-
-def _line_value(line, key: str, default=None):
-    if isinstance(line, dict):
-        return line.get(key, default)
-    return getattr(line, key, default)
-
-
-def _numeric_or_none(value) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _auto_post_upload_lines(
@@ -131,37 +111,6 @@ def _auto_post_upload_lines(
         logger.exception("[AUTO_POST] upload=%s failed — continuing", upload_id)
 
 
-def _review_snapshot_line(wrapper: dict, row_number: int) -> dict:
-    line = wrapper["line"]
-    duplicate_status = wrapper.get("duplicate_status") or "clear"
-    signed_amount = _line_signed_amount(line)
-    if duplicate_status != "clear":
-        import_status = "duplicate_filtered"
-    elif signed_amount == 0:
-        import_status = "dropped_zero_or_opening"
-    else:
-        import_status = "stored"
-    return {
-        "row_number": row_number,
-        "import_status": import_status,
-        "duplicate_status": duplicate_status,
-        "line_date": _line_value(line, "line_date"),
-        "value_date": _line_value(line, "value_date"),
-        "description": _line_value(line, "description"),
-        "reference": _line_value(line, "reference"),
-        "counterparty": _line_value(line, "counterparty"),
-        "debit_amount": _numeric_or_none(_line_value(line, "debit_amount")),
-        "credit_amount": _numeric_or_none(_line_value(line, "credit_amount")),
-        "signed_amount": signed_amount,
-        "balance_amount": _numeric_or_none(_line_value(line, "balance_amount")),
-        "currency": _line_value(line, "currency"),
-        "source_page": _line_value(line, "source_page"),
-        "source_row_index": _line_value(line, "source_row_index"),
-        "extraction_confidence": _numeric_or_none(_line_value(line, "extraction_confidence")),
-        "extraction_warnings": _line_value(line, "extraction_warnings", []) or [],
-    }
-
-
 def _storage_signed_url(db, *, bucket: str, path: str, expires_in: int = 3600) -> tuple[str | None, str | None]:
     try:
         storage_bucket = db.storage.from_(bucket)
@@ -181,60 +130,6 @@ def _storage_signed_url(db, *, bucket: str, path: str, expires_in: int = 3600) -
         return signed_url, None if signed_url else "Storage client returned no signed URL"
     except Exception as exc:
         return None, str(exc)
-
-
-def _gold_document_id(upload: dict) -> str:
-    filename = str(upload.get("original_filename") or upload.get("id") or "bank-statement")
-    stem = Path(filename).stem or "bank-statement"
-    clean = "".join(ch.lower() if ch.isalnum() else "-" for ch in stem).strip("-")
-    return clean or str(upload.get("id") or "bank-statement")
-
-
-def _gold_transaction_from_review_line(line: dict, transaction_index: int) -> dict:
-    return {
-        "transaction_index": transaction_index,
-        "date": line.get("line_date"),
-        "description": line.get("description") or "",
-        "amount": line.get("signed_amount"),
-        "debit": line.get("debit_amount"),
-        "credit": line.get("credit_amount"),
-        "running_balance": line.get("balance_amount"),
-        "page_number": line.get("source_page"),
-        "source_reference": (
-            f"row-{line.get('source_row_index')}"
-            if line.get("source_row_index") not in (None, "")
-            else f"extracted-row-{line.get('row_number') or transaction_index}"
-        ),
-    }
-
-
-def _gold_draft_from_upload(upload: dict, account: dict) -> dict:
-    evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
-    review_snapshot = evidence.get("review_snapshot") if isinstance(evidence.get("review_snapshot"), dict) else {}
-    snapshot_lines = review_snapshot.get("lines") if isinstance(review_snapshot.get("lines"), list) else []
-    transactions = []
-    for line in snapshot_lines:
-        if not isinstance(line, dict):
-            continue
-        if line.get("import_status") == "dropped_zero_or_opening":
-            continue
-        if _numeric_or_none(line.get("signed_amount")) == 0:
-            continue
-        transactions.append(_gold_transaction_from_review_line(line, len(transactions) + 1))
-    return {
-        "document_id": _gold_document_id(upload),
-        "bank": account.get("institution_name"),
-        "account_type": account.get("account_type"),
-        "document_variant": upload.get("source_format") or "bank_upload",
-        "statement_start_date": upload.get("statement_period_from"),
-        "statement_end_date": upload.get("statement_period_to"),
-        "opening_balance": upload.get("opening_balance"),
-        "closing_balance": upload.get("closing_balance"),
-        "transactions": transactions,
-        "source_upload_id": upload.get("id"),
-        "source_filename": upload.get("original_filename"),
-        "needs_manual_correction": True,
-    }
 
 
 @router.get("/uploads")
@@ -282,263 +177,6 @@ def create_bank_upload(payload: BankUploadCreate, auth: UserAuth):
     return {"success": True, "upload": upload}
 
 
-def _soft_blockers(upload: dict) -> list[str]:
-    """Balance signals the reviewer's attestation can override.
-
-    For a statement in manual review, the human comparing against the source
-    document is the authority — these automatic checks are shown as warnings, not
-    hard blocks, so a poorly-read scan doesn't trap the reviewer forever. They are
-    covered by the reviewer's `balances_checked` attestation at approval time.
-    """
-    warnings: list[str] = []
-    evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
-    validation = evidence.get("validation") if isinstance(evidence.get("validation"), dict) else {}
-    running_balance = evidence.get("running_balance") if isinstance(evidence.get("running_balance"), dict) else {}
-
-    if upload.get("balance_status") != "balanced":
-        warnings.append("Statement opening/closing balances are not reconciled")
-    if validation.get("closing_balance_passed") is not True:
-        warnings.append("Closing balance validation has not passed")
-    if validation.get("running_balance_passed") is not True:
-        warnings.append("Running balance validation has not passed")
-    if running_balance.get("balance_walk_status") not in {None, "balanced"}:
-        warnings.append("Running balance walk has not passed")
-    return warnings
-
-
-def _structural_blockers(upload: dict, db=None, reviewer_id: str | None = None, is_single_user: bool = False) -> list[str]:
-    """Hard blockers that no attestation can wave away.
-
-    These are structural integrity problems (nothing to import, an incomplete
-    review snapshot, unresolved duplicates) plus — only under strict gold-fixture
-    mode — the fixture/benchmark/independent-verifier controls.
-    """
-    blockers: list[str] = []
-    evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
-    duplicate_summary = upload.get("duplicate_summary") if isinstance(upload.get("duplicate_summary"), dict) else {}
-
-    if int(upload.get("extracted_line_count") or 0) <= 0:
-        blockers.append("No importable transaction rows were stored")
-    review_snapshot = evidence.get("review_snapshot") if isinstance(evidence.get("review_snapshot"), dict) else {}
-    review_lines = review_snapshot.get("lines") if isinstance(review_snapshot.get("lines"), list) else []
-    raw_count = int(evidence.get("raw_extracted_transaction_count") or 0)
-    if raw_count and len(review_lines) != raw_count:
-        blockers.append("Row-level extraction review snapshot is incomplete")
-    duplicate_count = int(
-        upload.get("duplicate_line_count")
-        or duplicate_summary.get("duplicate_line_count")
-        or 0
-    )
-    if duplicate_count:
-        blockers.append("Duplicate transaction rows are still present")
-    if db is not None:
-        fixture_rows = corrected_fixture_rows_for_upload(
-            db,
-            organisation_id=str(upload.get("organisation_id")),
-            upload_id=str(upload.get("id")),
-        )
-        if upload_requires_corrected_fixture(upload) and not fixture_rows:
-            blockers.append(
-                "PDF/image/VLM bank statement extraction requires a corrected gold fixture and passing benchmark"
-            )
-        if upload_requires_corrected_fixture(upload) and fixture_rows and reviewer_id and not is_single_user:
-            has_independent_verifier = any(
-                row.get("verified_by") and str(row.get("verified_by")) != str(reviewer_id)
-                for row in fixture_rows
-            )
-            if not has_independent_verifier:
-                blockers.append(
-                    "PDF/image/VLM bank statement extraction approval must be performed by a reviewer different from the corrected gold fixture verifier"
-                )
-        # Benchmark freshness only gates approval when gold fixtures are a hard
-        # requirement. In the default optional/internal mode a saved-but-unbenchmarked
-        # gold file must not block approval of an eyeballed extraction.
-        if upload_requires_corrected_fixture(upload):
-            blockers.extend(
-                corrected_fixture_benchmark_blockers(
-                    db,
-                    organisation_id=str(upload.get("organisation_id")),
-                    upload_id=str(upload.get("id")),
-                )
-            )
-    return blockers
-
-
-def _is_single_user_org(db, organisation_id: str) -> bool:
-    result = (
-        db.table("organisation_users")
-        .select("id", count="exact")
-        .eq("organisation_id", organisation_id)
-        .execute()
-    )
-    # Prefer the exact server count, but fall back to the returned rows when the
-    # driver does not populate `count` (e.g. some stubs / older postgrest).
-    member_count = result.count
-    if member_count is None:
-        member_count = len(result.data or [])
-    return member_count <= 1
-
-
-def _reviewer_identity_blockers(upload: dict, reviewer_id: str, is_single_user: bool = False) -> list[str]:
-    if is_single_user:
-        return []
-    evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
-    extracted_by = evidence.get("extracted_by")
-    if reviewer_id in {upload.get("uploaded_by"), extracted_by}:
-        return ["Bank statement extraction must be approved by a different reviewer"]
-    return []
-
-
-def _attestation_blockers(payload: ApproveExtractionRequest) -> list[str]:
-    required_checks = [
-        (payload.source_document_checked, "Reviewer must confirm the source document was opened and checked"),
-        (payload.transaction_count_checked, "Reviewer must confirm the extracted transaction count matches the source"),
-        (payload.amounts_and_dates_checked, "Reviewer must confirm extracted dates, descriptions, and amounts match the source"),
-        (payload.balances_checked, "Reviewer must confirm opening, closing, and running balances reconcile"),
-    ]
-    return [message for passed, message in required_checks if not passed]
-
-
-def _timestamp_key(row: dict, *fields: str) -> str:
-    for field in fields:
-        value = row.get(field)
-        if value:
-            return str(value)
-    return ""
-
-
-def _latest_gold_file(rows: list[dict]) -> dict | None:
-    if not rows:
-        return None
-    return max(rows, key=lambda row: (_timestamp_key(row, "verified_at", "created_at"), str(row.get("id") or "")))
-
-
-def _latest_benchmark_run_for_gold_file(
-    db,
-    *,
-    organisation_id: str,
-    upload_id: str,
-    gold_file: dict | None,
-) -> dict | None:
-    if not gold_file or not gold_file.get("document_id"):
-        return None
-    runs = (
-        db.table("bank_statement_extraction_runs")
-        .select("*")
-        .eq("organisation_id", organisation_id)
-        .eq("bank_statement_upload_id", upload_id)
-        .eq("document_id", gold_file["document_id"])
-        .order("created_at")
-        .execute()
-        .data
-        or []
-    )
-    if not runs:
-        return None
-    return max(runs, key=lambda row: (_timestamp_key(row, "created_at"), str(row.get("id") or "")))
-
-
-def _benchmark_status(
-    *,
-    upload: dict,
-    requires_fixture: bool,
-    latest_gold_file: dict | None,
-    latest_benchmark_run: dict | None,
-) -> str:
-    if not requires_fixture and not latest_gold_file:
-        return "not_required"
-    if requires_fixture and not latest_gold_file:
-        return "missing_gold_file"
-    if latest_gold_file and not latest_benchmark_run:
-        return "not_run"
-
-    run_created_at = _timestamp_key(latest_benchmark_run or {}, "created_at")
-    gold_verified_at = _timestamp_key(latest_gold_file or {}, "verified_at", "created_at")
-    upload_extracted_at = _timestamp_key(upload, "extracted_at")
-    if gold_verified_at and (not run_created_at or run_created_at < gold_verified_at):
-        return "stale_after_gold_correction"
-    if upload_extracted_at and (not run_created_at or run_created_at < upload_extracted_at):
-        return "stale_after_latest_extraction"
-    return "passed" if latest_benchmark_run and latest_benchmark_run.get("can_allocate") is True else "failed"
-
-
-def _gold_draft_or_none(upload: dict, account: dict) -> dict | None:
-    draft = _gold_draft_from_upload(upload, account)
-    return draft if draft["transactions"] else None
-
-
-def _review_workflow_state(
-    db,
-    *,
-    organisation_id: str,
-    upload: dict,
-    account: dict,
-    reviewer_id: str,
-    is_single_user: bool = False,
-) -> dict:
-    fixture_rows = corrected_fixture_rows_for_upload(
-        db,
-        organisation_id=organisation_id,
-        upload_id=str(upload.get("id")),
-    )
-    latest_gold_file = _latest_gold_file(fixture_rows)
-    latest_benchmark_run = _latest_benchmark_run_for_gold_file(
-        db,
-        organisation_id=organisation_id,
-        upload_id=str(upload.get("id")),
-        gold_file=latest_gold_file,
-    )
-    approval_blockers = (
-        _reviewer_identity_blockers(upload, reviewer_id, is_single_user=is_single_user)
-        if upload.get("extraction_status") == "needs_review"
-        else []
-    ) + _structural_blockers(upload, db, reviewer_id=reviewer_id, is_single_user=is_single_user)
-    approval_warnings = _soft_blockers(upload)
-    requires_fixture = upload_requires_corrected_fixture(upload)
-    status = _benchmark_status(
-        upload=upload,
-        requires_fixture=requires_fixture,
-        latest_gold_file=latest_gold_file,
-        latest_benchmark_run=latest_benchmark_run,
-    )
-    gold_draft = _gold_draft_or_none(upload, account)
-    has_independent_gold_verifier = any(
-        row.get("verified_by") and str(row.get("verified_by")) != str(reviewer_id)
-        for row in fixture_rows
-    )
-    return {
-        "route_hint": {
-            "bank_cash_review_path": (
-                f"/bank-cash/accounts/{upload.get('bank_account_id')}/"
-                f"uploads/{upload.get('id')}/review"
-            ),
-            "action_label": "Review Extraction",
-            "show_review_action": (
-                str(upload.get("extraction_status") or "").lower() in {"needs_review", "failed"}
-                or bool(approval_blockers)
-            ),
-        },
-        "gold_draft": gold_draft,
-        "latest_gold_file": latest_gold_file,
-        "latest_benchmark_run": latest_benchmark_run,
-        "requires_corrected_fixture": requires_fixture,
-        "has_corrected_fixture": bool(fixture_rows),
-        "has_independent_gold_verifier": has_independent_gold_verifier,
-        "benchmark_status": status,
-        "approval_blockers": approval_blockers,
-        "approval_warnings": approval_warnings,
-        "actions": {
-            "can_save_gold_file": gold_draft is not None,
-            "can_run_benchmark": latest_gold_file is not None,
-            "can_approve": (
-                upload.get("extraction_status") == "needs_review"
-                and not approval_blockers
-                and (not requires_fixture or status in {"passed", "not_required"})
-            ),
-        },
-    }
-
-
 @router.post("/uploads/{upload_id}/approve-extraction")
 def approve_bank_upload_extraction(upload_id: str, payload: ApproveExtractionRequest, auth: UserAuth):
     user_id, db = _auth(auth)
@@ -558,7 +196,7 @@ def approve_bank_upload_extraction(upload_id: str, payload: ApproveExtractionReq
     if upload.get("extraction_status") != "needs_review":
         raise HTTPException(status_code=400, detail="Only bank statement uploads needing review can be approved")
 
-    single_user = _is_single_user_org(db, organisation_id)
+    single_user = rw.is_single_user_org(db, organisation_id)
     evidence = upload.get("extraction_evidence") if isinstance(upload.get("extraction_evidence"), dict) else {}
     extracted_by = evidence.get("extracted_by")
     if not single_user and user_id in {upload.get("uploaded_by"), extracted_by}:
@@ -570,7 +208,7 @@ def approve_bank_upload_extraction(upload_id: str, payload: ApproveExtractionReq
     # Only structural problems hard-block. The soft balance signals are covered by
     # the reviewer's four attestations (below) — for a manually reviewed statement
     # the human comparing against the source document is the authority.
-    blockers = _structural_blockers(upload, db, reviewer_id=user_id, is_single_user=single_user) + _attestation_blockers(payload)
+    blockers = rw.structural_blockers(upload, db, reviewer_id=user_id, is_single_user=single_user) + rw.attestation_blockers(payload)
     if blockers:
         raise HTTPException(status_code=400, detail={"message": "Bank statement extraction cannot be approved", "blockers": blockers})
 
@@ -664,13 +302,13 @@ def get_bank_upload_extraction_review(upload_id: str, organisation_id: str, auth
     signed_url = access_error = None
     if path:
         signed_url, access_error = _storage_signed_url(db, bucket=bucket, path=path)
-    review_workflow = _review_workflow_state(
+    review_workflow = rw.review_workflow_state(
         db,
         organisation_id=organisation_id,
         upload=upload,
         account=account,
         reviewer_id=user_id,
-        is_single_user=_is_single_user_org(db, organisation_id),
+        is_single_user=rw.is_single_user_org(db, organisation_id),
     )
     return {
         "success": True,
@@ -714,7 +352,7 @@ def get_bank_upload_gold_draft(upload_id: str, organisation_id: str, auth: UserA
         .execute(),
         "Bank account not found",
     )
-    draft = _gold_draft_from_upload(upload, account)
+    draft = rw.gold_draft_from_upload(upload, account)
     if not draft["transactions"]:
         raise HTTPException(
             status_code=400,
@@ -773,7 +411,7 @@ def create_bank_upload_gold_file(
 
     row = {
         "organisation_id": organisation_id,
-        "document_id": payload.document_id or gold_json.get("document_id") or _gold_document_id(upload),
+        "document_id": payload.document_id or gold_json.get("document_id") or rw.gold_document_id(upload),
         "bank": payload.bank or gold_json.get("bank") or account.get("institution_name") or "Unknown bank",
         "account_type": payload.account_type or gold_json.get("account_type") or account.get("account_type"),
         "document_variant": (
@@ -1152,13 +790,13 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
 
         nil_line_count = sum(
             1 for w in line_wrappers
-            if w["duplicate_status"] == "clear" and _line_signed_amount(w["line"]) == 0
+            if w["duplicate_status"] == "clear" and rw.line_signed_amount(w["line"]) == 0
         )
         duplicate_line_count = int(duplicate_summary.get("duplicate_line_count", 0) or 0)
         raw_extracted_transaction_count = len(lines)
         clearable = [
             w for w in line_wrappers
-            if w["duplicate_status"] == "clear" and _line_signed_amount(w["line"]) != 0
+            if w["duplicate_status"] == "clear" and rw.line_signed_amount(w["line"]) != 0
         ]
         stored_line_count = len(clearable)
         duplicate_summary["nil_line_count"] = nil_line_count
@@ -1175,7 +813,7 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
         out_of_period_rows = set(date_correction_summary.get("out_of_period_row_indexes") or [])
         review_snapshot_lines = []
         for row_number, wrapper in enumerate(line_wrappers, start=1):
-            snap = _review_snapshot_line(wrapper, row_number)
+            snap = rw.build_review_snapshot_line(wrapper, row_number)
             diag = balance_rows_by_index.get(row_number - 1)
             if diag:
                 snap["balance_status"] = diag.get("status")
