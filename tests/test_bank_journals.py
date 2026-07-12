@@ -184,6 +184,28 @@ def test_draft_bank_journal_uses_description_override(monkeypatch):
     assert captured_kwargs["description_override"] == "Detailed narration"
 
 
+def test_draft_bank_journal_uses_stored_narration(monkeypatch):
+    """With no override, the journal header falls back to the line's allocation_narration."""
+    db = MemoryDB({
+        "bank_statement_lines": [{**_line(), "allocation_narration": "School fees term 1"}],
+        "bank_statement_uploads": [_upload()],
+        "gl_journals": [],
+        "gl_journal_lines": [],
+    })
+    monkeypatch.setattr(bj, "_auth", _fake_auth(db))
+    monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bj, "build_journal_rows_for_line", lambda _db, **_kw: [
+        {"account_id": "acc-1", "debit_amount": 100.0, "credit_amount": 0, "sort_order": 0},
+        {"account_id": "bank-gl-1", "debit_amount": 0, "credit_amount": 100.0, "sort_order": 1},
+    ])
+    monkeypatch.setattr(bj, "journal_preview_lines", lambda _db, _org, rows: rows)
+    monkeypatch.setattr(bj, "log_bank_event", lambda *_a, **_kw: None)
+
+    bj.draft_bank_journal("line-1", _draft_payload(), auth=("user-1", None))
+
+    assert db.tables["gl_journals"][0]["description"] == "School fees term 1"
+
+
 def test_draft_bank_journal_returns_existing_draft(monkeypatch):
     """If the line already has a draft journal, return it without recreating."""
     existing_journal = _journal(status="draft")

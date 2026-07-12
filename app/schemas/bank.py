@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class BankAccountCreate(BaseModel):
@@ -57,10 +57,19 @@ class ReviewLineRequest(BaseModel):
     tracking: dict[str, Any] = Field(default_factory=dict)
     tax_treatment: Optional[str] = None
     supplier_id: Optional[UUID] = None
+    customer_id: Optional[UUID] = None
+    narration: Optional[str] = Field(default=None, max_length=2000)
     create_rule: bool = False
     rule_name: Optional[str] = None
     rule_criteria: list[dict[str, Any]] = Field(default_factory=list)
     criteria_mode: str = "and"
+
+    @model_validator(mode="after")
+    def _one_contact_only(self) -> "ReviewLineRequest":
+        # A line can be tagged to a supplier OR a customer, never both.
+        if self.supplier_id is not None and self.customer_id is not None:
+            raise ValueError("supplier_id and customer_id are mutually exclusive")
+        return self
 
 
 class DraftJournalRequest(BaseModel):

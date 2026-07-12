@@ -276,6 +276,10 @@ def review_bank_line(line_id: str, payload: ReviewLineRequest, auth: UserAuth):
         "accepted_suggestion_id": str(payload.suggestion_id) if payload.suggestion_id else None,
         "accepted_rule_id": accepted_rule_id,
         "supplier_id": str(payload.supplier_id) if payload.supplier_id else None,
+        "customer_id": str(payload.customer_id) if payload.customer_id else None,
+        "allocation_narration": (
+            payload.narration.strip() if (payload.narration and payload.narration.strip()) else None
+        ),
         "matched_sales_invoice_id": (
             suggestion.get("matched_sales_invoice_id") if suggestion else None
         ),

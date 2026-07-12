@@ -129,7 +129,12 @@ def draft_bank_journal(line_id: str, payload: DraftJournalRequest, auth: UserAut
         )
         return {"success": True, "journal": journal, "lines": journal_preview_lines(db, organisation_id, existing_lines)}
     journal_id = new_uuid()
-    description = (payload.description_override or "").strip() or line.get("description") or "Bank transaction"
+    description = (
+        (payload.description_override or "").strip()
+        or (line.get("allocation_narration") or "").strip()
+        or line.get("description")
+        or "Bank transaction"
+    )
     journal_lines = build_journal_rows_for_line(
         db,
         organisation_id=organisation_id,

@@ -64,6 +64,50 @@ def test_build_journal_rows_for_line_splits_vat_on_allocation_side():
     assert rows[2]["tracking"] == {}
 
 
+def _simple_db():
+    return MemoryDB({
+        "bank_accounts": [
+            {"id": "bank-1", "organisation_id": ORG_ID, "gl_account_id": "bank-gl"},
+        ],
+        "organisations": [{"id": ORG_ID, "vat_registered": False}],
+        "organisation_module_settings": [],
+    })
+
+
+def _rows_with(db, *, description="Office supplies", allocation_narration=None, override=None):
+    line = {
+        "bank_account_id": "bank-1",
+        "line_date": "2026-06-30",
+        "signed_amount": -100,
+        "description": description,
+    }
+    if allocation_narration is not None:
+        line["allocation_narration"] = allocation_narration
+    return build_journal_rows_for_line(
+        db,
+        organisation_id=ORG_ID,
+        line=line,
+        gl_account_id="expense-1",
+        tracking={},
+        description_override=override,
+    )
+
+
+def test_journal_row_description_prefers_stored_narration_over_bank_description():
+    rows = _rows_with(_simple_db(), allocation_narration="School fees term 1")
+    assert rows[0]["description"] == "School fees term 1"
+
+
+def test_journal_row_description_override_wins_over_narration():
+    rows = _rows_with(_simple_db(), allocation_narration="Narration", override="Explicit override")
+    assert rows[0]["description"] == "Explicit override"
+
+
+def test_journal_row_description_falls_back_to_bank_description():
+    rows = _rows_with(_simple_db(), description="Coffee Shop")
+    assert rows[0]["description"] == "Coffee Shop"
+
+
 def test_build_journal_rows_for_line_suppresses_vat_before_registration_date():
     db = MemoryDB({
         "bank_accounts": [

@@ -97,7 +97,12 @@ def build_journal_rows_for_line(
         bank_account_gl_id=str(bank_gl),
         allocation_account_id=str(gl_account_id),
         amount=money(line.get("signed_amount")),
-        description=(description_override or "").strip() or line.get("description") or "Bank transaction",
+        description=(
+            (description_override or "").strip()
+            or (line.get("allocation_narration") or "").strip()
+            or line.get("description")
+            or "Bank transaction"
+        ),
         tracking=tracking,
     )
     if vat_rate and vat_account_id:

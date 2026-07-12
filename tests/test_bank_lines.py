@@ -21,6 +21,8 @@ ORG_ID = "00000000-0000-0000-0000-000000000001"
 ACCOUNT_ID = "00000000-0000-0000-0000-000000000002"
 LINE_ID = "00000000-0000-0000-0000-000000000003"
 GL_ID = "00000000-0000-0000-0000-000000000004"
+SUPPLIER_ID = "00000000-0000-0000-0000-000000000005"
+CUSTOMER_ID = "00000000-0000-0000-0000-000000000006"
 UPLOAD_ID = "00000000-0000-0000-0000-000000000099"
 
 
@@ -347,6 +349,63 @@ def test_review_bank_line_sets_reviewed_status(monkeypatch):
     line = db.tables["bank_statement_lines"][0]
     assert line["review_status"] == "reviewed"
     assert line["reviewed_by"] == "user-1"
+
+
+def test_review_bank_line_persists_customer_and_narration(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row(supplier_id="old-supplier")],
+        "bank_statement_uploads": [_upload_row()],
+        "bank_audit_events": [],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bl, "log_bank_event", lambda _db, **_kw: None)
+    monkeypatch.setattr(bl, "now_iso", lambda: "2024-01-05T12:00:00+00:00")
+
+    from app.routers.bank import ReviewLineRequest
+    payload = ReviewLineRequest(
+        organisation_id=ORG_ID,
+        gl_account_id=GL_ID,
+        customer_id=CUSTOMER_ID,
+        narration="  School fees term 1  ",
+    )
+    result = bl.review_bank_line(LINE_ID, payload, AUTH)
+
+    assert result["success"] is True
+    line = db.tables["bank_statement_lines"][0]
+    assert line["customer_id"] == CUSTOMER_ID
+    # Tagging a customer clears any prior supplier tag (one contact only).
+    assert line["supplier_id"] is None
+    assert line["allocation_narration"] == "School fees term 1"
+
+
+def test_review_bank_line_blank_narration_stored_as_none(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row()],
+        "bank_audit_events": [],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bl, "log_bank_event", lambda _db, **_kw: None)
+    monkeypatch.setattr(bl, "now_iso", lambda: "2024-01-05T12:00:00+00:00")
+
+    from app.routers.bank import ReviewLineRequest
+    bl.review_bank_line(
+        LINE_ID, ReviewLineRequest(organisation_id=ORG_ID, narration="   "), AUTH
+    )
+
+    assert db.tables["bank_statement_lines"][0]["allocation_narration"] is None
+
+
+def test_review_line_request_rejects_supplier_and_customer_together():
+    from app.routers.bank import ReviewLineRequest
+    with pytest.raises(ValueError):
+        ReviewLineRequest(
+            organisation_id=ORG_ID,
+            supplier_id=SUPPLIER_ID,
+            customer_id=CUSTOMER_ID,
+        )
 
 
 def test_review_bank_line_creates_rule(monkeypatch):
