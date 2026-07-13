@@ -296,6 +296,7 @@ def test_explicit_bulk_line_delete_route_calls_atomic_rpc(monkeypatch):
                 "44444444-4444-4444-4444-444444444444",
             ],
             "p_actor_user_id": "11111111-1111-1111-1111-111111111111",
+            "p_mode": "block",
         },
     )]
     routes = {(route.path, ",".join(sorted(route.methods or []))) for route in bank_lines.router.routes}
@@ -353,8 +354,41 @@ def test_explicit_bulk_upload_delete_route_calls_atomic_rpc(monkeypatch):
         "storage_cleanup_failures": [],
     }
     assert db.rpc_calls[0][0] == "delete_bank_statement_uploads_atomic"
+    # Default (no explicit mode) maps to the 'block' guard.
+    assert db.rpc_calls[0][1]["p_mode"] == "block"
     routes = {(route.path, ",".join(sorted(route.methods or []))) for route in bank_uploads.router.routes}
     assert ("/api/bank/uploads/bulk-delete", "POST") in routes
+
+
+def test_bulk_upload_delete_hard_mode_passes_hard(monkeypatch):
+    db = _RpcDB(rpc_result=[{"deleted_count": 1, "files": []}])
+    _patch_write_auth(monkeypatch, db)
+    payload = bank.BulkDeleteUploadsRequest(
+        organisation_id="22222222-2222-2222-2222-222222222222",
+        upload_ids=["77777777-7777-7777-7777-777777777777"],
+        mode="hard",
+    )
+
+    bank_uploads.bulk_delete_bank_uploads(payload, auth=("user", None))
+
+    assert db.rpc_calls[0][0] == "delete_bank_statement_uploads_atomic"
+    assert db.rpc_calls[0][1]["p_mode"] == "hard"
+
+
+def test_bulk_upload_delete_reverse_mode_passes_keep_journals(monkeypatch):
+    db = _RpcDB(rpc_result=[{"deleted_count": 1, "files": []}])
+    _patch_write_auth(monkeypatch, db)
+    payload = bank.BulkDeleteUploadsRequest(
+        organisation_id="22222222-2222-2222-2222-222222222222",
+        upload_ids=["77777777-7777-7777-7777-777777777777"],
+        mode="reverse",
+    )
+
+    bank_uploads.bulk_delete_bank_uploads(payload, auth=("user", None))
+
+    # Reverse first (no posted journals here), then delete leaving reversed journals.
+    assert db.rpc_calls[0][0] == "delete_bank_statement_uploads_atomic"
+    assert db.rpc_calls[0][1]["p_mode"] == "keep_journals"
 
 
 def test_c19_migration_contains_atomic_guards_and_draft_cleanup():

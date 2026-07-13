@@ -101,6 +101,7 @@ def _delete_bank_lines_rpc(
     organisation_id: str,
     line_ids: list[str],
     actor_user_id: str,
+    mode: str = "block",
 ) -> dict[str, Any]:
     result = db.rpc(
         "delete_bank_statement_lines_atomic",
@@ -108,6 +109,7 @@ def _delete_bank_lines_rpc(
             "p_org_id": organisation_id,
             "p_line_ids": line_ids,
             "p_actor_user_id": actor_user_id,
+            "p_mode": mode,
         },
     ).execute()
     return _rpc_data(result)
@@ -119,6 +121,7 @@ def _delete_bank_uploads_rpc(
     organisation_id: str,
     upload_ids: list[str],
     actor_user_id: str,
+    mode: str = "block",
 ) -> dict[str, Any]:
     result = db.rpc(
         "delete_bank_statement_uploads_atomic",
@@ -126,6 +129,7 @@ def _delete_bank_uploads_rpc(
             "p_org_id": organisation_id,
             "p_upload_ids": upload_ids,
             "p_actor_user_id": actor_user_id,
+            "p_mode": mode,
         },
     ).execute()
     return _rpc_data(result)

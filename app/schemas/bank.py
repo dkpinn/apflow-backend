@@ -85,14 +85,22 @@ class PostJournalRequest(BaseModel):
     organisation_id: UUID
 
 
+# Deletion mode: 'block' refuses to delete anything with posted/reversed journals;
+# 'reverse' reverses posted journals first (keeping an audit trail) then deletes;
+# 'hard' permanently deletes the lines/uploads and every related journal.
+BankDeleteMode = Literal["block", "reverse", "hard"]
+
+
 class BulkDeleteLinesRequest(BaseModel):
     organisation_id: UUID
     line_ids: list[UUID]
+    mode: BankDeleteMode = "block"
 
 
 class BulkDeleteUploadsRequest(BaseModel):
     organisation_id: UUID
     upload_ids: list[UUID]
+    mode: BankDeleteMode = "block"
 
 
 class BankBalanceSummary(BaseModel):

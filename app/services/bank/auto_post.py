@@ -163,13 +163,18 @@ def auto_post_matched_lines(
     try:
         account_row = (
             db.table("bank_accounts")
-            .select("gl_account_id")
+            .select("gl_account_id, auto_post_paused")
             .eq("id", bank_account_id)
             .limit(1)
             .execute()
             .data
             or [{}]
         )[0]
+        if account_row.get("auto_post_paused"):
+            # Rule auto-posting is on hold for this account (a manual unpost or a
+            # delete-with-postings paused it) until the user explicitly resumes.
+            logger.info("auto_post: account %s is paused — skipping", bank_account_id)
+            return {"posted_count": 0, "skipped_count": len(line_ids), "paused": True}
         bank_gl_id = account_row.get("gl_account_id")
         if not bank_gl_id:
             logger.warning("auto_post: bank account %s has no gl_account_id — skipping all", bank_account_id)

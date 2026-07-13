@@ -404,10 +404,13 @@ def test_unpost_bank_journal_creates_reversal(monkeypatch):
     })
     monkeypatch.setattr(bj, "_auth", _fake_auth(db))
     monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
-    monkeypatch.setattr(bj, "reversal_lines_for_journal", lambda lines, description: [
-        {**line, "debit_amount": line.get("credit_amount", 0), "credit_amount": line.get("debit_amount", 0)}
-        for line in lines
-    ])
+    monkeypatch.setattr(
+        "app.services.bank.journals.reversal_lines_for_journal",
+        lambda lines, description: [
+            {**line, "debit_amount": line.get("credit_amount", 0), "credit_amount": line.get("debit_amount", 0)}
+            for line in lines
+        ],
+    )
     monkeypatch.setattr(bj, "journal_preview_lines", lambda _db, _org, rows: rows)
     monkeypatch.setattr(bj, "log_bank_event", lambda *_a, **_kw: None)
 
@@ -433,10 +436,13 @@ def test_unpost_bank_journal_allows_remediation_after_failed_benchmark(monkeypat
     })
     monkeypatch.setattr(bj, "_auth", _fake_auth(db))
     monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
-    monkeypatch.setattr(bj, "reversal_lines_for_journal", lambda lines, description: [
-        {**line, "debit_amount": line.get("credit_amount", 0), "credit_amount": line.get("debit_amount", 0)}
-        for line in lines
-    ])
+    monkeypatch.setattr(
+        "app.services.bank.journals.reversal_lines_for_journal",
+        lambda lines, description: [
+            {**line, "debit_amount": line.get("credit_amount", 0), "credit_amount": line.get("debit_amount", 0)}
+            for line in lines
+        ],
+    )
     monkeypatch.setattr(bj, "journal_preview_lines", lambda _db, _org, rows: rows)
     monkeypatch.setattr(bj, "log_bank_event", lambda *_a, **_kw: None)
 
@@ -447,6 +453,55 @@ def test_unpost_bank_journal_allows_remediation_after_failed_benchmark(monkeypat
     assert original["status"] == "reversed"
     bank_line = db.tables["bank_statement_lines"][0]
     assert bank_line["posting_status"] == "unposted"
+
+
+def test_unpost_bank_journal_pauses_auto_post(monkeypatch):
+    db = MemoryDB({
+        "gl_journals": [_journal(status="posted")],
+        "gl_journal_lines": [
+            {"gl_journal_id": "journal-1", "account_id": "acc-1", "debit_amount": 100.0, "credit_amount": 0, "sort_order": 0},
+        ],
+        "bank_statement_lines": [_line(posting_status="posted")],
+        "bank_accounts": [{"id": "ba-1", "organisation_id": ORG_ID, "auto_post_paused": False}],
+    })
+    monkeypatch.setattr(bj, "_auth", _fake_auth(db))
+    monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(
+        "app.services.bank.journals.reversal_lines_for_journal",
+        lambda lines, description: [
+            {**line, "debit_amount": line.get("credit_amount", 0), "credit_amount": line.get("debit_amount", 0)}
+            for line in lines
+        ],
+    )
+    monkeypatch.setattr(bj, "journal_preview_lines", lambda _db, _org, rows: rows)
+    monkeypatch.setattr(bj, "log_bank_event", lambda *_a, **_kw: None)
+
+    bj.unpost_bank_journal("journal-1", _post_payload(), auth=("user-1", None))
+
+    account = db.tables["bank_accounts"][0]
+    assert account["auto_post_paused"] is True
+    assert account["auto_post_paused_reason"] == "manual_unpost"
+
+
+def test_resume_auto_post_clears_flag(monkeypatch):
+    db = MemoryDB({
+        "bank_accounts": [{"id": "ba-1", "organisation_id": ORG_ID, "auto_post_paused": True}],
+        "bank_statement_lines": [_line(posting_status="unposted")],
+    })
+    monkeypatch.setattr(bj, "_auth", _fake_auth(db))
+    monkeypatch.setattr(bj, "ensure_org_write", lambda *_: None)
+    calls = {}
+    monkeypatch.setattr(
+        bj,
+        "auto_post_matched_lines",
+        lambda _db, **kw: calls.setdefault("kw", kw) or {"posted_count": 0},
+    )
+
+    result = bj.resume_account_auto_post("ba-1", _post_payload(), auth=("user-1", None))
+
+    assert result == {"resumed": True, "posted_count": 0}
+    assert db.tables["bank_accounts"][0]["auto_post_paused"] is False
+    assert calls["kw"]["bank_account_id"] == "ba-1"
 
 
 def test_unpost_bank_journal_400_when_not_posted(monkeypatch):

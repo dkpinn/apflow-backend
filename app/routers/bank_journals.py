@@ -15,7 +15,6 @@ from app.services.bank_statement_service import (
     dec_to_float,
     money,
     new_uuid,
-    reversal_lines_for_journal,
 )
 from app.services.organisation_module_settings import (
     required_tracking_dimensions,
@@ -23,6 +22,8 @@ from app.services.organisation_module_settings import (
 )
 from app.services.protected_accounts import assert_manual_posting_account_allowed
 from app.services.bank.extraction_gate import assert_bank_line_upload_extracted
+from app.services.bank.journals import reverse_posted_journal
+from app.services.bank.auto_post import auto_post_matched_lines
 
 # Shared helpers and models live in bank.py; import them here.
 from app.routers.bank import (
@@ -278,6 +279,30 @@ def list_bank_journal_lines(journal_id: str, organisation_id: str, auth: UserAut
     return {"success": True, "lines": journal_preview_lines(db, organisation_id, rows)}
 
 
+def _pause_account_auto_post(db, organisation_id: str, line_id: str, *, reason: str) -> None:
+    """Put rule auto-posting on hold for the bank account owning ``line_id``."""
+    line = (
+        db.table("bank_statement_lines")
+        .select("bank_account_id")
+        .eq("id", line_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    account_id = line[0].get("bank_account_id") if line else None
+    if not account_id:
+        return
+    db.table("bank_accounts").update(
+        {
+            "auto_post_paused": True,
+            "auto_post_paused_at": now_iso(),
+            "auto_post_paused_reason": reason,
+        }
+    ).eq("id", account_id).eq("organisation_id", organisation_id).execute()
+
+
 @router.post("/journals/{journal_id}/unpost")
 def unpost_bank_journal(journal_id: str, payload: PostJournalRequest, auth: UserAuth):
     user_id, db = _auth(auth)
@@ -301,65 +326,25 @@ def unpost_bank_journal(journal_id: str, payload: PostJournalRequest, auth: User
     source_line_id = journal.get("source_id") if journal.get("source_type") == "bank_transaction" else None
     if not source_line_id:
         raise HTTPException(status_code=400, detail="Only bank transaction journals can be unposted here")
-    existing_reversal = (
-        db.table("gl_journals")
-        .select("id")
-        .eq("organisation_id", organisation_id)
-        .eq("reversal_of_journal_id", journal_id)
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
-    if existing_reversal:
-        raise HTTPException(status_code=400, detail="This journal has already been reversed")
 
-    original_lines = (
-        db.table("gl_journal_lines")
-        .select("*")
-        .eq("gl_journal_id", journal_id)
-        .order("sort_order")
-        .execute()
-        .data
-        or []
+    reversal = reverse_posted_journal(
+        db,
+        organisation_id=organisation_id,
+        journal=journal,
+        actor_user_id=user_id,
     )
-    if not original_lines:
-        raise HTTPException(status_code=400, detail="Journal has no lines to reverse")
+    if reversal is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Journal could not be reversed (already reversed or has no lines)",
+        )
+    reversal_id = reversal["reversal_id"]
+    reversal_journal = reversal["reversal_journal"]
+    reversal_rows = reversal["reversal_rows"]
 
-    reversal_id = new_uuid()
-    description = f"Reversal: {journal.get('description') or 'Bank journal'}"
-    reversal_rows = reversal_lines_for_journal(original_lines, description=description)
-    total_debit = sum(money(row["debit_amount"]) for row in reversal_rows)
-    total_credit = sum(money(row["credit_amount"]) for row in reversal_rows)
-    reversal_journal = {
-        "id": reversal_id,
-        "organisation_id": organisation_id,
-        "source_type": "bank_transaction_reversal",
-        "source_id": source_line_id,
-        "reversal_of_journal_id": journal_id,
-        "journal_date": journal.get("journal_date"),
-        "description": description,
-        "status": "posted",
-        "total_debit": dec_to_float(total_debit),
-        "total_credit": dec_to_float(total_credit),
-        "created_by": user_id,
-        "posted_by": user_id,
-        "posted_at": now_iso(),
-    }
-    db.table("gl_journals").insert(reversal_journal).execute()
-    db.table("gl_journal_lines").insert([{**row, "gl_journal_id": reversal_id} for row in reversal_rows]).execute()
-    db.table("gl_journals").update({"status": "reversed", "reversed_by": user_id, "reversed_at": now_iso()}).eq("id", journal_id).execute()
-    db.table("bank_statement_lines").update({
-        "posting_status": "unposted",
-        "allocation_status": "unallocated",
-        "match_status": "unmatched",
-        "review_status": "pending",
-        "accepted_suggestion_id": None,
-        "accepted_rule_id": None,
-        "gl_journal_id": None,
-        "reviewed_by": None,
-        "reviewed_at": None,
-    }).eq("id", source_line_id).eq("organisation_id", organisation_id).execute()
+    # Put rule auto-posting on hold for this account until the user resumes.
+    _pause_account_auto_post(db, organisation_id, source_line_id, reason="manual_unpost")
+
     log_bank_event(
         db,
         organisation_id=organisation_id,
@@ -398,3 +383,42 @@ def list_posted_bank_lines(account_id: str, organisation_id: str, auth: UserAuth
         or []
     )
     return {"lines": rows}
+
+
+@router.post("/accounts/{account_id}/resume-auto-post")
+def resume_account_auto_post(account_id: str, payload: PostJournalRequest, auth: UserAuth):
+    """Clear the auto-post hold on an account and re-run rules over its pending lines."""
+    user_id, db = _auth(auth)
+    organisation_id = str(payload.organisation_id)
+    ensure_org_write(user_id, organisation_id)
+    _one(
+        db.table("bank_accounts").select("id").eq("id", account_id).eq("organisation_id", organisation_id).limit(1).execute(),
+        "Bank account not found",
+    )
+    db.table("bank_accounts").update(
+        {
+            "auto_post_paused": False,
+            "auto_post_paused_at": None,
+            "auto_post_paused_reason": None,
+        }
+    ).eq("id", account_id).eq("organisation_id", organisation_id).execute()
+
+    pending = (
+        db.table("bank_statement_lines")
+        .select("id")
+        .eq("organisation_id", organisation_id)
+        .eq("bank_account_id", account_id)
+        .eq("posting_status", "unposted")
+        .eq("duplicate_status", "clear")
+        .execute()
+        .data
+        or []
+    )
+    line_ids = [str(row["id"]) for row in pending if row.get("id")]
+    summary = auto_post_matched_lines(
+        db,
+        organisation_id=organisation_id,
+        bank_account_id=account_id,
+        line_ids=line_ids,
+    )
+    return {"resumed": True, "posted_count": summary.get("posted_count", 0)}

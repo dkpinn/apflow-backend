@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -9,12 +10,18 @@ from app.services.bank_statement_service import (
     dec_to_float,
     journal_lines_for_bank_transaction,
     money,
+    new_uuid,
+    reversal_lines_for_journal,
 )
 from app.services.organisation_module_settings import (
     required_tracking_dimensions,
     validate_bank_allocation_tracking,
 )
 from app.services.organisation_vat import vat_applicability
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _one(res, message: str):
@@ -55,6 +62,104 @@ def journal_preview_lines(db, organisation_id: str, rows: list[dict[str, Any]]) 
             "account_name": account.get("name") or account_id,
         })
     return preview
+
+
+def reverse_posted_journal(
+    db,
+    *,
+    organisation_id: str,
+    journal: dict[str, Any],
+    actor_user_id: str,
+) -> Optional[dict[str, Any]]:
+    """Reverse a posted bank-transaction journal (contra entry) and reset its line.
+
+    Creates a `bank_transaction_reversal` journal with debit/credit-swapped lines,
+    marks the original journal `reversed`, and returns the source bank line to
+    `unposted`. Returns the reversal detail, or ``None`` when the journal is not a
+    reversible posted bank-transaction journal (already reversed, wrong source type,
+    or no lines) so batch callers can skip it. Caller is responsible for period-lock
+    and permission checks.
+    """
+    journal_id = str(journal.get("id"))
+    if journal.get("status") != "posted":
+        return None
+    source_line_id = (
+        journal.get("source_id") if journal.get("source_type") == "bank_transaction" else None
+    )
+    if not source_line_id:
+        return None
+
+    existing_reversal = (
+        db.table("gl_journals")
+        .select("id")
+        .eq("organisation_id", organisation_id)
+        .eq("reversal_of_journal_id", journal_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if existing_reversal:
+        return None
+
+    original_lines = (
+        db.table("gl_journal_lines")
+        .select("*")
+        .eq("gl_journal_id", journal_id)
+        .order("sort_order")
+        .execute()
+        .data
+        or []
+    )
+    if not original_lines:
+        return None
+
+    reversal_id = new_uuid()
+    description = f"Reversal: {journal.get('description') or 'Bank journal'}"
+    reversal_rows = reversal_lines_for_journal(original_lines, description=description)
+    total_debit = sum(money(row["debit_amount"]) for row in reversal_rows)
+    total_credit = sum(money(row["credit_amount"]) for row in reversal_rows)
+    reversal_journal = {
+        "id": reversal_id,
+        "organisation_id": organisation_id,
+        "source_type": "bank_transaction_reversal",
+        "source_id": source_line_id,
+        "reversal_of_journal_id": journal_id,
+        "journal_date": journal.get("journal_date"),
+        "description": description,
+        "status": "posted",
+        "total_debit": dec_to_float(total_debit),
+        "total_credit": dec_to_float(total_credit),
+        "created_by": actor_user_id,
+        "posted_by": actor_user_id,
+        "posted_at": _now_iso(),
+    }
+    db.table("gl_journals").insert(reversal_journal).execute()
+    db.table("gl_journal_lines").insert(
+        [{**row, "gl_journal_id": reversal_id} for row in reversal_rows]
+    ).execute()
+    db.table("gl_journals").update(
+        {"status": "reversed", "reversed_by": actor_user_id, "reversed_at": _now_iso()}
+    ).eq("id", journal_id).execute()
+    db.table("bank_statement_lines").update(
+        {
+            "posting_status": "unposted",
+            "allocation_status": "unallocated",
+            "match_status": "unmatched",
+            "review_status": "pending",
+            "accepted_suggestion_id": None,
+            "accepted_rule_id": None,
+            "gl_journal_id": None,
+            "reviewed_by": None,
+            "reviewed_at": None,
+        }
+    ).eq("id", source_line_id).eq("organisation_id", organisation_id).execute()
+    return {
+        "reversal_id": reversal_id,
+        "reversal_journal": reversal_journal,
+        "reversal_rows": reversal_rows,
+        "source_line_id": source_line_id,
+    }
 
 
 def build_journal_rows_for_line(

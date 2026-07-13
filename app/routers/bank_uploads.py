@@ -39,6 +39,7 @@ from app.services.bank_statement_service import (
 )
 from app.services.extraction_foundation import file_sha256
 from app.services.bank.auto_post import auto_post_matched_lines
+from app.services.bank.journals import reverse_posted_journal
 from app.services.bank import review_workflow as rw
 
 from app.routers.bank import (
@@ -953,16 +954,94 @@ def extract_bank_upload(upload_id: str, payload: ExtractUploadRequest, auth: Use
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+def _reverse_posted_journals_for_uploads(
+    db,
+    *,
+    organisation_id: str,
+    upload_ids: list[str],
+    actor_user_id: str,
+) -> int:
+    """Reverse every posted bank-transaction journal belonging to these uploads."""
+    line_rows = (
+        db.table("bank_statement_lines")
+        .select("id")
+        .eq("organisation_id", organisation_id)
+        .in_("bank_statement_upload_id", upload_ids)
+        .execute()
+        .data
+        or []
+    )
+    line_ids = [str(row["id"]) for row in line_rows if row.get("id")]
+    if not line_ids:
+        return 0
+    journals = (
+        db.table("gl_journals")
+        .select("*")
+        .eq("organisation_id", organisation_id)
+        .eq("source_type", "bank_transaction")
+        .eq("status", "posted")
+        .in_("source_id", line_ids)
+        .execute()
+        .data
+        or []
+    )
+    reversed_count = 0
+    for journal in journals:
+        if reverse_posted_journal(
+            db,
+            organisation_id=organisation_id,
+            journal=journal,
+            actor_user_id=actor_user_id,
+        ):
+            reversed_count += 1
+    return reversed_count
+
+
+def _perform_upload_delete(
+    db,
+    *,
+    organisation_id: str,
+    upload_ids: list[str],
+    actor_user_id: str,
+    mode: str,
+) -> dict:
+    """Delete uploads honouring the chosen mode (block / reverse / hard)."""
+    if mode == "reverse":
+        # Reverse posted journals first (audit trail preserved), then delete the
+        # statement + lines while leaving the reversed originals + contras in the ledger.
+        _reverse_posted_journals_for_uploads(
+            db,
+            organisation_id=organisation_id,
+            upload_ids=upload_ids,
+            actor_user_id=actor_user_id,
+        )
+        rpc_mode = "keep_journals"
+    elif mode == "hard":
+        rpc_mode = "hard"
+    else:
+        rpc_mode = "block"
+    return _delete_bank_uploads_rpc(
+        db,
+        organisation_id=organisation_id,
+        upload_ids=upload_ids,
+        actor_user_id=actor_user_id,
+        mode=rpc_mode,
+    )
+
+
 @router.delete("/uploads/{upload_id}")
-def delete_bank_upload(upload_id: str, organisation_id: str, auth: UserAuth):
+def delete_bank_upload(upload_id: str, organisation_id: str, auth: UserAuth, mode: str = "block"):
     user_id, db = _auth(auth)
     ensure_org_write(user_id, organisation_id)
+    if mode not in ("block", "reverse", "hard"):
+        raise HTTPException(status_code=400, detail=f"Invalid delete mode: {mode}")
     try:
-        result = _delete_bank_uploads_rpc(
+        result = _perform_upload_delete(
             db,
             organisation_id=organisation_id,
             upload_ids=[upload_id],
             actor_user_id=user_id,
+            mode=mode,
         )
     except Exception as exc:
         raise _bank_delete_error(exc) from exc
@@ -984,11 +1063,12 @@ def bulk_delete_bank_uploads(payload: BulkDeleteUploadsRequest, auth: UserAuth):
     ensure_org_write(user_id, organisation_id)
     upload_ids = [str(upload_id) for upload_id in payload.upload_ids]
     try:
-        result = _delete_bank_uploads_rpc(
+        result = _perform_upload_delete(
             db,
             organisation_id=organisation_id,
             upload_ids=upload_ids,
             actor_user_id=user_id,
+            mode=payload.mode,
         )
     except Exception as exc:
         raise _bank_delete_error(exc) from exc
