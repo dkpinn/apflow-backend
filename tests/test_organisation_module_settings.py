@@ -59,6 +59,7 @@ class OrganisationModuleSettingsTests(unittest.TestCase):
             "tracking_dimensions": [
                 {"id": "dim-1", "organisation_id": "org-1", "name": "Department", "active": True},
                 {"id": "dim-2", "organisation_id": "org-2", "name": "Other", "active": True},
+                {"id": "dim-3", "organisation_id": "org-1", "name": "Archived", "active": False},
             ]
         })
         ids, rows = validate_required_dimensions(
@@ -76,6 +77,14 @@ class OrganisationModuleSettingsTests(unittest.TestCase):
                 organisation_id="org-1",
                 tracking_enabled=True,
                 dimension_ids=["dim-2"],
+            )
+
+        with self.assertRaisesRegex(ValueError, "active"):
+            validate_required_dimensions(
+                db,
+                organisation_id="org-1",
+                tracking_enabled=True,
+                dimension_ids=["dim-3"],
             )
 
     def test_disabled_module_normalises_dimensions_to_empty(self):

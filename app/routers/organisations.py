@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from app.db.supabase_client import get_supabase_client
@@ -17,6 +17,12 @@ from app.services.organisation_module_settings import (
     MODULE_KEYS,
     get_module_settings,
     validate_required_dimensions,
+)
+from app.services.tracking_dimensions import (
+    create_tracking_dimension as create_tracking_dimension_record,
+    list_tracking_dimensions as list_tracking_dimension_records,
+    set_tracking_dimension_active,
+    update_tracking_dimension as update_tracking_dimension_record,
 )
 from app.services.supplier_matching_config import (
     AutoLinkAmountTier,
@@ -118,6 +124,37 @@ class OrganisationModuleSettingResponse(BaseModel):
 class UpdateOrganisationModuleSettingRequest(BaseModel):
     tracking_enabled: bool = False
     required_tracking_dimension_ids: list[str] = Field(default_factory=list)
+
+
+class TrackingValueResponse(BaseModel):
+    id: str
+    dimension_id: str
+    code: Optional[str] = None
+    name: str
+    active: bool = True
+    sort_order: int = 0
+
+
+class TrackingDimensionResponse(BaseModel):
+    id: str
+    organisation_id: str
+    name: str
+    position: int
+    active: bool = True
+    default_value_id: Optional[str] = None
+    is_income_statement_function_driver: bool = False
+    values: list[TrackingValueResponse] = Field(default_factory=list)
+
+
+class CreateTrackingDimensionRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    position: Optional[int] = Field(default=None, ge=1, le=5)
+
+
+class UpdateTrackingDimensionRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    position: Optional[int] = Field(default=None, ge=1, le=5)
+    active: Optional[bool] = None
 
 
 class InvoiceBrandingResponse(BaseModel):
@@ -271,6 +308,128 @@ def update_organisation_module_setting(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Unable to save module settings: {exc}") from exc
+
+
+@router.get(
+    "/{organisation_id}/tracking-dimensions",
+    response_model=list[TrackingDimensionResponse],
+)
+def list_tracking_dimensions(
+    organisation_id: str,
+    auth: UserAuth,
+    include_archived: bool = Query(default=False),
+):
+    user_id, db = auth
+    ensure_org_read(str(user_id), organisation_id)
+    try:
+        return list_tracking_dimension_records(
+            db,
+            organisation_id=organisation_id,
+            include_archived=include_archived,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to load tracking dimensions: {exc}") from exc
+
+
+@router.post(
+    "/{organisation_id}/tracking-dimensions",
+    response_model=TrackingDimensionResponse,
+)
+def create_tracking_dimension(
+    organisation_id: str,
+    payload: CreateTrackingDimensionRequest,
+    auth: UserAuth,
+):
+    user_id, db = auth
+    ensure_org_admin(str(user_id), organisation_id)
+    try:
+        return create_tracking_dimension_record(
+            db,
+            organisation_id=organisation_id,
+            name=payload.name,
+            position=payload.position,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to create tracking dimension: {exc}") from exc
+
+
+@router.put(
+    "/{organisation_id}/tracking-dimensions/{dimension_id}",
+    response_model=TrackingDimensionResponse,
+)
+def update_tracking_dimension(
+    organisation_id: str,
+    dimension_id: str,
+    payload: UpdateTrackingDimensionRequest,
+    auth: UserAuth,
+):
+    user_id, db = auth
+    ensure_org_admin(str(user_id), organisation_id)
+    try:
+        return update_tracking_dimension_record(
+            db,
+            organisation_id=organisation_id,
+            dimension_id=dimension_id,
+            name=payload.name,
+            position=payload.position,
+            active=payload.active,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to update tracking dimension: {exc}") from exc
+
+
+@router.post(
+    "/{organisation_id}/tracking-dimensions/{dimension_id}/archive",
+    response_model=TrackingDimensionResponse,
+)
+def archive_tracking_dimension(
+    organisation_id: str,
+    dimension_id: str,
+    auth: UserAuth,
+):
+    user_id, db = auth
+    ensure_org_admin(str(user_id), organisation_id)
+    try:
+        return set_tracking_dimension_active(
+            db,
+            organisation_id=organisation_id,
+            dimension_id=dimension_id,
+            active=False,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to archive tracking dimension: {exc}") from exc
+
+
+@router.post(
+    "/{organisation_id}/tracking-dimensions/{dimension_id}/restore",
+    response_model=TrackingDimensionResponse,
+)
+def restore_tracking_dimension(
+    organisation_id: str,
+    dimension_id: str,
+    auth: UserAuth,
+):
+    user_id, db = auth
+    ensure_org_admin(str(user_id), organisation_id)
+    try:
+        return set_tracking_dimension_active(
+            db,
+            organisation_id=organisation_id,
+            dimension_id=dimension_id,
+            active=True,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to restore tracking dimension: {exc}") from exc
 
 
 def _default_invoice_branding() -> dict:

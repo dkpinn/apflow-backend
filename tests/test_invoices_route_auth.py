@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 from fastapi import HTTPException
 
+from app.dependencies import authenticated_user
 import app.routers.invoices as invoices
+import app.routers.invoices_queue as invoices_queue
+import app.routers.invoices_review as invoices_review
 
 AUTH = ("user-1", None)
 
@@ -75,3 +80,27 @@ def test_save_line_items_authorizes_before_supplier_lookup(monkeypatch):
 
     assert exc_info.value.status_code == 403
     assert supplier_lookups == []
+
+
+def test_invoice_review_fastapi_calls_require_bearer_token():
+    with pytest.raises(HTTPException) as exc_info:
+        authenticated_user(authorization=None)
+
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Missing bearer token"
+
+
+def test_invoice_detail_fastapi_routes_keep_auth_dependency():
+    protected_handlers = [
+        invoices_review.get_invoice_review_data,
+        invoices.save_invoice_line_items,
+        invoices.reapply_supplier_rules_endpoint,
+        invoices.generate_invoice_preview,
+        invoices_queue.re_extract_invoice,
+        invoices_queue.get_re_extract_status,
+    ]
+
+    for handler in protected_handlers:
+        signature = inspect.signature(handler)
+        assert "auth" in signature.parameters, f"{handler.__name__} must accept auth"
+        assert signature.parameters["auth"].default is inspect.Signature.empty

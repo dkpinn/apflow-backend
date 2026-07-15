@@ -6,19 +6,51 @@ import importlib
 try:
     import supabase  # noqa: F401
 except ImportError:
-    pass
-
-if "supabase" not in sys.modules:
     supabase_stub = types.ModuleType("supabase")
-    supabase_stub.Client = type("Client", (), {})
-    supabase_stub.create_client = lambda url, key: object()
     sys.modules["supabase"] = supabase_stub
+else:
+    supabase_stub = supabase
 
-if "supabase" not in sys.modules:
-    supabase_stub = types.ModuleType("supabase")
-    supabase_stub.Client = type("Client", (), {})
-    supabase_stub.create_client = lambda url, key: object()
-    sys.modules["supabase"] = supabase_stub
+class _ClientOptions:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+supabase_stub.Client = getattr(supabase_stub, "Client", type("Client", (), {}))
+supabase_stub.ClientOptions = getattr(supabase_stub, "ClientOptions", _ClientOptions)
+supabase_stub.create_client = getattr(supabase_stub, "create_client", lambda url, key, **_kwargs: object())
+
+if "jwt" not in sys.modules:
+    jwt_stub = types.ModuleType("jwt")
+
+    class PyJWTError(Exception):
+        pass
+
+    class ExpiredSignatureError(PyJWTError):
+        pass
+
+    class PyJWKClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_signing_key_from_jwt(self, *_args, **_kwargs):
+            return type("SigningKey", (), {"key": "test-key"})()
+
+    jwt_stub.PyJWTError = PyJWTError
+    jwt_stub.ExpiredSignatureError = ExpiredSignatureError
+    jwt_stub.PyJWKClient = PyJWKClient
+    jwt_stub.decode = lambda *_args, **_kwargs: {"sub": "user-1"}
+    sys.modules["jwt"] = jwt_stub
+
+if "cachetools" not in sys.modules:
+    cachetools_stub = types.ModuleType("cachetools")
+
+    class TTLCache(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    cachetools_stub.TTLCache = TTLCache
+    sys.modules["cachetools"] = cachetools_stub
 
 try:
     import fastapi  # noqa: F401
@@ -52,10 +84,17 @@ if "fastapi" not in sys.modules:
 
             return decorator
 
+        def post(self, *args, **kwargs):
+            def decorator(fn):
+                return fn
+
+            return decorator
+
     fastapi_stub.HTTPException = HTTPException
     fastapi_stub.APIRouter = APIRouter
     fastapi_stub.Depends = lambda dependency=None: dependency
     fastapi_stub.Header = lambda default=None, **_kwargs: default
+    fastapi_stub.Query = lambda default=None, **_kwargs: default
     sys.modules["fastapi"] = fastapi_stub
 
 from fastapi import HTTPException
