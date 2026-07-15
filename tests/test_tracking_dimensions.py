@@ -50,10 +50,12 @@ if "cachetools" not in sys.modules:
     cachetools_stub.TTLCache = TTLCache
     sys.modules["cachetools"] = cachetools_stub
 
-helpers_mod = types.ModuleType("app.services.invoice_extraction_service._helpers")
-helpers_mod.get_organisation_extraction_settings = lambda *_args, **_kwargs: {}
-helpers_mod.update_organisation_extraction_settings = lambda *_args, **_kwargs: {}
-sys.modules["app.services.invoice_extraction_service._helpers"] = helpers_mod
+helpers_mod = sys.modules.get("app.services.invoice_extraction_service._helpers")
+if helpers_mod is None:
+    helpers_mod = types.ModuleType("app.services.invoice_extraction_service._helpers")
+    helpers_mod.get_organisation_extraction_settings = lambda *_args, **_kwargs: {}
+    helpers_mod.update_organisation_extraction_settings = lambda *_args, **_kwargs: {}
+    sys.modules["app.services.invoice_extraction_service._helpers"] = helpers_mod
 
 try:
     import fastapi  # noqa: F401

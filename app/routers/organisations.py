@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from app.db.supabase_client import get_supabase_client
@@ -317,7 +317,7 @@ def update_organisation_module_setting(
 def list_tracking_dimensions(
     organisation_id: str,
     auth: UserAuth,
-    include_archived: bool = Query(default=False),
+    include_archived: bool = False,
 ):
     user_id, db = auth
     ensure_org_read(str(user_id), organisation_id)
