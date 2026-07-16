@@ -229,6 +229,10 @@ def run_invoice_re_extraction(
             or not parsed_data.get("total_amount")
             or not parsed_data.get("supplier_name_extracted")
             or supplier_candidate_invalid
+            or (
+                not parsed_data.get("line_items")
+                and parsed_data.get("total_amount")
+            )
         )
 
         if vlm_should_try:
@@ -409,6 +413,7 @@ def run_invoice_re_extraction(
             strategy="deep_region_ocr",
         )
         selected_raw_parse_attempt = raw_parse_attempts[0] if raw_parse_attempts else None
+        raw_line_items_found_count = len(parsed_data.get("line_items") or [])
 
         update_payload, improved_fields, unchanged_fields = build_reextract_update(
             existing=existing,
@@ -537,6 +542,26 @@ def run_invoice_re_extraction(
                 notes=parse_attempt_result.get("parse_attempts_insert_error") or parse_attempt_fetch_error,
             )
 
+        parse_snapshot_available = (
+            raw_line_items_found_count > 0
+            and not parse_attempt_result.get("parse_attempts_insert_error")
+            and int(parse_attempt_result.get("parse_attempts_inserted_count") or 0) > 0
+        )
+        line_items_reextract_status = (
+            "line_items_rebuilt"
+            if parse_snapshot_available
+            else "parse_snapshot_save_failed"
+            if raw_line_items_found_count > 0 and parse_attempt_result.get("parse_attempts_insert_error")
+            else "no_line_items_recovered"
+        )
+        reextract_diagnostics = {
+            **line_item_diagnostics,
+            **parse_attempt_result,
+            "raw_line_items_found_count": raw_line_items_found_count,
+            "parse_snapshot_available": parse_snapshot_available,
+            "line_items_reextract_status": line_items_reextract_status,
+        }
+
         if improved_fields:
             log_invoice_event(
                 supabase,
@@ -565,7 +590,7 @@ def run_invoice_re_extraction(
                 "fields_improved": [field["field"] for field in improved_fields],
                 "fields_unchanged": unchanged_fields,
                 "line_items_replaced": line_items_replaced,
-                **line_item_diagnostics,
+                **reextract_diagnostics,
                 "confidence_score": parsed_data.get("confidence_score"),
             },
             notes="Deep region OCR re-extraction completed.",
@@ -589,11 +614,10 @@ def run_invoice_re_extraction(
             "field_changes": improved_fields,
             "fields_unchanged": unchanged_fields,
             "line_items_replaced": line_items_replaced,
-            **line_item_diagnostics,
+            **reextract_diagnostics,
             "needs_review": not readiness_result.get("ready"),
             "readiness": readiness_result,
             "ocr_confidence": deep_result.get("ocr_confidence"),
-            **parse_attempt_result,
             "regions_attempted": deep_result.get("regions_attempted") or [],
             "confidence_by_region": deep_result.get("confidence_by_region") or {},
             "region_text_preview": _trim_region_text(deep_result.get("region_ocr") or {}),
@@ -608,7 +632,7 @@ def run_invoice_re_extraction(
                 status="completed",
                 stage="completed",
                 extracted_invoice_id=extracted_invoice_id,
-                diagnostic=line_item_diagnostics,
+                diagnostic=reextract_diagnostics,
             )
         return response
     except HTTPException as exc:

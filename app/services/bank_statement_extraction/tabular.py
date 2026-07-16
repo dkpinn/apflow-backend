@@ -76,10 +76,16 @@ def parse_tabular_rows(
 
     for row_index, row in enumerate(rows):
         line_date = parse_date(row.get(columns["date"] or ""))
-        description = normalize_text(row.get(columns["description"] or "")) or normalize_text(dict(row))
         transaction_type = normalize_text(row.get(columns["transaction_type"] or "")) or None
         reference = normalize_text(row.get(columns["reference"] or "")) or None
         counterparty = normalize_text(row.get(columns["counterparty"] or "")) or None
+        description = (
+            normalize_text(row.get(columns["description"] or ""))
+            or reference
+            or counterparty
+            or transaction_type
+            or ""
+        )
         bank_reference = (
             normalize_text(row.get(columns["bank_reference"] or ""))
             or extract_bank_reference(reference, description, counterparty)

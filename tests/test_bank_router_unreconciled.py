@@ -6,6 +6,7 @@ from fastapi import HTTPException
 from app.routers import bank
 from app.routers import bank_lines
 from app.routers import bank_uploads
+from tests.conftest import MemoryDB
 
 
 class _Response:
@@ -120,6 +121,8 @@ def test_account_unreconciled_endpoint_filters_org_account_status_and_enriches_u
                     "bank_statement_upload_id": "upload-2",
                     "line_date": "2024-04-02",
                     "source_row_index": 0,
+                    "description": "{'Date': '15 Jul 2026', 'Reference': 'oThongathi TapnGo 485442*5359 13 JUL'}",
+                    "reference": "oThongathi TapnGo 485442*5359 13 JUL",
                     "posting_status": "unposted",
                     "allocation_status": "unallocated",
                     "review_status": "pending",
@@ -162,6 +165,15 @@ def test_account_unreconciled_endpoint_filters_org_account_status_and_enriches_u
             "bank_audit_events": [],
             "bank_transaction_suggestions": [
                 {
+                    "id": "suggestion-ai",
+                    "organisation_id": "org-1",
+                    "bank_statement_line_id": "pending",
+                    "suggestion_type": "ai",
+                    "confidence_score": 0.99,
+                    "suggested_account_id": "account-ai",
+                    "status": "open",
+                },
+                {
                     "id": "suggestion-low",
                     "organisation_id": "org-1",
                     "bank_statement_line_id": "pending",
@@ -174,9 +186,12 @@ def test_account_unreconciled_endpoint_filters_org_account_status_and_enriches_u
                     "id": "suggestion-high",
                     "organisation_id": "org-1",
                     "bank_statement_line_id": "pending",
+                    "suggestion_type": "supplier_invoice",
                     "confidence_score": 0.96,
                     "suggested_account_id": "account-high",
                     "suggested_tax_treatment": "full",
+                    "matched_invoice_id": "invoice-10415",
+                    "matched_invoice_number": "10415",
                     "status": "open",
                 },
             ],
@@ -194,9 +209,14 @@ def test_account_unreconciled_endpoint_filters_org_account_status_and_enriches_u
     assert result["lines"][0]["recon_confidence"] == 0.5
     assert result["lines"][0]["recon_suggested_account_id"] is None
     assert result["lines"][1]["upload_uploaded_at"] == "2026-05-31T13:00:00Z"
+    assert result["lines"][1]["description"] == "oThongathi TapnGo 485442*5359 13 JUL"
     assert result["lines"][1]["recon_confidence"] == 0.96
+    assert result["lines"][1]["recon_suggestion_id"] == "suggestion-high"
+    assert result["lines"][1]["recon_suggestion_type"] == "supplier_invoice"
     assert result["lines"][1]["recon_suggested_account_id"] == "account-high"
     assert result["lines"][1]["recon_suggested_tax"] == "full"
+    assert result["lines"][1]["recon_matched_invoice_id"] == "invoice-10415"
+    assert result["lines"][1]["recon_matched_invoice_ref"] == "10415"
     assert result["blocked_extraction_line_count"] == 1
     assert result["blocked_extraction_upload_count"] == 1
 
@@ -271,6 +291,87 @@ def _patch_write_auth(monkeypatch, db):
     monkeypatch.setattr(bank_lines, "ensure_org_write", _noop)
     monkeypatch.setattr(bank_uploads, "_auth", _fake_auth)
     monkeypatch.setattr(bank_uploads, "ensure_org_write", _noop)
+
+
+def test_refresh_account_suggestions_replaces_deterministic_and_preserves_ai(monkeypatch):
+    org_id = "22222222-2222-2222-2222-222222222222"
+    account_id = "33333333-3333-3333-3333-333333333333"
+    line_id = "44444444-4444-4444-4444-444444444444"
+    upload_id = "55555555-5555-5555-5555-555555555555"
+    db = MemoryDB({
+        "bank_accounts": [{"id": account_id, "organisation_id": org_id, "name": "Daniel Gold"}],
+        "bank_statement_uploads": [
+            {
+                "id": upload_id,
+                "organisation_id": org_id,
+                "bank_account_id": account_id,
+                "extraction_status": "extracted",
+            }
+        ],
+        "bank_statement_lines": [
+            {
+                "id": line_id,
+                "organisation_id": org_id,
+                "bank_account_id": account_id,
+                "bank_statement_upload_id": upload_id,
+                "signed_amount": -410.55,
+                "description": "EDGE ZONE TFCGRC MISTY SEA TFCGRC",
+                "reference": "EDGE ZONE TFCGRC MISTY SEA TFCGRC",
+                "posting_status": "unposted",
+                "allocation_status": "unallocated",
+                "review_status": "pending",
+                "match_status": "unmatched",
+            }
+        ],
+        "invoices_extracted": [
+            {
+                "id": "66666666-6666-6666-6666-666666666666",
+                "organisation_id": org_id,
+                "invoice_number": "10415",
+                "supplier_name": "Edge Zone CC",
+                "total_amount": 410.55,
+            }
+        ],
+        "bank_transaction_rules": [],
+        "bank_transaction_suggestions": [
+            {
+                "id": "77777777-7777-7777-7777-777777777777",
+                "organisation_id": org_id,
+                "bank_statement_line_id": line_id,
+                "suggestion_type": "ai",
+                "status": "open",
+                "confidence_score": 0.42,
+            },
+            {
+                "id": "88888888-8888-8888-8888-888888888888",
+                "organisation_id": org_id,
+                "bank_statement_line_id": line_id,
+                "suggestion_type": "rule",
+                "status": "open",
+                "confidence_score": 0.5,
+            },
+        ],
+    })
+    _patch_write_auth(monkeypatch, db)
+
+    result = bank.refresh_bank_account_suggestions(
+        account_id,
+        bank.ExtractUploadRequest(organisation_id=org_id),
+        auth=("user", None),
+    )
+
+    assert result == {
+        "success": True,
+        "processed_count": 1,
+        "suggestion_count": 1,
+        "suggested_line_count": 1,
+    }
+    suggestions = db.tables["bank_transaction_suggestions"]
+    assert [row["suggestion_type"] for row in suggestions] == ["ai", "supplier_invoice"]
+    supplier_match = suggestions[1]
+    assert supplier_match["matched_invoice_id"] == "66666666-6666-6666-6666-666666666666"
+    assert supplier_match["matched_invoice_number"] == "10415"
+    assert db.tables["bank_statement_lines"][0]["match_status"] == "suggested"
 
 
 def test_explicit_bulk_line_delete_route_calls_atomic_rpc(monkeypatch):

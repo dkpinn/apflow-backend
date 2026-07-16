@@ -7,7 +7,7 @@ from typing import Optional
 
 from app.services.audit_log import log_invoice_event
 from app.services.money import numeric_amount
-from app.services.invoice_line_items import replace_invoice_line_items
+from app.services.invoice_line_items import normalize_pricing_notes, replace_invoice_line_items
 from app.services.invoice_parse_attempts import fetch_parse_attempts
 
 
@@ -191,7 +191,7 @@ def _apply_allocation_rule_to_line(item: dict, rule: dict) -> dict:
         ]
 
     updated["pricing_notes"] = {
-        **(item.get("pricing_notes") or {}),
+        **normalize_pricing_notes(item.get("pricing_notes")),
         "supplier_allocation_rule_id": rule.get("id"),
         "supplier_allocation_rule_name": rule.get("name"),
     }
@@ -273,7 +273,7 @@ def _strip_vat_from_line_item(item: dict, vat_rate: float) -> dict:
 
     if updated != item:
         updated["pricing_notes"] = {
-            **(item.get("pricing_notes") or {}),
+            **normalize_pricing_notes(item.get("pricing_notes")),
             "vat_stripped_from_line_item": True,
             "vat_rate": vat_rate,
         }

@@ -54,6 +54,25 @@ def bank_line_sort_key(line: dict[str, Any]) -> tuple[str, int, str]:
     return (str(line.get("line_date") or ""), row_order, str(line.get("id") or ""))
 
 
+def _looks_like_serialized_csv_row(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return (
+        text.startswith("{")
+        and text.endswith("}")
+        and ("'Date':" in text or '"Date":' in text)
+        and ("'Reference':" in text or '"Reference":' in text)
+    )
+
+
+def _line_for_reconciliation_display(line: dict[str, Any]) -> dict[str, Any]:
+    reference = line.get("reference")
+    if _looks_like_serialized_csv_row(line.get("description")) and reference:
+        return {**line, "description": str(reference)}
+    return line
+
+
 def get_unreconciled_lines_payload(
     db,
     *,
@@ -135,7 +154,11 @@ def get_unreconciled_lines_payload(
         line_id_strs = [str(line["id"]) for line in lines[:500]]
         sug_rows = (
             db.table("bank_transaction_suggestions")
-            .select("bank_statement_line_id, confidence_score, suggested_account_id, suggested_tax_treatment, matched_invoice_number")
+            .select(
+                "id, bank_statement_line_id, suggestion_type, confidence_score, "
+                "suggested_account_id, suggested_tax_treatment, matched_invoice_id, "
+                "matched_sales_invoice_id, matched_invoice_number"
+            )
             .eq("organisation_id", organisation_id)
             .in_("bank_statement_line_id", line_id_strs)
             .eq("status", "open")
@@ -147,7 +170,12 @@ def get_unreconciled_lines_payload(
         )
         for suggestion in sug_rows:
             line_id = str(suggestion.get("bank_statement_line_id") or "")
-            if line_id and line_id not in top_suggestion:
+            if not line_id:
+                continue
+            current = top_suggestion.get(line_id)
+            suggestion_matches_invoice = bool(suggestion.get("matched_invoice_number"))
+            current_matches_invoice = bool((current or {}).get("matched_invoice_number"))
+            if current is None or (suggestion_matches_invoice and not current_matches_invoice):
                 top_suggestion[line_id] = suggestion
 
     enriched = []
@@ -159,12 +187,15 @@ def get_unreconciled_lines_payload(
             or (0.75 if line.get("match_status") == "suggested" else 0.5)
         )
         enriched.append({
-            **line,
+            **_line_for_reconciliation_display(line),
             "upload_original_filename": upload.get("original_filename"),
             "upload_uploaded_at": upload.get("uploaded_at"),
             "recon_confidence": confidence,
+            "recon_suggestion_id": suggestion.get("id"),
+            "recon_suggestion_type": suggestion.get("suggestion_type"),
             "recon_suggested_account_id": suggestion.get("suggested_account_id"),
             "recon_suggested_tax": suggestion.get("suggested_tax_treatment"),
+            "recon_matched_invoice_id": suggestion.get("matched_invoice_id") or suggestion.get("matched_sales_invoice_id"),
             "recon_matched_invoice_ref": suggestion.get("matched_invoice_number") or line.get("matched_invoice_number"),
         })
 

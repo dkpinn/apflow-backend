@@ -39,6 +39,7 @@ class StubQuery:
     def __init__(self, rows: list):
         self._rows = list(rows)
         self._filters: list[tuple] = []
+        self._neq_filters: list[tuple] = []
         self._in_filters: list[tuple] = []
         self._gte: list[tuple] = []
         self._lte: list[tuple] = []
@@ -150,6 +151,7 @@ class MemoryQuery:
         self._op = "select"
         self._payload: Any = None
         self._filters: list[tuple] = []
+        self._neq_filters: list[tuple] = []
         self._in_filters: list[tuple] = []
         self._limit: int | None = None
         self._count_mode: str | None = None
@@ -177,6 +179,10 @@ class MemoryQuery:
         self._filters.append((key, value))
         return self
 
+    def neq(self, key: str, value: Any):
+        self._neq_filters.append((key, value))
+        return self
+
     def in_(self, key: str, values):
         self._in_filters.append((key, set(values)))
         return self
@@ -190,6 +196,8 @@ class MemoryQuery:
 
     def _matches(self, row: dict) -> bool:
         return all(row.get(k) == v for k, v in self._filters) and all(
+            row.get(k) != v for k, v in self._neq_filters
+        ) and all(
             row.get(k) in vs for k, vs in self._in_filters
         )
 

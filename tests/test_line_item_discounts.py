@@ -97,3 +97,47 @@ def test_line_item_payload_persists_discount_fields():
     assert payload[0]["discount_percent"] == 30.0
     assert payload[0]["pricing_basis"] == "discounted_unit_price"
     assert payload[0]["pricing_notes"]["discount_column_mode"] == "discounted_unit_price"
+
+
+def test_line_item_payload_normalizes_vlm_string_pricing_notes():
+    payload = build_line_item_payload(
+        invoice_extracted_id="invoice-1",
+        organisation_id="org-1",
+        line_items=[
+            {
+                "description": "VLM item",
+                "quantity": 1,
+                "unit_price": 100.0,
+                "line_total": 100.0,
+                "pricing_notes": "VLM pricing evidence",
+                "source_bbox": [10, 20, 80, 30],
+            },
+        ],
+    )
+
+    assert payload[0]["pricing_notes"] == {
+        "note": "VLM pricing evidence",
+        "source_bbox": [10, 20, 80, 30],
+    }
+
+
+def test_supplier_vat_rule_normalizes_vlm_string_pricing_notes():
+    parsed = {
+        "subtotal": 86.96,
+        "tax_amount": 13.04,
+        "total_amount": 100.0,
+        "line_items": [
+            {
+                "description": "VLM item",
+                "quantity": 1,
+                "unit_price": 100.0,
+                "line_total": 100.0,
+                "pricing_notes": "VLM pricing evidence",
+            },
+        ],
+    }
+
+    result = apply_supplier_processing_rules(parsed, {"line_items_include_vat": True})
+
+    assert result["line_items"][0]["pricing_notes"]["note"] == "VLM pricing evidence"
+    assert result["line_items"][0]["pricing_notes"]["vat_stripped_from_line_item"] is True

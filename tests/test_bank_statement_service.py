@@ -9,6 +9,7 @@ from app.services.bank_statement_service import (
     parse_csv_statement,
     parse_text_statement_from_text,
     reversal_lines_for_journal,
+    score_invoice_suggestions,
     rule_matches_criteria,
     score_rule_suggestions,
     validate_balances,
@@ -68,6 +69,23 @@ def test_parse_csv_statement_infers_columns_and_balances():
     assert lines[0].signed_amount == Decimal("-100.00")
     assert lines[1].signed_amount == Decimal("250.00")
     assert lines[0].transaction_hash
+
+
+def test_parse_csv_statement_uses_reference_when_description_column_missing():
+    csv_bytes = (
+        "Date,Reference,Source,Amount,Balance\n"
+        "15 Jul 2026,oThongathi TapnGo 485442*5359 13 JUL 74067246194168987622888,Card,-15.50,365454.02\n"
+    ).encode()
+
+    header, lines = parse_csv_statement(csv_bytes, bank_account_id="bank-1", currency="ZAR")
+
+    assert header["parser_strategy"] == "deterministic_csv"
+    assert len(lines) == 1
+    assert lines[0].line_date == "2026-07-15"
+    assert lines[0].description == "oThongathi TapnGo 485442*5359 13 JUL 74067246194168987622888"
+    assert lines[0].reference == "oThongathi TapnGo 485442*5359 13 JUL 74067246194168987622888"
+    assert not lines[0].description.startswith("{")
+    assert lines[0].signed_amount == Decimal("-15.50")
 
 
 def test_parse_text_statement_groups_bank_continuation_lines():
@@ -163,6 +181,32 @@ def test_detect_line_duplicates_marks_same_upload_and_existing_hashes():
     assert [row["duplicate_status"] for row in wrapped] == ["possible_duplicate", "possible_duplicate"]
     assert summary["duplicate_line_count"] == 2
     assert summary["duplicate_status"] == "possible_duplicates"
+
+
+def test_supplier_invoice_suggestions_match_negative_bank_line_by_absolute_amount():
+    db = _DB({
+        "invoices_extracted": [
+            {
+                "id": "invoice-10415",
+                "organisation_id": "org-1",
+                "invoice_number": "10415",
+                "supplier_name": "Edge Zone CC",
+                "total_amount": 410.55,
+            }
+        ]
+    })
+    line = {
+        "signed_amount": -410.55,
+        "description": "EDGE ZONE TFCGRC MISTY SEA TFCGRC",
+        "reference": "EDGE ZONE TFCGRC MISTY SEA TFCGRC",
+    }
+
+    suggestions = score_invoice_suggestions(db, organisation_id="org-1", line=line)
+
+    assert suggestions[0]["suggestion_type"] == "supplier_invoice"
+    assert suggestions[0]["matched_invoice_id"] == "invoice-10415"
+    assert suggestions[0]["matched_invoice_number"] == "10415"
+    assert suggestions[0]["confidence_score"] >= 0.3
 
 
 def test_validate_balances_checks_opening_and_closing():

@@ -115,6 +115,105 @@ def list_bank_account_unreconciled_lines(account_id: str, organisation_id: str, 
     return {"success": True, **payload}
 
 
+@router.post("/accounts/{account_id}/refresh-suggestions")
+def refresh_bank_account_suggestions(account_id: str, payload: ExtractUploadRequest, auth: UserAuth):
+    user_id, db = _auth(auth)
+    organisation_id = str(payload.organisation_id)
+    ensure_org_write(user_id, organisation_id)
+    account = _one(
+        db.table("bank_accounts")
+        .select("id")
+        .eq("id", account_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Bank account not found",
+    )
+    rows = (
+        db.table("bank_statement_lines")
+        .select("*")
+        .eq("organisation_id", organisation_id)
+        .eq("bank_account_id", account["id"])
+        .limit(5000)
+        .execute()
+        .data
+        or []
+    )
+    upload_ids = list({str(row.get("bank_statement_upload_id")) for row in rows if row.get("bank_statement_upload_id")})
+    uploads_by_id: dict[str, dict] = {}
+    if upload_ids:
+        uploads = (
+            db.table("bank_statement_uploads")
+            .select("id, extraction_status")
+            .eq("organisation_id", organisation_id)
+            .in_("id", upload_ids)
+            .execute()
+            .data
+            or []
+        )
+        uploads_by_id = {str(row.get("id")): row for row in uploads if row.get("id")}
+
+    eligible_lines = [
+        row
+        for row in rows
+        if is_unreconciled_bank_line(row)
+        and str((uploads_by_id.get(str(row.get("bank_statement_upload_id"))) or {}).get("extraction_status") or "").lower()
+        == "extracted"
+    ]
+    line_ids = [str(line["id"]) for line in eligible_lines if line.get("id")]
+    if line_ids:
+        (
+            db.table("bank_transaction_suggestions")
+            .delete()
+            .eq("organisation_id", organisation_id)
+            .in_("bank_statement_line_id", line_ids)
+            .eq("status", "open")
+            .neq("suggestion_type", "ai")
+            .execute()
+        )
+
+    inserts: list[dict] = []
+    suggested_line_ids: set[str] = set()
+    for line in eligible_lines:
+        line_id = str(line.get("id") or "")
+        if not line_id:
+            continue
+        suggestions = score_invoice_suggestions(db, organisation_id=organisation_id, line=line)
+        suggestions += score_rule_suggestions(
+            db,
+            organisation_id=organisation_id,
+            bank_account_id=str(line.get("bank_account_id") or account["id"]),
+            line=line,
+        )
+        if suggestions:
+            suggested_line_ids.add(line_id)
+            inserts.extend(
+                {
+                    **suggestion,
+                    "organisation_id": organisation_id,
+                    "bank_statement_line_id": line_id,
+                }
+                for suggestion in suggestions
+            )
+
+    if inserts:
+        db.table("bank_transaction_suggestions").insert(inserts).execute()
+    if suggested_line_ids:
+        (
+            db.table("bank_statement_lines")
+            .update({"match_status": "suggested"})
+            .eq("organisation_id", organisation_id)
+            .in_("id", list(suggested_line_ids))
+            .execute()
+        )
+    return {
+        "success": True,
+        "processed_count": len(eligible_lines),
+        "suggestion_count": len(inserts),
+        "suggested_line_count": len(suggested_line_ids),
+    }
+
+
 @router.get("/accounts/{account_id}/statement/export")
 def export_bank_statement(
     account_id: str,

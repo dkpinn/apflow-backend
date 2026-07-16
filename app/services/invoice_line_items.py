@@ -40,6 +40,15 @@ def build_line_item_diagnostics(
     }
 
 
+def normalize_pricing_notes(value) -> dict:
+    if isinstance(value, dict):
+        return {str(k): v for k, v in value.items() if v not in (None, "")}
+    if isinstance(value, str):
+        note = value.strip()
+        return {"note": note} if note else {}
+    return {}
+
+
 def build_line_item_payload(
     *,
     invoice_extracted_id: str,
@@ -58,7 +67,7 @@ def build_line_item_payload(
             "discounted_unit_price": item.get("discounted_unit_price"),
             "pricing_basis": item.get("pricing_basis"),
             "pricing_notes": {
-                **(item.get("pricing_notes") or {}),
+                **normalize_pricing_notes(item.get("pricing_notes")),
                 # Store VLM-returned bounding box for document highlighting
                 **({ "source_bbox": item["source_bbox"] } if item.get("source_bbox") else {}),
             },
