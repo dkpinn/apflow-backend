@@ -41,11 +41,13 @@ from app.services.bank_statement_service import (
     detect_line_duplicates,
     extract_statement,
     line_to_insert,
+    money,
     new_uuid,
     normalize_rule_criteria,
     reversal_lines_for_journal,
     score_invoice_suggestions,
-    score_rule_suggestions,
+    score_rule_suggestions_from_rows,
+    score_supplier_invoice_suggestions_from_rows,
     validate_balances,
 )
 from app.services.bank.accounts import (
@@ -172,17 +174,59 @@ def refresh_bank_account_suggestions(account_id: str, payload: ExtractUploadRequ
             .execute()
         )
 
+    supplier_invoice_rows: list[dict] = []
+    if any(money(line.get("signed_amount")) < 0 for line in eligible_lines):
+        try:
+            supplier_invoice_rows = (
+                db.table("invoices_extracted")
+                .select(
+                    "id, invoice_number, supplier_name_extracted, supplier_id, "
+                    "total_amount, invoice_date, review_status, approval_status"
+                )
+                .eq("organisation_id", organisation_id)
+                .limit(1000)
+                .execute()
+                .data
+                or []
+            )
+        except Exception:
+            logger.exception("refresh_bank_account_suggestions supplier invoice query failed for org=%s", organisation_id)
+            supplier_invoice_rows = []
+
+    try:
+        rule_rows = (
+            db.table("bank_transaction_rules")
+            .select("*")
+            .eq("organisation_id", organisation_id)
+            .eq("active", True)
+            .order("priority", desc=False)
+            .limit(200)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        logger.exception("refresh_bank_account_suggestions rule query failed for org=%s", organisation_id)
+        rule_rows = []
+
     inserts: list[dict] = []
     suggested_line_ids: set[str] = set()
     for line in eligible_lines:
         line_id = str(line.get("id") or "")
         if not line_id:
             continue
-        suggestions = score_invoice_suggestions(db, organisation_id=organisation_id, line=line)
-        suggestions += score_rule_suggestions(
-            db,
-            organisation_id=organisation_id,
-            bank_account_id=str(line.get("bank_account_id") or account["id"]),
+        bank_account_id = str(line.get("bank_account_id") or account["id"])
+        suggestions = (
+            score_supplier_invoice_suggestions_from_rows(
+                line=line,
+                invoices=supplier_invoice_rows,
+            )
+            if money(line.get("signed_amount")) < 0
+            else score_invoice_suggestions(db, organisation_id=organisation_id, line=line)
+        )
+        suggestions += score_rule_suggestions_from_rows(
+            rules=rule_rows,
+            bank_account_id=bank_account_id,
             line=line,
         )
         if suggestions:

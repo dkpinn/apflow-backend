@@ -676,6 +676,77 @@ def score_invoice_suggestions(
     return suggestions[:limit]
 
 
+def score_supplier_invoice_suggestions_from_rows(
+    *,
+    line: dict[str, Any],
+    invoices: list[dict[str, Any]],
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    signed_amount = money(line.get("signed_amount"))
+    amount = abs(signed_amount)
+    if signed_amount >= 0:
+        return []
+    text = " ".join(
+        normalize_text(line.get(key))
+        for key in ["reference", "bank_reference", "counterparty", "description", "raw_text"]
+    ).lower()
+    date_floor: date | None = None
+    line_date_str = line.get("line_date")
+    if line_date_str:
+        try:
+            date_floor = date.fromisoformat(str(line_date_str)[:10]) - timedelta(days=180)
+        except (ValueError, TypeError):
+            date_floor = None
+
+    suggestions: list[dict[str, Any]] = []
+    for invoice in invoices:
+        if date_floor and invoice.get("invoice_date"):
+            try:
+                invoice_date = date.fromisoformat(str(invoice.get("invoice_date"))[:10])
+            except (ValueError, TypeError):
+                invoice_date = None
+            if invoice_date and invoice_date < date_floor:
+                continue
+        invoice_total = money(invoice.get("total_amount"))
+        difference = abs(invoice_total - amount)
+        reference = normalize_text(invoice.get("invoice_number")).lower()
+        supplier_name = normalize_text(
+            invoice.get("supplier_name_extracted") or invoice.get("supplier_name")
+        ).lower()
+        confidence = Decimal("0.00")
+        reasons: list[str] = []
+        if reference and reference in text:
+            confidence += Decimal("0.60")
+            reasons.append("reference matches invoice number")
+        if difference <= Decimal("0.01"):
+            confidence += Decimal("0.30")
+            reasons.append("amount matches")
+        elif difference <= Decimal("1.00"):
+            confidence += Decimal("0.15")
+            reasons.append("amount is within tolerance")
+        if supplier_name and supplier_name in text:
+            confidence += Decimal("0.10")
+            reasons.append("counterparty resembles supplier")
+        if confidence <= Decimal("0.20"):
+            continue
+        suggestions.append(
+            {
+                "suggestion_type": "supplier_invoice",
+                "confidence_score": float(min(confidence, Decimal("0.99"))),
+                "rationale": "; ".join(reasons) or "possible invoice match",
+                "matched_invoice_id": invoice.get("id"),
+                "matched_invoice_number": invoice.get("invoice_number"),
+                "evidence": {
+                    "amount_difference": float(difference),
+                    "invoice_total": float(invoice_total),
+                    "line_amount": float(amount),
+                },
+            }
+        )
+    suggestions.sort(key=lambda suggestion: suggestion["confidence_score"], reverse=True)
+    return suggestions[:limit]
+
+
 RULE_FIELDS = {"description", "raw_text", "counterparty", "reference", "bank_reference"}
 TEXT_OPERATORS = {"contains", "starts_with", "ends_with", "exact"}
 AMOUNT_OPERATORS = {"eq", "gt", "gte", "lt", "lte", "between"}
@@ -876,6 +947,21 @@ def score_rule_suggestions(
         logger.exception("score_rule_suggestions DB query failed for org=%s", organisation_id)
         return []
 
+    return score_rule_suggestions_from_rows(
+        rules=rules,
+        bank_account_id=bank_account_id,
+        line=line,
+        limit=limit,
+    )
+
+
+def score_rule_suggestions_from_rows(
+    *,
+    rules: list[dict[str, Any]],
+    bank_account_id: str,
+    line: dict[str, Any],
+    limit: int = 5,
+) -> list[dict[str, Any]]:
     suggestions: list[dict[str, Any]] = []
     for rule in rules:
         if bank_rule_matches(rule, bank_account_id=bank_account_id, line=line):
