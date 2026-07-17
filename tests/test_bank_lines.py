@@ -24,6 +24,8 @@ GL_ID = "00000000-0000-0000-0000-000000000004"
 SUPPLIER_ID = "00000000-0000-0000-0000-000000000005"
 CUSTOMER_ID = "00000000-0000-0000-0000-000000000006"
 UPLOAD_ID = "00000000-0000-0000-0000-000000000099"
+SUGGESTION_ID = "00000000-0000-0000-0000-000000000007"
+INVOICE_ID = "00000000-0000-0000-0000-000000000008"
 
 
 def _line_row(**overrides):
@@ -396,6 +398,46 @@ def test_review_bank_line_blank_narration_stored_as_none(monkeypatch):
     )
 
     assert db.tables["bank_statement_lines"][0]["allocation_narration"] is None
+
+
+def test_review_bank_line_accepts_supplier_invoice_suggestion(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row(signed_amount=-410.55)],
+        "bank_statement_uploads": [_upload_row()],
+        "bank_transaction_suggestions": [
+            {
+                "id": SUGGESTION_ID,
+                "organisation_id": ORG_ID,
+                "bank_statement_line_id": LINE_ID,
+                "suggestion_type": "supplier_invoice",
+                "matched_invoice_id": INVOICE_ID,
+                "matched_invoice_number": "10415",
+                "confidence_score": 0.3,
+                "status": "open",
+            }
+        ],
+        "bank_audit_events": [],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bl, "log_bank_event", lambda _db, **_kw: None)
+    monkeypatch.setattr(bl, "now_iso", lambda: "2024-01-05T12:00:00+00:00")
+
+    from app.routers.bank import ReviewLineRequest
+    result = bl.review_bank_line(
+        LINE_ID,
+        ReviewLineRequest(organisation_id=ORG_ID, suggestion_id=SUGGESTION_ID),
+        AUTH,
+    )
+
+    assert result["success"] is True
+    suggestion = db.tables["bank_transaction_suggestions"][0]
+    assert suggestion["status"] == "accepted"
+    line = db.tables["bank_statement_lines"][0]
+    assert line["accepted_suggestion_id"] == SUGGESTION_ID
+    assert line["match_status"] == "matched"
+    assert line["allocation_status"] == "allocated"
+    assert line["review_status"] == "reviewed"
 
 
 def test_review_line_request_rejects_supplier_and_customer_together():
