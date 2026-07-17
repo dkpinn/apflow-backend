@@ -190,7 +190,7 @@ def test_supplier_invoice_suggestions_match_negative_bank_line_by_absolute_amoun
                 "id": "invoice-10415",
                 "organisation_id": "org-1",
                 "invoice_number": "10415",
-                "supplier_name": "Edge Zone CC",
+                "supplier_name_extracted": "Edge Zone CC",
                 "total_amount": 410.55,
             }
         ]

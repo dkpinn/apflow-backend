@@ -621,7 +621,10 @@ def score_invoice_suggestions(
     try:
         _sq = (
             db.table("invoices_extracted")
-            .select("id, invoice_number, supplier_name, supplier_id, total_amount, invoice_date, review_status, approval_status")
+            .select(
+                "id, invoice_number, supplier_name_extracted, supplier_id, "
+                "total_amount, invoice_date, review_status, approval_status"
+            )
             .eq("organisation_id", organisation_id)
         )
         if _date_floor_s:
@@ -636,7 +639,9 @@ def score_invoice_suggestions(
         invoice_total = money(invoice.get("total_amount"))
         difference = abs(invoice_total - amount)
         reference = normalize_text(invoice.get("invoice_number")).lower()
-        supplier_name = normalize_text(invoice.get("supplier_name")).lower()
+        supplier_name = normalize_text(
+            invoice.get("supplier_name_extracted") or invoice.get("supplier_name")
+        ).lower()
         confidence = Decimal("0.00")
         reasons: list[str] = []
         if reference and reference in text:

@@ -328,7 +328,7 @@ def test_refresh_account_suggestions_replaces_deterministic_and_preserves_ai(mon
                 "id": "66666666-6666-6666-6666-666666666666",
                 "organisation_id": org_id,
                 "invoice_number": "10415",
-                "supplier_name": "Edge Zone CC",
+                "supplier_name_extracted": "Edge Zone CC",
                 "total_amount": 410.55,
             }
         ],
