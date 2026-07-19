@@ -205,12 +205,9 @@ def extract_bank_name(text: str) -> Optional[str]:
     candidate = extract_same_line_value(search_text, same_line_patterns)
 
     if candidate:
-        known = match_known_bank(candidate)
-        if known:
-            return known
-
-        if 2 <= len(candidate) <= 60 and not re.search(r"\d{4,}", candidate):
-            return candidate
+        normalised_candidate = normalise_extracted_bank_name(candidate)
+        if normalised_candidate and not re.search(r"\d{4,}", normalised_candidate):
+            return normalised_candidate
 
     label_candidate = extract_value_after_label(
         lines,
@@ -222,12 +219,9 @@ def extract_bank_name(text: str) -> Optional[str]:
     )
 
     if label_candidate:
-        known = match_known_bank(label_candidate)
-        if known:
-            return known
-
-        if 2 <= len(label_candidate) <= 60 and not re.search(r"\d{4,}", label_candidate):
-            return label_candidate
+        normalised_candidate = normalise_extracted_bank_name(label_candidate)
+        if normalised_candidate and not re.search(r"\d{4,}", normalised_candidate):
+            return normalised_candidate
 
     known = match_known_bank(search_text)
     if known:

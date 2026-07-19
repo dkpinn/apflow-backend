@@ -16,8 +16,13 @@ class _Query:
         self.rows = list(rows)
         self.filters = []
         self.ids = None
+        self.update_values = None
 
     def select(self, *_args):
+        return self
+
+    def update(self, values):
+        self.update_values = values
         return self
 
     def eq(self, key, value):
@@ -49,6 +54,9 @@ class _Query:
         if self.ids:
             key, values = self.ids
             rows = [row for row in rows if str(row.get(key)) in values]
+        if self.update_values is not None:
+            for row in rows:
+                row.update(self.update_values)
         return _Result(rows)
 
 
@@ -170,6 +178,61 @@ def test_preparation_rejects_subtotal_plus_vat_that_differs_from_document_total(
 
     with pytest.raises(ValueError, match="subtotal plus VAT does not match"):
         prepare_invoice_gl_posting(_DB(tables), invoice_id="invoice-1", org_id="org-1")
+
+
+@pytest.mark.parametrize(
+    ("stored_tax", "expected_adjustment"),
+    [(14.99, 0.01), (15.01, -0.01)],
+)
+def test_preparation_absorbs_cent_level_document_difference_into_vat(
+    stored_tax,
+    expected_adjustment,
+):
+    tables = _tables()
+    tables["invoices_extracted"][0]["tax_amount"] = stored_tax
+
+    prepared = prepare_invoice_gl_posting(
+        _DB(tables), invoice_id="invoice-1", org_id="org-1"
+    )
+
+    vat_line = next(
+        row for row in prepared["journal_lines"] if row["account_id"] == "vat-id"
+    )
+    creditor_line = prepared["journal_lines"][-1]
+    assert vat_line["debit_amount"] == 15
+    assert creditor_line["credit_amount"] == 115
+    assert prepared["total_debit"] == prepared["total_credit"] == 115
+    assert prepared["gross_total"] == 115
+    assert prepared["vat_rounding_adjustment"] == expected_adjustment
+
+
+def test_preparation_does_not_hide_non_vat_cent_difference():
+    tables = _tables()
+    tables["invoices_extracted"][0].update({"tax_amount": 0, "total_amount": 100.01})
+
+    with pytest.raises(ValueError, match="subtotal plus VAT does not match"):
+        prepare_invoice_gl_posting(_DB(tables), invoice_id="invoice-1", org_id="org-1")
+
+
+def test_persistence_saves_the_absorbed_vat_cent_on_the_invoice():
+    tables = _tables()
+    tables["invoices_extracted"][0]["tax_amount"] = 14.99
+    prepared = prepare_invoice_gl_posting(
+        _DB(tables), invoice_id="invoice-1", org_id="org-1"
+    )
+    db = _DB(
+        tables,
+        rpc_result={
+            "journal_id": "journal-1",
+            "total_debit": 115,
+            "total_credit": 115,
+            "lines": 3,
+        },
+    )
+
+    persist_prepared_invoice_posting(db, prepared=prepared, user_id="user-1")
+
+    assert tables["invoices_extracted"][0]["tax_amount"] == 15
 
 
 def test_preparation_rejects_saved_lines_that_differ_from_subtotal():

@@ -221,7 +221,18 @@ def prepare_invoice_gl_posting(
 
     if document_total is None or document_total <= 0:
         raise ValueError("Cannot post — the document total is missing or invalid")
-    if abs(gross_total - document_total) > 0.02:
+    rounding_adjustment = round(document_total - gross_total, 2)
+    if tax_amount > 0 and 0 < abs(rounding_adjustment) <= 0.02:
+        # The supplier's printed total is authoritative. A genuine cent-level
+        # VAT difference belongs in input VAT, not an arbitrary rounding
+        # expense, and must never understate the creditor balance.
+        tax_amount = round(tax_amount + rounding_adjustment, 2)
+        invoice = {**invoice, "tax_amount": tax_amount}
+        gross_total = round(subtotal + tax_amount, 2)
+    else:
+        rounding_adjustment = 0.0
+
+    if gross_total != document_total:
         raise ValueError(
             "Cannot post — subtotal plus VAT does not match the document total "
             f"({gross_total:.2f} calculated vs {document_total:.2f} on document)."
@@ -380,6 +391,7 @@ def prepare_invoice_gl_posting(
         "description": description_base,
         "journal_lines": journal_lines,
         "gross_total": gross_total,
+        "vat_rounding_adjustment": rounding_adjustment,
         "total_debit": total_debit,
         "total_credit": total_debit,
         "trade_payables_account": trade_payables.get("code"),
@@ -399,6 +411,17 @@ def persist_prepared_invoice_posting(
         transaction_date=prepared.get("journal_date"),
         action="Post supplier invoice",
     )
+    if prepared.get("vat_rounding_adjustment"):
+        try:
+            (
+                supabase.table("invoices_extracted")
+                .update({"tax_amount": prepared["invoice"]["tax_amount"]})
+                .eq("id", prepared["invoice_id"])
+                .eq("organisation_id", prepared["organisation_id"])
+                .execute()
+            )
+        except Exception as exc:
+            raise ValueError(f"Failed to save the VAT rounding adjustment: {exc}") from exc
     try:
         rpc_result = supabase.rpc(
             "post_invoice_to_gl_atomic",

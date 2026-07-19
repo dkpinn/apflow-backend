@@ -80,6 +80,26 @@ def test_deterministic_fnb_replaces_vlm_details_label_after_merge() -> None:
     assert parsed["bank_name_extracted"] == "FNB"
 
 
+def test_deep_ocr_bank_label_split_does_not_return_details() -> None:
+    source = """Bank
+Details:
+RO.00
+First
+National
+(FNB)
+Exclusive
+Account:
+62300843712
+Branch:
+220526"""
+
+    assert extract_bank_name(source) == "FNB"
+
+    parsed = {"bank_name_extracted": "Details:"}
+    assert reconcile_extracted_bank_name(parsed, source) == "FNB"
+    assert parsed["bank_name_extracted"] == "FNB"
+
+
 def test_reextract_rejects_generic_details_as_bank_name() -> None:
     update, _improved, _unchanged = build_reextract_update(
         existing={"bank_name_extracted": "FNB", "confidence_score": 0.8},
