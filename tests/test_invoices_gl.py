@@ -17,6 +17,11 @@ from tests.conftest import StubDB
 AUTH = ("user-1", None)
 
 
+@pytest.fixture(autouse=True)
+def _ready_for_posting(monkeypatch):
+    monkeypatch.setattr(gl, "evaluate_invoice_readiness", lambda *_a, **_kw: {"ready": True, "blockers": []})
+
+
 def _prepared(gross_total=500.0):
     return {
         "gross_total": gross_total,
@@ -73,6 +78,20 @@ def test_post_invoice_to_gl_400_on_prepare_error(monkeypatch):
 
     assert exc_info.value.status_code == 400
     assert "already posted" in exc_info.value.detail
+
+
+def test_post_invoice_to_gl_blocks_failed_readiness(monkeypatch):
+    monkeypatch.setattr(gl, "supabase", StubDB({}))
+    monkeypatch.setattr(gl, "evaluate_invoice_readiness", lambda *_a, **_kw: {
+        "ready": False,
+        "blockers": [{"message": "Invoice bank name differs from supplier master."}],
+    })
+
+    with pytest.raises(HTTPException) as exc_info:
+        gl.post_invoice_to_gl("inv-1", _payload(), auth=AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert "bank name differs" in exc_info.value.detail
 
 
 def test_post_invoice_to_gl_400_on_post_error(monkeypatch):

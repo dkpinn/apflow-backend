@@ -107,6 +107,38 @@ def match_known_bank(value: str) -> Optional[str]:
 
     return None
 
+
+_GENERIC_BANK_LABELS = {
+    "bank",
+    "bankdetail",
+    "bankdetails",
+    "bankingdetail",
+    "bankingdetails",
+    "detail",
+    "details",
+    "paymentdetail",
+    "paymentdetails",
+}
+
+
+def normalise_extracted_bank_name(value: object) -> Optional[str]:
+    """Return a real/canonical bank name, never an OCR label fragment."""
+    clean = re.sub(r"\s+", " ", str(value or "")).strip(" :-\t")
+    if not clean:
+        return None
+    compact = re.sub(r"[^a-z0-9]", "", clean.lower())
+    if compact in _GENERIC_BANK_LABELS:
+        return None
+    return match_known_bank(clean) or clean
+
+
+def reconcile_extracted_bank_name(parsed_data: dict, source_text: str) -> Optional[str]:
+    """Prefer deterministic evidence in OCR text over an unvalidated VLM value."""
+    detected = extract_bank_name(source_text)
+    bank_name = detected or normalise_extracted_bank_name(parsed_data.get("bank_name_extracted"))
+    parsed_data["bank_name_extracted"] = bank_name
+    return bank_name
+
 def extract_value_after_label(lines: list[str], labels: set[str], max_lookahead: int = 4) -> Optional[str]:
     """
     Handles:

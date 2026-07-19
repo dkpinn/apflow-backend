@@ -213,6 +213,19 @@ def prepare_invoice_gl_posting(
     subtotal = float(invoice.get("subtotal") or 0)
     tax_amount = float(invoice.get("tax_amount") or 0)
     gross_total = round(subtotal + tax_amount, 2)
+    document_total_raw = invoice.get("total_amount")
+    try:
+        document_total = round(float(document_total_raw), 2) if document_total_raw is not None else None
+    except (TypeError, ValueError):
+        document_total = None
+
+    if document_total is None or document_total <= 0:
+        raise ValueError("Cannot post — the document total is missing or invalid")
+    if abs(gross_total - document_total) > 0.02:
+        raise ValueError(
+            "Cannot post — subtotal plus VAT does not match the document total "
+            f"({gross_total:.2f} calculated vs {document_total:.2f} on document)."
+        )
 
     if gross_total <= 0:
         raise ValueError("Invoice total is zero — nothing to post")
@@ -227,6 +240,13 @@ def prepare_invoice_gl_posting(
     line_items = li_res.data or []
     if not line_items:
         raise ValueError("Invoice has no line items to post. Open the invoice, assign expense accounts to each line, and save before posting.")
+
+    saved_line_total = round(sum(abs(float(row.get("line_total") or 0)) for row in line_items), 2)
+    if abs(saved_line_total - abs(subtotal)) > 0.02:
+        raise ValueError(
+            "Cannot post — saved line items do not match the invoice subtotal "
+            f"({saved_line_total:.2f} in lines vs {subtotal:.2f} subtotal)."
+        )
 
     supplier_vat_number = invoice.get("vat_number_extracted")
     if invoice.get("supplier_id"):

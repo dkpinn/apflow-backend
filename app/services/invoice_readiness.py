@@ -44,7 +44,7 @@ def _current_extraction_blockers(invoice: dict) -> list[dict]:
             "Supplier extraction failed.",
             validation_notes or "The invoice still needs a linked supplier before it can be approved.",
         ))
-    elif validation_status and validation_status not in {"passed", "needs_review"}:
+    elif validation_status and validation_status != "passed":
         blockers.append(_reason(
             "extraction_validation",
             "warning",

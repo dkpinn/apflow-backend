@@ -234,6 +234,17 @@ MISSING_SUPPLIER_NOTE = (
 # The "has old value" guard does not apply to these.
 _ALWAYS_UPDATE_FIELDS = {"validation_status", "document_direction", "organisation_match_status"}
 
+# A user-triggered re-scan must be allowed to refresh valid banking evidence even
+# when unrelated OCR fields keep the overall confidence score flat. Global
+# confidence is not a meaningful tie-breaker for these field-specific results.
+_LATEST_VALID_EXTRACTION_FIELDS = {
+    "bank_account_name_extracted",
+    "bank_name_extracted",
+    "bank_account_number_extracted",
+    "bank_branch_code_extracted",
+    "bank_swift_code_extracted",
+}
+
 
 # ---------------------------------------------------------------------------
 # Field-level value validators / helpers
@@ -287,6 +298,10 @@ def _valid_reextract_value(field_name: str, value) -> bool:
             return False
     if field_name in {"vat_number_extracted", "bank_account_number_extracted"}:
         return len("".join(char for char in str(value) if char.isdigit())) >= 7
+    if field_name == "bank_name_extracted":
+        from app.services.invoice_extraction.banking_parser import normalise_extracted_bank_name  # noqa: PLC0415
+
+        return normalise_extracted_bank_name(value) is not None
     if field_name in {"supplier_telephone_extracted", "supplier_fax_extracted", "supplier_cell_extracted"}:
         return len("".join(char for char in str(value) if char.isdigit())) >= 7
     if field_name == "supplier_name_extracted":
@@ -452,6 +467,11 @@ def build_reextract_update(
         should_update = (
             force_update
             or target_field in _ALWAYS_UPDATE_FIELDS
+            or target_field in _LATEST_VALID_EXTRACTION_FIELDS
+            or (
+                target_field in {"subtotal", "tax_amount"}
+                and parsed.get("vat_reconciled") is True
+            )
             or not _has_value(old_value)
             or _looks_suspicious_value(target_field, old_value)
             or confidence_materially_improved

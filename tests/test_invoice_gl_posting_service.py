@@ -159,6 +159,27 @@ def test_prepared_journal_is_the_complete_vat_aware_posting_preview():
     ]
 
 
+def test_preparation_rejects_subtotal_plus_vat_that_differs_from_document_total():
+    tables = _tables()
+    tables["invoices_extracted"][0].update({
+        "subtotal": 22000.0,
+        "tax_amount": 2869.57,
+        "total_amount": 22000.0,
+    })
+    tables["invoice_line_items"][0]["line_total"] = 22000.0
+
+    with pytest.raises(ValueError, match="subtotal plus VAT does not match"):
+        prepare_invoice_gl_posting(_DB(tables), invoice_id="invoice-1", org_id="org-1")
+
+
+def test_preparation_rejects_saved_lines_that_differ_from_subtotal():
+    tables = _tables()
+    tables["invoice_line_items"][0]["line_total"] = 99.0
+
+    with pytest.raises(ValueError, match="saved line items do not match"):
+        prepare_invoice_gl_posting(_DB(tables), invoice_id="invoice-1", org_id="org-1")
+
+
 def test_split_level_vat_treatment_claims_and_expenses_mixed_vat():
     tables = _tables(allocations=[
         {"invoice_line_item_id": "line-1", "organisation_id": "org-1", "expense_account": "6000", "amount": 70, "percent": 70, "vat_treatment": "full", "tracking": {}, "sort_order": 0},

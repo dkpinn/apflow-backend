@@ -31,6 +31,7 @@ from app.services.invoice_extraction.extraction_rules import looks_like_location
 from app.services.invoice_extraction.supplier_parser import is_valid_supplier_candidate
 from app.services.ai_provider_fallback import extract_with_vlm_fallback
 from app.services.invoice_extraction.vlm_parser import VLM_MERGE_FIELDS
+from app.services.invoice_extraction.banking_parser import reconcile_extracted_bank_name
 from ._vat_reconciliation import _auto_reconcile_vat
 from ._supplier_matching import _attempt_supplier_auto_link, _correct_extracted_supplier
 
@@ -472,6 +473,8 @@ def run_invoice_extraction(
                         f"Image files require VLM extraction, but VLM could not complete "
                         f"({reason}). Please check your VLM integration settings."
                     )
+
+        reconcile_extracted_bank_name(parsed_data, text)
 
         supplier_recovery_result = {"applied": False, "fields": []}
         if not parsed_data.get("supplier_name_extracted"):

@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from app.db.supabase_client import get_supabase_client
 from app.dependencies import UserAuth
+from app.services.invoice_readiness import evaluate_invoice_readiness
 
 router = APIRouter(prefix="/api/invoices", tags=["invoices"])
 
@@ -369,6 +370,19 @@ def post_invoice_to_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: U
 
     if supabase is None:
         raise HTTPException(status_code=500, detail="Database not configured")
+
+    readiness = evaluate_invoice_readiness(
+        supabase,
+        invoice_extracted_id=invoice_id,
+        organisation_id=org_id,
+        reason="manual_gl_post_requested",
+        actor_type="user",
+        actor_user_id=user_id,
+    )
+    if not readiness.get("ready"):
+        messages = [str(item.get("message")) for item in readiness.get("blockers") or [] if item.get("message")]
+        detail = "; ".join(messages[:5]) or "Invoice readiness checks have not passed."
+        raise HTTPException(status_code=400, detail=f"Cannot post invoice: {detail}")
 
     try:
         prepared = prepare_invoice_gl_posting(

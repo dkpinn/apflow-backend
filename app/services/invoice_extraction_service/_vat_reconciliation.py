@@ -77,11 +77,13 @@ def _auto_reconcile_vat(parsed_data: dict, vat_rate: float = 0.15) -> None:
         ex_sum = round(sum(it["line_total"] for it in new_items), 2)
         parsed_data["subtotal"] = ex_sum
         parsed_data["tax_amount"] = round(doc_total - ex_sum, 2)
+        parsed_data["vat_reconciled"] = True
 
     elif diff_exclusive < diff_inclusive and diff_exclusive < TOLERANCE:
         # EX-VAT: prices already ex-VAT → derive VAT from doc_total
         parsed_data["prices_include_vat_detected"] = "exclusive"
         parsed_data["subtotal"] = round(line_sum, 2)
         parsed_data["tax_amount"] = round(doc_total - line_sum, 2)
+        parsed_data["vat_reconciled"] = True
 
     # else: cannot determine — leave as-is, user sees Solve button

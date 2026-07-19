@@ -25,6 +25,7 @@ from app.services.invoice_extraction.supplier_parser import (
 )
 from app.services.ai_provider_fallback import extract_with_vlm_fallback
 from app.services.invoice_extraction.vlm_parser import VLM_MERGE_FIELDS
+from app.services.invoice_extraction.banking_parser import reconcile_extracted_bank_name
 from app.services.invoice_line_items import build_line_item_diagnostics, replace_invoice_line_items
 from app.services.invoice_ocr_pipeline import calculate_confidence
 from app.services.invoice_parse_attempts import (
@@ -308,6 +309,8 @@ def run_invoice_re_extraction(
                     },
                     notes=f"VLM fallback was needed during re-extract but could not complete: {vlm_result.get('reason') or 'unknown_error'}.",
                 )
+
+        reconcile_extracted_bank_name(parsed_data, deep_text)
 
         organisation = get_organisation(org_id)
         direction_result = classify_document_direction(deep_text, organisation)

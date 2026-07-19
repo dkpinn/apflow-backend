@@ -357,11 +357,24 @@ def _banking_suggestions(invoice: dict, supplier: Optional[dict], supplier_branc
     for invoice_key, supplier_key, label in comparisons:
         invoice_value = invoice.get(invoice_key)
         supplier_value = effective_supplier.get(supplier_key)
+        is_required_field = supplier_key in {"bank_name", "bank_account_number", "bank_branch_code"}
+        if not has_value(invoice_value) and has_value(supplier_value) and is_required_field:
+            suggestions.append(AgentSuggestion(
+                category="banking",
+                severity="info" if cash_or_card else "warning",
+                message=f"Invoice {label} was not detected for verification.",
+                reason=(
+                    f"The supplier master contains {label}, but the latest invoice scan did not. "
+                    "Banking must be confirmed before approval."
+                ),
+                confidence=0.86,
+                target={"tab": "supplier", "field": invoice_key, "section": "banking"},
+            ))
+            continue
         if not has_value(invoice_value) or not has_value(supplier_value):
             continue
         if bank_values_match(invoice_key, invoice_value, supplier_value):
             continue
-        is_required_field = supplier_key in {"bank_name", "bank_account_number", "bank_branch_code"}
         severity = "info" if cash_or_card else ("critical" if is_required_field else "warning")
         if True:
             suggestions.append(AgentSuggestion(

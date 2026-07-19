@@ -65,6 +65,37 @@ def test_readiness_blocks_missing_supplier():
     assert any(item["category"] == "required_fields" for item in decision["blockers"])
 
 
+def test_readiness_blocks_needs_review_validation_status():
+    invoice = _ready_invoice(validation_status="needs_review")
+
+    decision = build_invoice_readiness_decision(
+        invoice=invoice,
+        supplier=_ready_supplier(),
+        line_items=[{"description": "Office expense", "line_total": 100.0, "expense_account": "6000/Office"}],
+    )
+
+    assert decision["ready"] is False
+    assert any(item["category"] == "extraction_validation" for item in decision["blockers"])
+
+
+def test_readiness_blocks_when_rescan_misses_fnb_from_invoice():
+    invoice = _ready_invoice(
+        bank_name_extracted=None,
+        bank_account_number_extracted=None,
+        bank_branch_code_extracted=None,
+    )
+
+    decision = build_invoice_readiness_decision(
+        invoice=invoice,
+        supplier=_ready_supplier(),
+        line_items=[{"description": "Office expense", "line_total": 100.0, "expense_account": "6000/Office"}],
+    )
+
+    assert decision["ready"] is False
+    messages = [item["message"] for item in decision["blockers"]]
+    assert "Invoice bank name was not detected for verification." in messages
+
+
 def test_readiness_blocks_sales_invoice_direction():
     decision = build_invoice_readiness_decision(
         invoice=_ready_invoice(
