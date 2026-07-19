@@ -54,6 +54,7 @@ from ._helpers import (
     log_reextract_failure,
 )
 from ._job_tracking import update_reextract_job
+from ._vat_reconciliation import _auto_reconcile_vat
 
 try:
     supabase = get_supabase_client()
@@ -400,6 +401,11 @@ def run_invoice_re_extraction(
                 new_value={"validation_status": parsed_data.get("validation_status")},
                 notes=MISSING_SUPPLIER_NOTE,
             )
+
+        # Keep re-extraction arithmetic identical to the primary extraction path.
+        # This must run after VLM/OCR merging and VAT identity guards, but before
+        # the raw parse attempt and invoice update are persisted.
+        _auto_reconcile_vat(parsed_data, vat_rate=0.15)
 
         if deep_attempt:
             deep_attempt["parsed_data"] = dict(parsed_data)

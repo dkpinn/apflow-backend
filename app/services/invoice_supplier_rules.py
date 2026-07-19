@@ -136,6 +136,7 @@ def _normalise_rule_splits(rule: dict) -> list[dict]:
         normalised.append({
             "expense_account": split.get("expense_account"),
             "tracking": _normalise_tracking(split.get("tracking")),
+            "vat_treatment": split.get("vat_treatment"),
             "percent": percent,
             "note": split.get("note"),
             "sort_order": int(split.get("sort_order") or index),
@@ -167,6 +168,8 @@ def _apply_allocation_rule_to_line(item: dict, rule: dict) -> dict:
     base_tracking = _normalise_tracking(item.get("tracking"))
     if first_split.get("expense_account"):
         updated["expense_account"] = first_split.get("expense_account")
+    if len(splits) == 1 and first_split.get("vat_treatment"):
+        updated["vat_treatment"] = first_split.get("vat_treatment")
     updated["tracking"] = {
         **base_tracking,
         **_normalise_tracking(first_split.get("tracking")),
@@ -182,6 +185,7 @@ def _apply_allocation_rule_to_line(item: dict, rule: dict) -> dict:
                     **base_tracking,
                     **_normalise_tracking(split.get("tracking")),
                 },
+                "vat_treatment": split.get("vat_treatment"),
                 "amount": amounts[index],
                 "percent": split.get("percent"),
                 "note": split.get("note") or rule.get("name"),
@@ -397,8 +401,21 @@ def apply_supplier_processing_rules(
         total_amount = numeric_amount(parsed_data.get("total_amount"))
         default_vat_rate = numeric_amount(settings.get("default_vat_rate"))
 
-        if tax_amount is not None and subtotal and subtotal > 0:
+        printed_subtotal_is_consistent = (
+            tax_amount is not None
+            and subtotal is not None
+            and total_amount is not None
+            and abs((subtotal + tax_amount) - total_amount) <= 0.02
+        )
+        derived_subtotal = (
+            total_amount - tax_amount
+            if tax_amount is not None and total_amount is not None and total_amount > tax_amount
+            else None
+        )
+        if printed_subtotal_is_consistent and subtotal and subtotal > 0:
             vat_rate = round((tax_amount / subtotal) * 10000) / 10000
+        elif tax_amount is not None and derived_subtotal and derived_subtotal > 0:
+            vat_rate = round((tax_amount / derived_subtotal) * 10000) / 10000
         elif default_vat_rate is not None:
             vat_rate = default_vat_rate / 100
         else:
@@ -409,6 +426,18 @@ def apply_supplier_processing_rules(
             line_total_sum is not None
             and subtotal is not None
             and abs(line_total_sum - subtotal) <= 0.02
+            and (
+                tax_amount in (None, 0)
+                or total_amount is None
+                or printed_subtotal_is_consistent
+            )
+        )
+        line_items_match_inclusive_total = (
+            tax_amount is not None
+            and tax_amount > 0
+            and line_total_sum is not None
+            and total_amount is not None
+            and abs(line_total_sum - total_amount) <= 0.02
         )
         # Don't strip only if the line sum significantly exceeds the invoice total —
         # that would imply items are already ex-VAT and the total is wrong.
@@ -418,7 +447,10 @@ def apply_supplier_processing_rules(
             and total_amount is not None
             and line_total_sum > total_amount + 0.50
         )
-        should_strip_line_items = not line_items_already_ex_vat and not line_sum_exceeds_total
+        should_strip_line_items = (
+            line_items_match_inclusive_total
+            or (not line_items_already_ex_vat and not line_sum_exceeds_total)
+        )
 
         if should_strip_line_items:
             stripped: list[dict] = []
@@ -428,6 +460,10 @@ def apply_supplier_processing_rules(
                 except (TypeError, ValueError, ZeroDivisionError):
                     stripped.append(item)
             line_items = stripped
+            stripped_sum = _sum_line_totals(line_items)
+            if stripped_sum is not None and total_amount is not None:
+                invoice_patch["subtotal"] = stripped_sum
+                invoice_patch["tax_amount"] = round(total_amount - stripped_sum, 2)
 
     if default_expense_account:
         invoice_patch["expense_account"] = default_expense_account

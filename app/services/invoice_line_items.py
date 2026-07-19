@@ -111,6 +111,7 @@ def _normalise_allocations(item: dict) -> list[dict]:
         allocations.append({
             "expense_account": allocation.get("expense_account"),
             "tracking": _normalise_tracking(allocation.get("tracking")),
+            "vat_treatment": allocation.get("vat_treatment"),
             "amount": amount,
             "percent": allocation.get("percent"),
             "note": allocation.get("note"),
@@ -162,6 +163,7 @@ def _build_allocation_payloads(
                 "organisation_id": organisation_id,
                 "expense_account": allocation.get("expense_account"),
                 "tracking": allocation.get("tracking") or {},
+                "vat_treatment": allocation.get("vat_treatment"),
                 "amount": allocation.get("amount"),
                 "percent": allocation.get("percent"),
                 "note": allocation.get("note"),
@@ -207,6 +209,8 @@ def _enrich_vat_treatment(supabase, organisation_id: Optional[str], payload: lis
                 by_name[acc["name"]] = treatment
 
         for row in payload:
+            if row.get("vat_treatment"):
+                continue
             acc_val = row.get("expense_account")
             if not acc_val:
                 continue
@@ -269,6 +273,7 @@ def replace_invoice_line_items(
             )
             if allocation_payload:
                 try:
+                    _enrich_vat_treatment(supabase, organisation_id, allocation_payload)
                     allocation_res = (
                         supabase
                         .table("invoice_line_item_allocations")

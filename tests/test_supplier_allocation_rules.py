@@ -62,7 +62,12 @@ def test_list_supplier_allocation_rules_404_org_mismatch(monkeypatch):
 # ── create_supplier_allocation_rule ─────────────────────────────────────────
 
 def test_create_supplier_allocation_rule_inserts(monkeypatch):
-    db = MemoryDB({TABLE: []})
+    db = MemoryDB({
+        TABLE: [],
+        "supplier_line_item_allocation_rule_splits": [],
+        "tracking_dimensions": [{"id": "division", "organisation_id": "org-1", "name": "Company Division", "active": True}],
+        "tracking_values": [{"id": "division-jhb", "dimension_id": "division", "name": "Johannesburg", "active": True}],
+    })
     monkeypatch.setattr(ar, "supabase", db)
     monkeypatch.setattr(ar, "_org_for_supplier", lambda _: "org-1")
     monkeypatch.setattr(ar, "ensure_org_write", lambda *_: None)
@@ -74,12 +79,60 @@ def test_create_supplier_allocation_rule_inserts(monkeypatch):
         organisation_id="org-1",
         supplier_id="sup-1",
         name="Rent",
+        splits=[{
+            "expense_account": "6000",
+            "tracking": {"division": "division-jhb"},
+            "vat_treatment": "full",
+            "percent": 100,
+        }],
     )
     result = ar.create_supplier_allocation_rule("sup-1", payload, AUTH)
 
     assert result["success"] is True
     assert len(db.tables[TABLE]) == 1
     assert db.tables[TABLE][0]["name"] == "Rent"
+    saved_split = db.tables["supplier_line_item_allocation_rule_splits"][0]
+    assert saved_split["tracking"] == {"division": "division-jhb"}
+    assert saved_split["vat_treatment"] == "full"
+
+
+def test_allocation_rule_options_include_tracking_and_vat(monkeypatch):
+    db = MemoryDB({
+        "tracking_dimensions": [{"id": "division", "organisation_id": "org-1", "name": "Company Division", "position": 1, "active": True}],
+        "tracking_values": [{"id": "division-cpt", "dimension_id": "division", "name": "Cape Town", "active": True}],
+        "accounts": [{"id": "account-1", "organisation_id": "org-1", "code": "6000", "name": "Rent", "type": "expense", "active": True, "vat_treatment": "full"}],
+    })
+    monkeypatch.setattr(ar, "_org_for_supplier", lambda _: "org-1")
+    monkeypatch.setattr(ar, "ensure_org_read", lambda *_: None)
+
+    result = ar.get_supplier_allocation_rule_options("sup-1", "org-1", ("user-1", db))
+
+    assert result["tracking_dimensions"][0]["name"] == "Company Division"
+    assert result["tracking_dimensions"][0]["values"][0]["name"] == "Cape Town"
+    assert {option["value"] for option in result["vat_treatments"]} == {"full", "blocked", "zero_rated", "exempt"}
+    assert result["accounts"][0]["vat_treatment"] == "full"
+
+
+def test_create_rejects_tracking_value_from_wrong_dimension(monkeypatch):
+    db = MemoryDB({
+        TABLE: [],
+        "tracking_dimensions": [{"id": "division", "organisation_id": "org-1", "name": "Company Division", "position": 1, "active": True}],
+        "tracking_values": [{"id": "other-value", "dimension_id": "other", "name": "Wrong", "active": True}],
+    })
+    monkeypatch.setattr(ar, "supabase", db)
+    monkeypatch.setattr(ar, "_org_for_supplier", lambda _: "org-1")
+    monkeypatch.setattr(ar, "ensure_org_write", lambda *_: None)
+
+    from app.routers.suppliers import SupplierAllocationRuleRequest
+
+    payload = SupplierAllocationRuleRequest(
+        organisation_id="org-1",
+        supplier_id="sup-1",
+        name="Invalid tracking",
+        splits=[{"tracking": {"division": "other-value"}, "percent": 100}],
+    )
+    with pytest.raises(HTTPException, match="tracking allocation"):
+        ar.create_supplier_allocation_rule("sup-1", payload, AUTH)
 
 
 def test_create_supplier_allocation_rule_400_org_mismatch(monkeypatch):

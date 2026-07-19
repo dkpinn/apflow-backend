@@ -164,6 +164,10 @@ If KYC screens are enabled, use them to request, track, and review supplier docu
 
 Supplier allocation rules help APPayPal suggest the correct expense account or tracking treatment for future invoices. Use them when a supplier's invoices normally belong to the same account or department.
 
+Each rule contains one or more allocation splits whose percentages must total 100%. A split selects an expense account, optional tracking values (for example Company Division), and an optional VAT treatment. Leaving VAT treatment unset inherits the selected account's VAT treatment. Full VAT is claimed when the supplier is VAT registered; blocked VAT is added to the expense; zero-rated and exempt splits receive no VAT.
+
+The allocation-rule editor loads its choices from `GET /api/suppliers/{supplier_id}/allocation-rule-options?organisation_id={organisation_id}`. The response contains active `tracking_dimensions` with their active values, the supported `vat_treatments`, and active accounts with their default VAT treatment. Rule create and update payloads store `tracking` as a dimension-ID to value-ID map and `vat_treatment` on each split.
+
 ## Bank/Cash
 
 The Bank/Cash area is used to create bank accounts, upload bank statements, review extracted transactions, and post balanced journals.

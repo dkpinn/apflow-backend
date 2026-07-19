@@ -16,6 +16,7 @@ from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
 from app.services.audit_log import log_invoice_event
 from app.services.invoice_supplier_rules import fetch_supplier_allocation_rules
 from app.services.supplier_service import get_extracted_invoice
+from app.services.tracking_dimensions import list_tracking_dimensions
 
 from app.routers.suppliers import (
     SupplierAllocationRuleRequest,
@@ -74,11 +75,70 @@ def _normalise_allocation_split_payloads(
                 for key, value in (row.get("tracking") or {}).items()
                 if value not in (None, "")
             },
+            "vat_treatment": row.get("vat_treatment"),
             "percent": percent,
             "note": row.get("note"),
             "sort_order": row.get("sort_order") if row.get("sort_order") is not None else index,
         })
     return payload
+
+
+def _validate_rule_splits(db, *, organisation_id: str, splits: list[SupplierAllocationRuleSplitRequest]) -> None:
+    if not splits:
+        raise HTTPException(status_code=422, detail="Add at least one allocation split")
+    total = round(sum(float(split.percent or 0) for split in splits), 4)
+    if abs(total - 100) > 0.0001:
+        raise HTTPException(status_code=422, detail="Allocation split percentages must total 100")
+
+    dimensions = list_tracking_dimensions(db, organisation_id=organisation_id)
+    values_by_dimension = {
+        str(dimension["id"]): {
+            str(value["id"])
+            for value in dimension.get("values") or []
+            if value.get("active") is not False
+        }
+        for dimension in dimensions
+    }
+    for split in splits:
+        for dimension_id, value_id in (split.tracking or {}).items():
+            if str(value_id) not in values_by_dimension.get(str(dimension_id), set()):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Every tracking allocation must use an active value from an active organisation dimension",
+                )
+
+
+@router.get("/{supplier_id}/allocation-rule-options")
+def get_supplier_allocation_rule_options(
+    supplier_id: str,
+    organisation_id: str = Query(...),
+    auth: UserAuth = ...,
+):
+    user_id, db = auth
+    supplier_org = _org_for_supplier(supplier_id)
+    if supplier_org and supplier_org != organisation_id:
+        raise HTTPException(status_code=404, detail="Supplier not found")
+    ensure_org_read(user_id, organisation_id)
+    dimensions = list_tracking_dimensions(db, organisation_id=organisation_id)
+    accounts = (
+        db.table("accounts")
+        .select("id, code, name, type, active, vat_treatment")
+        .eq("organisation_id", organisation_id)
+        .eq("active", True)
+        .execute()
+        .data
+        or []
+    )
+    return {
+        "tracking_dimensions": dimensions,
+        "vat_treatments": [
+            {"value": "full", "label": "Full input VAT claim"},
+            {"value": "blocked", "label": "Blocked VAT (expense it)"},
+            {"value": "zero_rated", "label": "Zero-rated (0%)"},
+            {"value": "exempt", "label": "Exempt / no VAT"},
+        ],
+        "accounts": accounts,
+    }
 
 
 def _rule_with_splits(rule: dict) -> dict:
@@ -119,6 +179,7 @@ def _splits_from_line_item(line_item: dict, allocations: list[dict]) -> list[Sup
             SupplierAllocationRuleSplitRequest(
                 expense_account=allocation.get("expense_account") or line_item.get("expense_account"),
                 tracking=allocation.get("tracking") or line_item.get("tracking") or {},
+                vat_treatment=allocation.get("vat_treatment") or line_item.get("vat_treatment"),
                 percent=float(
                     allocation.get("percent")
                     or (
@@ -139,6 +200,7 @@ def _splits_from_line_item(line_item: dict, allocations: list[dict]) -> list[Sup
         SupplierAllocationRuleSplitRequest(
             expense_account=line_item.get("expense_account"),
             tracking=line_item.get("tracking") or {},
+            vat_treatment=line_item.get("vat_treatment"),
             percent=100,
             sort_order=0,
         )
@@ -175,6 +237,7 @@ def create_supplier_allocation_rule(
     if supplier_id != payload.supplier_id:
         raise HTTPException(status_code=400, detail="Supplier id mismatch")
     ensure_org_write(user_id, payload.organisation_id)
+    _validate_rule_splits(supabase, organisation_id=payload.organisation_id, splits=payload.splits)
 
     insert_payload = _normalise_allocation_rule_payload(payload.model_dump(exclude={"splits"}))
     if not insert_payload.get("name"):
@@ -230,6 +293,7 @@ def update_supplier_allocation_rule(
         rule = res.data[0] if res.data else None
 
     if payload.splits is not None:
+        _validate_rule_splits(supabase, organisation_id=organisation_id, splits=payload.splits)
         supabase.table("supplier_line_item_allocation_rule_splits").delete().eq("rule_id", rule_id).execute()
         split_payload = _normalise_allocation_split_payloads(
             rule_id=rule_id,

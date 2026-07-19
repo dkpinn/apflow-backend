@@ -49,12 +49,33 @@ def build_invoice_debit_lines(
         f"{invoice.get('supplier_name_extracted') or 'Supplier'} "
         f"- {invoice.get('invoice_number') or invoice_id[:8]}"
     )
+    vat_units: list[dict] = []
+    for line_item in line_items:
+        line_id = str(line_item.get("id") or "")
+        allocations = allocations_by_line.get(line_id, [])
+        if not allocations:
+            vat_units.append({**line_item, "id": f"line:{line_id}"})
+            continue
+        explicit_tax = line_item.get("tax_amount")
+        explicit_shares = (
+            allocate_amount_by_weights(explicit_tax, [row.get("amount") for row in allocations])
+            if explicit_tax not in (None, "")
+            else [None] * len(allocations)
+        )
+        for index, allocation in enumerate(allocations):
+            vat_units.append({
+                "id": f"allocation:{line_id}:{index}",
+                "line_total": allocation.get("amount"),
+                "tax_amount": explicit_shares[index],
+                "vat_treatment": allocation.get("vat_treatment") or line_item.get("vat_treatment") or "full",
+            })
+
     vat_allocation = allocate_invoice_vat(
         invoice_tax=invoice.get("tax_amount"),
-        line_items=line_items,
+        line_items=vat_units,
         supplier_has_vat_number=supplier_has_vat_number,
     )
-    vat_by_line_id = {
+    vat_by_unit_id = {
         str(row.get("line_id")): row
         for row in vat_allocation["line_allocations"]
         if row.get("line_id")
@@ -68,24 +89,20 @@ def build_invoice_debit_lines(
         line_desc = line_item.get("description") or "Invoice line"
         allocations = allocations_by_line.get(str(line_item.get("id")), [])
         tracking = line_item.get("tracking") or {}
-        line_vat = vat_by_line_id.get(str(line_item.get("id"))) or {}
+        line_vat = vat_by_unit_id.get(f"line:{line_item.get('id')}") or {}
         blocked_line_vat = line_vat.get("blocked_tax") or 0
 
         if allocations:
-            blocked_shares = allocate_amount_by_weights(
-                blocked_line_vat,
-                [allocation.get("amount") for allocation in allocations],
-            )
             for allocation_index, allocation in enumerate(allocations):
                 account_id = allocation.get("expense_account")
                 if not account_id:
                     missing_accounts.append(f"{line_desc} (split)")
                     continue
-                blocked_share = (
-                    blocked_shares[allocation_index]
-                    if allocation_index < len(blocked_shares)
-                    else 0
+                allocation_vat = vat_by_unit_id.get(
+                    f"allocation:{line_item.get('id')}:{allocation_index}",
+                    {},
                 )
+                blocked_share = allocation_vat.get("blocked_tax") or 0
                 amount = round(
                     float(allocation.get("amount") or 0) + float(blocked_share),
                     2,

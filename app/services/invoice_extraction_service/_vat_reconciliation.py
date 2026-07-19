@@ -23,6 +23,10 @@ def _auto_reconcile_vat(parsed_data: dict, vat_rate: float = 0.15) -> None:
     doc_total_raw = parsed_data.get("total_amount")
     line_items = parsed_data.get("line_items") or []
     vat_number = parsed_data.get("vat_number_extracted")
+    try:
+        explicit_tax = float(parsed_data.get("tax_amount") or 0)
+    except (TypeError, ValueError):
+        explicit_tax = 0.0
 
     if not doc_total_raw or not line_items:
         return
@@ -37,7 +41,7 @@ def _auto_reconcile_vat(parsed_data: dict, vat_rate: float = 0.15) -> None:
         return
 
     # Case 1: No VAT number → non-VAT supplier, use line totals as-is
-    if not vat_number:
+    if not vat_number and explicit_tax <= 0:
         parsed_data["prices_include_vat_detected"] = None  # not applicable, not a DB enum value
         parsed_data["subtotal"] = round(line_sum, 2)
         parsed_data["tax_amount"] = 0.0
@@ -45,17 +49,24 @@ def _auto_reconcile_vat(parsed_data: dict, vat_rate: float = 0.15) -> None:
 
     TOLERANCE = 0.03  # 3%
 
+    # Registration controls whether input VAT may be claimed later. It must not
+    # override tax explicitly printed on the invoice or distort its arithmetic.
+    effective_vat_rate = vat_rate
+    derived_subtotal = doc_total - explicit_tax
+    if explicit_tax > 0 and derived_subtotal > 0:
+        effective_vat_rate = explicit_tax / derived_subtotal
+
     # Case 2: Prices inclusive (SUM ≈ doc_total)
     diff_inclusive = abs(line_sum - doc_total) / doc_total
 
     # Case 3: Prices exclusive (SUM × (1+rate) ≈ doc_total)
-    diff_exclusive = abs(line_sum * (1 + vat_rate) - doc_total) / doc_total
+    diff_exclusive = abs(line_sum * (1 + effective_vat_rate) - doc_total) / doc_total
 
     if diff_inclusive <= diff_exclusive and diff_inclusive < TOLERANCE:
         # VAT-INCLUSIVE: strip VAT from printed prices → store ex-VAT
         parsed_data["prices_include_vat_detected"] = "inclusive"
         new_items = []
-        scale = Decimal(str(1 + vat_rate))
+        scale = Decimal(str(1 + effective_vat_rate))
         for it in line_items:
             raw_total = float(it.get("line_total") or 0)
             ex_total = round(float(Decimal(str(raw_total)) / scale), 2)

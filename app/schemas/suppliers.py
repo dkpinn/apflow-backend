@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -145,6 +145,7 @@ class SupplierBranchUnlinkRequest(BaseModel):
 class SupplierAllocationRuleSplitRequest(BaseModel):
     expense_account: Optional[str] = None
     tracking: dict[str, Any] = {}
+    vat_treatment: Optional[Literal["full", "blocked", "exempt", "zero_rated"]] = None
     percent: float = 100
     note: Optional[str] = None
     sort_order: int = 0
@@ -208,4 +209,3 @@ class SupplierKycDocumentCreate(BaseModel):
     file_size: Optional[int] = None
     mime_type: Optional[str] = None
     notes: Optional[str] = None
-

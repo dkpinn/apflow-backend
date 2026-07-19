@@ -8,6 +8,7 @@ ZERO = Decimal("0.00")
 
 PENDING_STATUSES = {"pending", "needs_info", "in_review"}
 ALL_STATUSES = {"pending", "needs_info", "in_review", "approved", "ignored"}
+STATEMENT_DOCUMENT_TYPES = {"statement", "supplier_statement", "account_statement"}
 
 
 def _d(v: Any) -> Decimal:
@@ -15,6 +16,11 @@ def _d(v: Any) -> Decimal:
         return Decimal(str(v or 0)).quantize(MONEY, rounding=ROUND_HALF_UP)
     except Exception:
         return ZERO
+
+
+def is_statement_document_type(value: Any) -> bool:
+    normalised = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return normalised in STATEMENT_DOCUMENT_TYPES
 
 
 def list_review_items(
@@ -42,7 +48,6 @@ def list_review_items(
         )
         .eq("organisation_id", organisation_id)
         .order("invoice_date", desc=True)
-        .limit(limit)
     )
 
     if filter_status == "pending":
@@ -54,7 +59,11 @@ def list_review_items(
     else:
         query = query.neq("posting_status", "posted")
 
-    rows = query.execute().data or []
+    rows = [
+        row
+        for row in (query.execute().data or [])
+        if not is_statement_document_type(row.get("document_type"))
+    ][:limit]
 
     out = []
     for row in rows:
@@ -83,13 +92,15 @@ def get_review_counts(db, organisation_id: str) -> dict:
     try:
         rows = (
             db.table("invoices_extracted")
-            .select("review_status")
+            .select("review_status, document_type")
             .eq("organisation_id", organisation_id)
             .neq("posting_status", "posted")
             .execute()
             .data or []
         )
         for row in rows:
+            if is_statement_document_type(row.get("document_type")):
+                continue
             rs = (row.get("review_status") or "pending").lower()
             if rs in ("pending", "in_review"):
                 counts["pending"] += 1

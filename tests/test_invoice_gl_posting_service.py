@@ -159,6 +159,20 @@ def test_prepared_journal_is_the_complete_vat_aware_posting_preview():
     ]
 
 
+def test_split_level_vat_treatment_claims_and_expenses_mixed_vat():
+    tables = _tables(allocations=[
+        {"invoice_line_item_id": "line-1", "organisation_id": "org-1", "expense_account": "6000", "amount": 70, "percent": 70, "vat_treatment": "full", "tracking": {}, "sort_order": 0},
+        {"invoice_line_item_id": "line-1", "organisation_id": "org-1", "expense_account": "6000", "amount": 30, "percent": 30, "vat_treatment": "blocked", "tracking": {}, "sort_order": 1},
+    ])
+
+    prepared = prepare_invoice_gl_posting(_DB(tables), invoice_id="invoice-1", org_id="org-1")
+
+    expense_lines = [row for row in prepared["journal_lines"] if row["account_id"] == "expense-id"]
+    assert [row["debit_amount"] for row in expense_lines] == [70.0, 34.5]
+    vat_line = next(row for row in prepared["journal_lines"] if row["account_id"] == "vat-id")
+    assert vat_line["debit_amount"] == 10.5
+
+
 def test_supplier_invoice_vat_is_expensed_before_vat_registration_date():
     tables = _tables()
     tables["organisations"][0]["vat_registration_date"] = "2026-07-01"

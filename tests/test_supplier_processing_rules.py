@@ -329,6 +329,43 @@ def test_supplier_allocation_rule_inherits_default_tracking_and_overrides_select
     assert item["allocations"][0]["tracking"] == item["tracking"]
 
 
+def test_supplier_allocation_rule_applies_vat_treatment_per_split():
+    result = apply_supplier_processing_rules(
+        {"document_type": "tax_invoice", "line_items": [{"description": "Mixed expense", "line_total": 100}]},
+        {"allocation_rules": [{
+            "id": "mixed-vat",
+            "name": "Mixed VAT",
+            "active": True,
+            "match_type": "all_lines",
+            "splits": [
+                {"expense_account": "6000", "vat_treatment": "full", "percent": 70},
+                {"expense_account": "6100", "vat_treatment": "blocked", "percent": 30},
+            ],
+        }]},
+    )
+
+    assert [row["vat_treatment"] for row in result["line_items"][0]["allocations"]] == ["full", "blocked"]
+
+
+def test_inclusive_line_is_stripped_when_extracted_subtotal_incorrectly_equals_grand_total():
+    parsed = {
+        "subtotal": 22000.0,
+        "tax_amount": 2869.57,
+        "total_amount": 22000.0,
+        "line_items": [{
+            "description": "Consulting Fees Income",
+            "quantity": 1,
+            "unit_price": 22000.0,
+            "line_total": 22000.0,
+        }],
+    }
+
+    result = apply_supplier_processing_rules(parsed, {"line_items_include_vat": True})
+
+    assert result["line_items"][0]["line_total"] == 19130.43
+    assert result["invoice_patch"] == {"subtotal": 19130.43, "tax_amount": 2869.57}
+
+
 def test_supplier_allocation_rule_respects_document_scope_and_priority():
     parsed = {
         "supplier_name_extracted": "Example Supplier",
