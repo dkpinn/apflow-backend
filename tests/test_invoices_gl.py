@@ -11,7 +11,7 @@ from fastapi import HTTPException
 
 import app.routers.invoices_gl as gl
 import app.services.invoice_gl_posting as gl_svc
-from tests.conftest import StubDB
+from tests.conftest import MemoryDB, StubDB
 
 
 AUTH = ("user-1", None)
@@ -32,6 +32,68 @@ def _prepared(gross_total=500.0):
 def _payload():
     from app.routers.invoices_gl import PostInvoiceToGLRequest
     return PostInvoiceToGLRequest(organisation_id="org-1")
+
+
+def test_confirmed_approval_resolves_extraction_direction_before_readiness(monkeypatch):
+    db = MemoryDB({
+        "invoices_extracted": [{
+            "id": "inv-1",
+            "invoice_raw_id": "raw-1",
+            "organisation_id": "org-1",
+            "supplier_id": "supplier-1",
+            "document_direction": "unknown",
+            "organisation_match_status": "selected_org_not_found",
+            "validation_status": "needs_review",
+            "validation_notes": "Could not confidently detect issuer or recipient.",
+        }],
+        "invoice_audit_events": [],
+    })
+    monkeypatch.setattr(gl, "supabase", db)
+
+    def _readiness_after_confirmation(database, **_kwargs):
+        invoice = database.tables["invoices_extracted"][0]
+        assert invoice["document_direction"] == "supplier_invoice_payable"
+        assert invoice["organisation_match_status"] == "manually_confirmed_supplier_payable"
+        assert invoice["validation_status"] == "passed"
+        return {"ready": True, "blockers": []}
+
+    monkeypatch.setattr(gl, "evaluate_invoice_readiness", _readiness_after_confirmation)
+    monkeypatch.setattr(gl, "_handle_invoice_approval_workflow", lambda **_kw: None)
+    monkeypatch.setattr(gl, "_enforce_user_limits", lambda **_kw: None)
+    monkeypatch.setattr(gl_svc, "prepare_invoice_gl_posting", lambda db, **_kw: _prepared())
+    monkeypatch.setattr(gl_svc, "post_invoice_to_gl_service", lambda db, **_kw: {"success": True, "journal_id": "jnl-1"})
+
+    payload = gl.PostInvoiceToGLRequest(
+        organisation_id="org-1",
+        confirm_extraction_review=True,
+    )
+    result = gl.post_invoice_to_gl("inv-1", payload, auth=AUTH)
+
+    assert result["success"] is True
+    assert db.tables["invoice_audit_events"][0]["event_type"] == "supplier_payable_manually_confirmed"
+
+
+def test_confirmed_approval_still_requires_a_linked_supplier(monkeypatch):
+    db = MemoryDB({
+        "invoices_extracted": [{
+            "id": "inv-1",
+            "organisation_id": "org-1",
+            "supplier_id": None,
+            "document_direction": "unknown",
+            "validation_status": "needs_review",
+        }],
+    })
+    monkeypatch.setattr(gl, "supabase", db)
+    payload = gl.PostInvoiceToGLRequest(
+        organisation_id="org-1",
+        confirm_extraction_review=True,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        gl.post_invoice_to_gl("inv-1", payload, auth=AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert "Link a supplier" in exc_info.value.detail
 
 
 # ── Happy path ───────────────────────────────────────────────────────────────

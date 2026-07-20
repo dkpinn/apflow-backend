@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from app.db.supabase_client import get_supabase_client
 from app.dependencies import UserAuth
+from app.services.audit_log import log_invoice_event
 from app.services.invoice_readiness import evaluate_invoice_readiness
 
 router = APIRouter(prefix="/api/invoices", tags=["invoices"])
@@ -23,6 +24,7 @@ except Exception:
 
 class PostInvoiceToGLRequest(BaseModel):
     organisation_id: str
+    confirm_extraction_review: bool = False
 
 
 # ── Private helpers ────────────────────────────────────────────────────────────
@@ -30,6 +32,65 @@ class PostInvoiceToGLRequest(BaseModel):
 def _now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+def _confirm_extraction_review_for_post(
+    db,
+    *,
+    invoice_id: str,
+    organisation_id: str,
+    user_id: str,
+) -> None:
+    result = (
+        db.table("invoices_extracted")
+        .select(
+            "id, invoice_raw_id, supplier_id, document_direction, "
+            "organisation_match_status, validation_status, validation_notes"
+        )
+        .eq("id", invoice_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        raise ValueError("Invoice not found")
+    invoice = result.data[0]
+    if not invoice.get("supplier_id"):
+        raise ValueError("Link a supplier before confirming this invoice for posting")
+
+    old_value = {
+        "document_direction": invoice.get("document_direction"),
+        "organisation_match_status": invoice.get("organisation_match_status"),
+        "validation_status": invoice.get("validation_status"),
+        "validation_notes": invoice.get("validation_notes"),
+    }
+    new_value = {
+        "document_direction": "supplier_invoice_payable",
+        "organisation_match_status": "manually_confirmed_supplier_payable",
+        "validation_status": "passed",
+        "validation_notes": "Confirmed as supplier payable during invoice approval.",
+    }
+    (
+        db.table("invoices_extracted")
+        .update(new_value)
+        .eq("id", invoice_id)
+        .eq("organisation_id", organisation_id)
+        .execute()
+    )
+    log_invoice_event(
+        db,
+        organisation_id=organisation_id,
+        invoice_raw_id=invoice.get("invoice_raw_id"),
+        invoice_extracted_id=invoice_id,
+        event_type="supplier_payable_manually_confirmed",
+        stage="approval",
+        field_name="document_direction",
+        old_value=old_value,
+        new_value=new_value,
+        actor_type="user",
+        actor_user_id=user_id,
+        notes="User explicitly approved the reviewed document as a supplier payable.",
+    )
 
 
 def _fetch_org_role(user_id: str, organisation_id: str) -> str | None:
@@ -370,6 +431,17 @@ def post_invoice_to_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: U
 
     if supabase is None:
         raise HTTPException(status_code=500, detail="Database not configured")
+
+    if payload.confirm_extraction_review:
+        try:
+            _confirm_extraction_review_for_post(
+                supabase,
+                invoice_id=invoice_id,
+                organisation_id=org_id,
+                user_id=user_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     readiness = evaluate_invoice_readiness(
         supabase,
