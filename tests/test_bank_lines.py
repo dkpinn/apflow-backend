@@ -440,6 +440,109 @@ def test_review_bank_line_accepts_supplier_invoice_suggestion(monkeypatch):
     assert line["review_status"] == "reviewed"
 
 
+def test_reject_invoice_match_persists_status_and_audit(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row()],
+        "bank_transaction_suggestions": [{
+            "id": SUGGESTION_ID,
+            "organisation_id": ORG_ID,
+            "bank_statement_line_id": LINE_ID,
+            "suggestion_type": "supplier_invoice",
+            "matched_invoice_id": INVOICE_ID,
+            "status": "open",
+        }],
+        "bank_audit_events": [],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+
+    from app.routers.bank import ExtractUploadRequest
+    result = bl.reject_invoice_match(
+        SUGGESTION_ID,
+        ExtractUploadRequest(organisation_id=ORG_ID),
+        AUTH,
+    )
+
+    assert result == {"success": True, "status": "rejected"}
+    assert db.tables["bank_transaction_suggestions"][0]["status"] == "rejected"
+    assert db.tables["bank_audit_events"][0]["event_type"] == "bank_invoice_match_rejected"
+
+
+def test_refresh_does_not_resuggest_a_rejected_invoice_pair(monkeypatch):
+    rejected = {
+        "id": SUGGESTION_ID,
+        "organisation_id": ORG_ID,
+        "bank_statement_line_id": LINE_ID,
+        "suggestion_type": "supplier_invoice",
+        "matched_invoice_id": INVOICE_ID,
+        "status": "rejected",
+    }
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row()],
+        "bank_statement_uploads": [_upload_row()],
+        "bank_statement_gold_files": [],
+        "bank_statement_extraction_runs": [],
+        "bank_transaction_suggestions": [rejected],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bl, "score_invoice_suggestions", lambda *_a, **_kw: [{
+        "suggestion_type": "supplier_invoice",
+        "matched_invoice_id": INVOICE_ID,
+        "matched_invoice_number": "INV-580",
+        "confidence_score": 0.9,
+    }])
+    monkeypatch.setattr(bl, "score_rule_suggestions", lambda *_a, **_kw: [])
+
+    from app.routers.bank import ExtractUploadRequest
+    result = bl.suggest_bank_line(
+        LINE_ID,
+        ExtractUploadRequest(organisation_id=ORG_ID),
+        AUTH,
+    )
+
+    assert result["suggestions"] == []
+    assert db.tables["bank_transaction_suggestions"] == [rejected]
+
+
+def test_invoice_match_preview_returns_captured_invoice_and_lines(monkeypatch):
+    db = MemoryDB({
+        "bank_transaction_suggestions": [{
+            "id": SUGGESTION_ID,
+            "organisation_id": ORG_ID,
+            "bank_statement_line_id": LINE_ID,
+            "suggestion_type": "supplier_invoice",
+            "matched_invoice_id": INVOICE_ID,
+            "status": "open",
+        }],
+        "invoices_extracted": [{
+            "id": INVOICE_ID,
+            "organisation_id": ORG_ID,
+            "invoice_raw_id": "raw-1",
+            "invoice_number": "INV-580",
+            "supplier_name_extracted": "SM Caminsky",
+            "invoice_date": "2026-03-01",
+            "total_amount": 22000,
+        }],
+        "invoice_line_items": [{
+            "id": "item-1",
+            "organisation_id": ORG_ID,
+            "invoice_extracted_id": INVOICE_ID,
+            "description": "Consulting fees",
+            "line_total": 19130.43,
+        }],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bl, "ensure_org_read", lambda *_: None)
+
+    result = bl.get_invoice_match_preview(SUGGESTION_ID, ORG_ID, AUTH)
+
+    assert result["invoice"]["invoice_number"] == "INV-580"
+    assert result["invoice"]["supplier_name_extracted"] == "SM Caminsky"
+    assert result["line_items"][0]["description"] == "Consulting fees"
+
+
 def test_review_line_request_rejects_supplier_and_customer_together():
     from app.routers.bank import ReviewLineRequest
     with pytest.raises(ValueError):

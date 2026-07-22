@@ -163,7 +163,27 @@ def refresh_bank_account_suggestions(account_id: str, payload: ExtractUploadRequ
         == "extracted"
     ]
     line_ids = [str(line["id"]) for line in eligible_lines if line.get("id")]
+    rejected_keys_by_line: dict[str, set[tuple[str, str]]] = {}
     if line_ids:
+        rejected_rows = (
+            db.table("bank_transaction_suggestions")
+            .select(
+                "bank_statement_line_id, suggestion_type, matched_invoice_id, matched_sales_invoice_id"
+            )
+            .eq("organisation_id", organisation_id)
+            .in_("bank_statement_line_id", line_ids)
+            .eq("status", "rejected")
+            .execute()
+            .data
+            or []
+        )
+        for rejected in rejected_rows:
+            rejected_keys_by_line.setdefault(
+                str(rejected.get("bank_statement_line_id") or ""), set()
+            ).add((
+                str(rejected.get("suggestion_type") or ""),
+                str(rejected.get("matched_invoice_id") or rejected.get("matched_sales_invoice_id") or ""),
+            ))
         (
             db.table("bank_transaction_suggestions")
             .delete()
@@ -224,6 +244,14 @@ def refresh_bank_account_suggestions(account_id: str, payload: ExtractUploadRequ
             if money(line.get("signed_amount")) < 0
             else score_invoice_suggestions(db, organisation_id=organisation_id, line=line)
         )
+        rejected_keys = rejected_keys_by_line.get(line_id, set())
+        suggestions = [
+            suggestion for suggestion in suggestions
+            if (
+                str(suggestion.get("suggestion_type") or ""),
+                str(suggestion.get("matched_invoice_id") or suggestion.get("matched_sales_invoice_id") or ""),
+            ) not in rejected_keys
+        ]
         suggestions += score_rule_suggestions_from_rows(
             rules=rule_rows,
             bank_account_id=bank_account_id,

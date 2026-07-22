@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 
-from app.dependencies import UserAuth, ensure_org_write
+from app.dependencies import UserAuth, ensure_org_read, ensure_org_write
 from app.models.schemas import BulkAllocateRequest, LineSkipRequest
 from app.services.bank_statement_service import (
     default_rule_criteria_from_line,
@@ -92,7 +92,31 @@ def suggest_bank_line(line_id: str, payload: ExtractUploadRequest, auth: UserAut
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    rejected = (
+        db.table("bank_transaction_suggestions")
+        .select("suggestion_type, matched_invoice_id, matched_sales_invoice_id")
+        .eq("organisation_id", organisation_id)
+        .eq("bank_statement_line_id", line_id)
+        .eq("status", "rejected")
+        .execute()
+        .data
+        or []
+    )
+    rejected_keys = {
+        (
+            str(row.get("suggestion_type") or ""),
+            str(row.get("matched_invoice_id") or row.get("matched_sales_invoice_id") or ""),
+        )
+        for row in rejected
+    }
     suggestions = score_invoice_suggestions(db, organisation_id=organisation_id, line=line)
+    suggestions = [
+        suggestion for suggestion in suggestions
+        if (
+            str(suggestion.get("suggestion_type") or ""),
+            str(suggestion.get("matched_invoice_id") or suggestion.get("matched_sales_invoice_id") or ""),
+        ) not in rejected_keys
+    ]
     suggestions += score_rule_suggestions(
         db,
         organisation_id=organisation_id,
@@ -105,6 +129,86 @@ def suggest_bank_line(line_id: str, payload: ExtractUploadRequest, auth: UserAut
         db.table("bank_transaction_suggestions").insert(inserts).execute()
         db.table("bank_statement_lines").update({"match_status": "suggested"}).eq("id", line_id).execute()
     return {"success": True, "suggestions": inserts}
+
+
+@router.get("/suggestions/{suggestion_id}/invoice-preview")
+def get_invoice_match_preview(suggestion_id: str, organisation_id: str, auth: UserAuth):
+    user_id, db = _auth(auth)
+    ensure_org_read(user_id, organisation_id)
+    suggestion = _one(
+        db.table("bank_transaction_suggestions")
+        .select("*")
+        .eq("id", suggestion_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Invoice match suggestion not found",
+    )
+    invoice_id = suggestion.get("matched_invoice_id")
+    if not invoice_id:
+        raise HTTPException(status_code=400, detail="This suggestion is not a supplier invoice match")
+    invoice = _one(
+        db.table("invoices_extracted")
+        .select("*")
+        .eq("id", invoice_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Matched invoice not found",
+    )
+    line_items = (
+        db.table("invoice_line_items")
+        .select("id, description, quantity, unit_price, line_total, expense_account, tracking, vat_treatment")
+        .eq("invoice_extracted_id", invoice_id)
+        .eq("organisation_id", organisation_id)
+        .order("created_at")
+        .execute()
+        .data
+        or []
+    )
+    return {"suggestion": suggestion, "invoice": invoice, "line_items": line_items}
+
+
+@router.post("/suggestions/{suggestion_id}/reject")
+def reject_invoice_match(suggestion_id: str, payload: ExtractUploadRequest, auth: UserAuth):
+    user_id, db = _auth(auth)
+    organisation_id = str(payload.organisation_id)
+    ensure_org_write(user_id, organisation_id)
+    suggestion = _one(
+        db.table("bank_transaction_suggestions")
+        .select("*")
+        .eq("id", suggestion_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Invoice match suggestion not found",
+    )
+    if not (suggestion.get("matched_invoice_id") or suggestion.get("matched_sales_invoice_id")):
+        raise HTTPException(status_code=400, detail="Only invoice-match suggestions can be rejected")
+    db.table("bank_transaction_suggestions").update({
+        "status": "rejected",
+        "updated_at": now_iso(),
+    }).eq("id", suggestion_id).eq("organisation_id", organisation_id).execute()
+    line = _one(
+        db.table("bank_statement_lines")
+        .select("id, bank_account_id, bank_statement_upload_id")
+        .eq("id", suggestion["bank_statement_line_id"])
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute(),
+        "Bank statement line not found",
+    )
+    log_bank_event(
+        db,
+        organisation_id=organisation_id,
+        event_type="bank_invoice_match_rejected",
+        actor_user_id=user_id,
+        bank_account_id=line.get("bank_account_id"),
+        bank_statement_upload_id=line.get("bank_statement_upload_id"),
+        bank_statement_line_id=line.get("id"),
+        suggestion_id=suggestion_id,
+    )
+    return {"success": True, "status": "rejected"}
 
 
 @router.post("/lines/{line_id}/suggest-ai")

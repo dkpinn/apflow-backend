@@ -157,7 +157,7 @@ def get_unreconciled_lines_payload(
             .select(
                 "id, bank_statement_line_id, suggestion_type, confidence_score, "
                 "suggested_account_id, suggested_tax_treatment, matched_invoice_id, "
-                "matched_sales_invoice_id, matched_invoice_number"
+                "matched_sales_invoice_id, matched_invoice_number, rationale, evidence"
             )
             .eq("organisation_id", organisation_id)
             .in_("bank_statement_line_id", line_id_strs)
@@ -178,10 +178,32 @@ def get_unreconciled_lines_payload(
             if current is None or (suggestion_matches_invoice and not current_matches_invoice):
                 top_suggestion[line_id] = suggestion
 
+    supplier_invoice_ids = {
+        str(suggestion.get("matched_invoice_id"))
+        for suggestion in top_suggestion.values()
+        if suggestion.get("matched_invoice_id")
+    }
+    supplier_invoices_by_id: dict[str, dict[str, Any]] = {}
+    if supplier_invoice_ids:
+        invoice_rows = (
+            db.table("invoices_extracted")
+            .select(
+                "id, invoice_raw_id, invoice_number, invoice_date, due_date, total_amount, "
+                "currency, supplier_id, supplier_name_extracted"
+            )
+            .eq("organisation_id", organisation_id)
+            .in_("id", list(supplier_invoice_ids))
+            .execute()
+            .data
+            or []
+        )
+        supplier_invoices_by_id = {str(row.get("id")): row for row in invoice_rows}
+
     enriched = []
     for line in lines:
         upload = uploads_by_id.get(str(line.get("bank_statement_upload_id"))) or {}
         suggestion = top_suggestion.get(str(line.get("id") or ""), {})
+        matched_invoice = supplier_invoices_by_id.get(str(suggestion.get("matched_invoice_id") or ""), {})
         confidence = float(
             suggestion.get("confidence_score")
             or (0.75 if line.get("match_status") == "suggested" else 0.5)
@@ -197,6 +219,14 @@ def get_unreconciled_lines_payload(
             "recon_suggested_tax": suggestion.get("suggested_tax_treatment"),
             "recon_matched_invoice_id": suggestion.get("matched_invoice_id") or suggestion.get("matched_sales_invoice_id"),
             "recon_matched_invoice_ref": suggestion.get("matched_invoice_number") or line.get("matched_invoice_number"),
+            "recon_match_rationale": suggestion.get("rationale"),
+            "recon_match_evidence": suggestion.get("evidence") or {},
+            "recon_matched_supplier_name": matched_invoice.get("supplier_name_extracted"),
+            "recon_matched_invoice_date": matched_invoice.get("invoice_date"),
+            "recon_matched_invoice_due_date": matched_invoice.get("due_date"),
+            "recon_matched_invoice_total": matched_invoice.get("total_amount"),
+            "recon_matched_invoice_currency": matched_invoice.get("currency"),
+            "recon_matched_invoice_raw_id": matched_invoice.get("invoice_raw_id"),
         })
 
     balances = BankBalanceSummary.model_validate(
