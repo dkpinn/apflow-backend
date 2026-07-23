@@ -163,6 +163,19 @@ def test_account_unreconciled_endpoint_filters_org_account_status_and_enriches_u
             "bank_statement_gold_files": [],
             "bank_statement_extraction_runs": [],
             "bank_audit_events": [],
+            "invoices_extracted": [{
+                "id": "invoice-10415",
+                "organisation_id": "org-1",
+                "invoice_raw_id": "raw-10415",
+                "invoice_number": "10415",
+                "invoice_date": "2026-07-11",
+                "total_amount": 410.55,
+                "currency": "ZAR",
+                "supplier_name_extracted": "FlySafair",
+                "review_status": "pending",
+                "approval_status": "pending",
+                "posting_status": "unposted",
+            }],
             "bank_transaction_suggestions": [
                 {
                     "id": "suggestion-ai",
@@ -217,8 +230,30 @@ def test_account_unreconciled_endpoint_filters_org_account_status_and_enriches_u
     assert result["lines"][1]["recon_suggested_tax"] == "full"
     assert result["lines"][1]["recon_matched_invoice_id"] == "invoice-10415"
     assert result["lines"][1]["recon_matched_invoice_ref"] == "10415"
+    assert result["lines"][1]["recon_match_eligible"] is False
+    assert result["lines"][1]["recon_match_block_code"] == "invoice_not_posted"
+    assert result["lines"][1]["recon_matched_invoice_review_status"] == "pending"
+    assert result["lines"][1]["recon_matched_invoice_approval_status"] == "pending"
+    assert result["lines"][1]["recon_matched_invoice_posting_status"] == "unposted"
+    assert result["lines"][0]["recon_match_eligible"] is None
     assert result["blocked_extraction_line_count"] == 1
     assert result["blocked_extraction_upload_count"] == 1
+
+    # Eligibility is derived from the live invoice state, so a normal payload
+    # refresh unlocks the existing suggestion without regenerating matches.
+    invoice = db.tables["invoices_extracted"][0]
+    invoice.update({
+        "review_status": "approved",
+        "approval_status": "approved",
+        "posting_status": "posted",
+    })
+    refreshed = bank.list_bank_account_unreconciled_lines(
+        "bank-1", "org-1", auth=("user-1", None)
+    )
+    refreshed_pending = next(line for line in refreshed["lines"] if line["id"] == "pending")
+    assert refreshed_pending["recon_suggestion_id"] == "suggestion-high"
+    assert refreshed_pending["recon_match_eligible"] is True
+    assert refreshed_pending["recon_match_block_code"] is None
 
 
 def test_account_unreconciled_endpoint_rejects_account_from_other_org(monkeypatch):

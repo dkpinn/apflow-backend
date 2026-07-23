@@ -92,6 +92,29 @@ def _post_payload():
     return bj.PostJournalRequest(organisation_id=ORG_UUID)
 
 
+def test_list_posted_bank_lines_replaces_serialized_description_with_reference(monkeypatch):
+    serialized = (
+        "{'Date': '15 Jul 2026', 'Reference': 'oThongathi TapnGo 485442*5359 13 JUL', "
+        "'Source': 'Bank Feed', 'Amount': '(15.50)'}"
+    )
+    db = MemoryDB({
+        "bank_statement_lines": [{
+            **_line(posting_status="posted"),
+            "line_date": "2026-07-15",
+            "description": serialized,
+            "reference": "oThongathi TapnGo 485442*5359 13 JUL",
+            "counterparty": None,
+            "gl_journal_id": "journal-1",
+        }],
+    })
+    monkeypatch.setattr(bj, "_auth", _fake_auth(db))
+    monkeypatch.setattr(bj, "ensure_org_read", lambda *_: None)
+
+    result = bj.list_posted_bank_lines("ba-1", ORG_ID, auth=("user-1", None))
+
+    assert result["lines"][0]["description"] == "oThongathi TapnGo 485442*5359 13 JUL"
+
+
 # ── list_bank_journal_lines ──────────────────────────────────────────────────
 
 def test_list_bank_journal_lines_returns_lines(monkeypatch):

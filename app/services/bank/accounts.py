@@ -66,11 +66,29 @@ def _looks_like_serialized_csv_row(value: Any) -> bool:
     )
 
 
-def _line_for_reconciliation_display(line: dict[str, Any]) -> dict[str, Any]:
+def line_for_reconciliation_display(line: dict[str, Any]) -> dict[str, Any]:
+    """Return a bank line with an end-user-friendly description.
+
+    Some CSV imports historically stored the entire serialized source row in
+    ``description``.  Keep that raw value in the database for traceability, but
+    never expose it as the transaction label when a parsed reference exists.
+    """
     reference = line.get("reference")
     if _looks_like_serialized_csv_row(line.get("description")) and reference:
         return {**line, "description": str(reference)}
     return line
+
+
+def supplier_invoice_match_eligibility(invoice: dict[str, Any] | None) -> tuple[bool, str | None]:
+    """Return whether a supplier invoice may be settled from bank reconciliation."""
+    if not invoice:
+        return False, "matched_invoice_not_found"
+    eligible = (
+        str(invoice.get("review_status") or "").lower() == "approved"
+        and str(invoice.get("approval_status") or "").lower() == "approved"
+        and str(invoice.get("posting_status") or "").lower() == "posted"
+    )
+    return (True, None) if eligible else (False, "invoice_not_posted")
 
 
 def get_unreconciled_lines_payload(
@@ -189,7 +207,8 @@ def get_unreconciled_lines_payload(
             db.table("invoices_extracted")
             .select(
                 "id, invoice_raw_id, invoice_number, invoice_date, due_date, total_amount, "
-                "currency, supplier_id, supplier_name_extracted"
+                "currency, supplier_id, supplier_name_extracted, review_status, "
+                "approval_status, posting_status"
             )
             .eq("organisation_id", organisation_id)
             .in_("id", list(supplier_invoice_ids))
@@ -204,12 +223,18 @@ def get_unreconciled_lines_payload(
         upload = uploads_by_id.get(str(line.get("bank_statement_upload_id"))) or {}
         suggestion = top_suggestion.get(str(line.get("id") or ""), {})
         matched_invoice = supplier_invoices_by_id.get(str(suggestion.get("matched_invoice_id") or ""), {})
+        is_supplier_invoice_match = bool(suggestion.get("matched_invoice_id"))
+        match_eligible, match_block_code = (
+            supplier_invoice_match_eligibility(matched_invoice)
+            if is_supplier_invoice_match
+            else (None, None)
+        )
         confidence = float(
             suggestion.get("confidence_score")
             or (0.75 if line.get("match_status") == "suggested" else 0.5)
         )
         enriched.append({
-            **_line_for_reconciliation_display(line),
+            **line_for_reconciliation_display(line),
             "upload_original_filename": upload.get("original_filename"),
             "upload_uploaded_at": upload.get("uploaded_at"),
             "recon_confidence": confidence,
@@ -221,12 +246,17 @@ def get_unreconciled_lines_payload(
             "recon_matched_invoice_ref": suggestion.get("matched_invoice_number") or line.get("matched_invoice_number"),
             "recon_match_rationale": suggestion.get("rationale"),
             "recon_match_evidence": suggestion.get("evidence") or {},
+            "recon_match_eligible": match_eligible,
+            "recon_match_block_code": match_block_code,
             "recon_matched_supplier_name": matched_invoice.get("supplier_name_extracted"),
             "recon_matched_invoice_date": matched_invoice.get("invoice_date"),
             "recon_matched_invoice_due_date": matched_invoice.get("due_date"),
             "recon_matched_invoice_total": matched_invoice.get("total_amount"),
             "recon_matched_invoice_currency": matched_invoice.get("currency"),
             "recon_matched_invoice_raw_id": matched_invoice.get("invoice_raw_id"),
+            "recon_matched_invoice_review_status": matched_invoice.get("review_status"),
+            "recon_matched_invoice_approval_status": matched_invoice.get("approval_status"),
+            "recon_matched_invoice_posting_status": matched_invoice.get("posting_status"),
         })
 
     balances = BankBalanceSummary.model_validate(

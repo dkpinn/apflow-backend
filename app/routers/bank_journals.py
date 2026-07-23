@@ -24,6 +24,8 @@ from app.services.protected_accounts import assert_manual_posting_account_allowe
 from app.services.bank.extraction_gate import assert_bank_line_upload_extracted
 from app.services.bank.journals import reverse_posted_journal
 from app.services.bank.auto_post import auto_post_matched_lines
+from app.services.bank.accounts import line_for_reconciliation_display
+from app.services.bank.supplier_settlement import reverse_supplier_invoice_bank_match
 
 # Shared helpers and models live in bank.py; import them here.
 from app.routers.bank import (
@@ -327,12 +329,52 @@ def unpost_bank_journal(journal_id: str, payload: PostJournalRequest, auth: User
     if not source_line_id:
         raise HTTPException(status_code=400, detail="Only bank transaction journals can be unposted here")
 
-    reversal = reverse_posted_journal(
-        db,
-        organisation_id=organisation_id,
-        journal=journal,
-        actor_user_id=user_id,
+    settlement_payments = (
+        db.table("payments")
+        .select("id")
+        .eq("organisation_id", organisation_id)
+        .eq("bank_statement_line_id", source_line_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
     )
+    if settlement_payments:
+        try:
+            reversed_settlement = reverse_supplier_invoice_bank_match(
+                db,
+                organisation_id=organisation_id,
+                journal_id=journal_id,
+                actor_user_id=user_id,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to reverse supplier payment: {exc}") from exc
+        reversal_id = str(reversed_settlement["reversal_id"])
+        reversal_journal = _one(
+            db.table("gl_journals").select("*").eq("id", reversal_id).eq("organisation_id", organisation_id).limit(1).execute(),
+            "Reversal journal not found",
+        )
+        reversal_rows = (
+            db.table("gl_journal_lines")
+            .select("*")
+            .eq("gl_journal_id", reversal_id)
+            .order("sort_order")
+            .execute()
+            .data
+            or []
+        )
+        reversal = {
+            "reversal_id": reversal_id,
+            "reversal_journal": reversal_journal,
+            "reversal_rows": reversal_rows,
+        }
+    else:
+        reversal = reverse_posted_journal(
+            db,
+            organisation_id=organisation_id,
+            journal=journal,
+            actor_user_id=user_id,
+        )
     if reversal is None:
         raise HTTPException(
             status_code=400,
@@ -382,7 +424,7 @@ def list_posted_bank_lines(account_id: str, organisation_id: str, auth: UserAuth
         .data
         or []
     )
-    return {"lines": rows}
+    return {"lines": [line_for_reconciliation_display(row) for row in rows]}
 
 
 @router.post("/accounts/{account_id}/resume-auto-post")

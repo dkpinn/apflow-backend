@@ -22,6 +22,9 @@ from app.services.bank_statement_service import (
     score_invoice_suggestions,
     score_rule_suggestions,
 )
+from app.services.accounting_locks import assert_accounting_period_unlocked
+from app.services.bank.supplier_settlement import accept_supplier_invoice_bank_match
+from app.services.bank.accounts import supplier_invoice_match_eligibility
 from app.services.sales_invoices import post_customer_receipt
 from app.services.protected_accounts import assert_manual_posting_account_allowed
 from app.services.organisation_vat import vat_applicability
@@ -166,7 +169,16 @@ def get_invoice_match_preview(suggestion_id: str, organisation_id: str, auth: Us
         .data
         or []
     )
-    return {"suggestion": suggestion, "invoice": invoice, "line_items": line_items}
+    eligible, block_code = supplier_invoice_match_eligibility(invoice)
+    return {
+        "suggestion": suggestion,
+        "invoice": invoice,
+        "line_items": line_items,
+        "match_eligibility": {
+            "eligible": eligible,
+            "block_code": block_code,
+        },
+    }
 
 
 @router.post("/suggestions/{suggestion_id}/reject")
@@ -278,6 +290,37 @@ def review_bank_line(line_id: str, payload: ReviewLineRequest, auth: UserAuth):
             db.table("bank_transaction_suggestions").select("*").eq("id", str(payload.suggestion_id)).eq("organisation_id", organisation_id).limit(1).execute(),
             "Suggestion not found",
         )
+    if suggestion and suggestion.get("matched_invoice_id"):
+        try:
+            assert_accounting_period_unlocked(
+                db,
+                organisation_id=organisation_id,
+                transaction_date=line.get("line_date"),
+                action="Reconcile supplier payment",
+            )
+            settlement = accept_supplier_invoice_bank_match(
+                db,
+                organisation_id=organisation_id,
+                bank_statement_line_id=line_id,
+                suggestion_id=str(suggestion["id"]),
+                actor_user_id=user_id,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to reconcile supplier payment: {exc}") from exc
+        log_bank_event(
+            db,
+            organisation_id=organisation_id,
+            event_type="bank_supplier_invoice_payment_reconciled",
+            actor_user_id=user_id,
+            bank_account_id=line.get("bank_account_id"),
+            bank_statement_upload_id=line.get("bank_statement_upload_id"),
+            bank_statement_line_id=line_id,
+            suggestion_id=str(suggestion["id"]),
+            matched_invoice_id=str(suggestion["matched_invoice_id"]),
+            gl_journal_id=settlement.get("journal_id"),
+            payment_id=settlement.get("payment_id"),
+        )
+        return {"success": True, "supplier_payment": settlement}
     selected_account_id = str(payload.gl_account_id) if payload.gl_account_id else (suggestion or {}).get("suggested_account_id")
     if selected_account_id:
         try:

@@ -422,6 +422,20 @@ def test_review_bank_line_accepts_supplier_invoice_suggestion(monkeypatch):
     monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
     monkeypatch.setattr(bl, "log_bank_event", lambda _db, **_kw: None)
     monkeypatch.setattr(bl, "now_iso", lambda: "2024-01-05T12:00:00+00:00")
+    monkeypatch.setattr(bl, "assert_accounting_period_unlocked", lambda *_a, **_kw: None)
+    settlement_calls = []
+    monkeypatch.setattr(
+        bl,
+        "accept_supplier_invoice_bank_match",
+        lambda _db, **kwargs: settlement_calls.append(kwargs) or {
+            "journal_id": "journal-1",
+            "payment_id": "payment-1",
+            "invoice_id": INVOICE_ID,
+            "amount": 410.55,
+            "outstanding_after": 0,
+            "payment_status": "paid",
+        },
+    )
 
     from app.routers.bank import ReviewLineRequest
     result = bl.review_bank_line(
@@ -431,13 +445,47 @@ def test_review_bank_line_accepts_supplier_invoice_suggestion(monkeypatch):
     )
 
     assert result["success"] is True
-    suggestion = db.tables["bank_transaction_suggestions"][0]
-    assert suggestion["status"] == "accepted"
-    line = db.tables["bank_statement_lines"][0]
-    assert line["accepted_suggestion_id"] == SUGGESTION_ID
-    assert line["match_status"] == "matched"
-    assert line["allocation_status"] == "allocated"
-    assert line["review_status"] == "reviewed"
+    assert result["supplier_payment"]["payment_status"] == "paid"
+    assert settlement_calls == [{
+        "organisation_id": ORG_ID,
+        "bank_statement_line_id": LINE_ID,
+        "suggestion_id": SUGGESTION_ID,
+        "actor_user_id": "user-1",
+    }]
+
+
+def test_review_bank_line_supplier_match_surfaces_atomic_settlement_failure(monkeypatch):
+    db = MemoryDB({
+        "bank_statement_lines": [_line_row(signed_amount=-410.55)],
+        "bank_statement_uploads": [_upload_row()],
+        "bank_transaction_suggestions": [{
+            "id": SUGGESTION_ID,
+            "organisation_id": ORG_ID,
+            "bank_statement_line_id": LINE_ID,
+            "suggestion_type": "supplier_invoice",
+            "matched_invoice_id": INVOICE_ID,
+            "status": "open",
+        }],
+    })
+    monkeypatch.setattr(bl, "_auth", lambda _: ("user-1", db))
+    monkeypatch.setattr(bl, "ensure_org_write", lambda *_: None)
+    monkeypatch.setattr(bl, "assert_accounting_period_unlocked", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        bl,
+        "accept_supplier_invoice_bank_match",
+        lambda *_a, **_kw: (_ for _ in ()).throw(ValueError("invoice is already fully paid")),
+    )
+
+    from app.routers.bank import ReviewLineRequest
+    with pytest.raises(HTTPException) as exc_info:
+        bl.review_bank_line(
+            LINE_ID,
+            ReviewLineRequest(organisation_id=ORG_ID, suggestion_id=SUGGESTION_ID),
+            AUTH,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "already fully paid" in exc_info.value.detail
 
 
 def test_reject_invoice_match_persists_status_and_audit(monkeypatch):
@@ -523,6 +571,9 @@ def test_invoice_match_preview_returns_captured_invoice_and_lines(monkeypatch):
             "supplier_name_extracted": "SM Caminsky",
             "invoice_date": "2026-03-01",
             "total_amount": 22000,
+            "review_status": "pending",
+            "approval_status": "pending",
+            "posting_status": "unposted",
         }],
         "invoice_line_items": [{
             "id": "item-1",
@@ -541,6 +592,10 @@ def test_invoice_match_preview_returns_captured_invoice_and_lines(monkeypatch):
     assert result["invoice"]["invoice_number"] == "INV-580"
     assert result["invoice"]["supplier_name_extracted"] == "SM Caminsky"
     assert result["line_items"][0]["description"] == "Consulting fees"
+    assert result["match_eligibility"] == {
+        "eligible": False,
+        "block_code": "invoice_not_posted",
+    }
 
 
 def test_review_line_request_rejects_supplier_and_customer_together():
