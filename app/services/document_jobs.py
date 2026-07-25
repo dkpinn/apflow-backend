@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -40,23 +40,25 @@ def create_processing_job(
     return res.data[0]
 
 
-def get_next_queued_job(supabase, *, organisation_id: Optional[str] = None) -> Optional[dict]:
-    query = (
-        supabase
-        .table("document_processing_jobs")
-        .select("*")
-        .eq("job_type", "invoice_extract")
-        .eq("status", "queued")
-        .order("priority", desc=False)
-        .order("created_at", desc=False)
-        .limit(1)
-    )
-
-    if organisation_id:
-        query = query.eq("organisation_id", organisation_id)
-
-    res = query.execute()
-    return res.data[0] if res.data else None
+def claim_next_queued_job(
+    supabase,
+    *,
+    worker_id: str,
+    organisation_id: Optional[str] = None,
+    lease_seconds: int = 1800,
+) -> Optional[dict]:
+    """Atomically claim one queued job using PostgreSQL SKIP LOCKED."""
+    res = supabase.rpc(
+        "claim_next_document_processing_job",
+        {
+            "p_worker_id": worker_id,
+            "p_organisation_id": organisation_id,
+            "p_lease_seconds": lease_seconds,
+        },
+    ).execute()
+    if isinstance(res.data, list):
+        return res.data[0] if res.data else None
+    return res.data or None
 
 
 def mark_job_processing(supabase, *, job_id: str, stage: str = "processing") -> None:
@@ -71,6 +73,7 @@ def mark_job_processing(supabase, *, job_id: str, stage: str = "processing") -> 
 def mark_job_stage(supabase, *, job_id: str, stage: str) -> None:
     supabase.table("document_processing_jobs").update({
         "current_stage": stage,
+        "lease_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
         "updated_at": utc_now_iso(),
     }).eq("id", job_id).execute()
 
@@ -80,6 +83,9 @@ def mark_job_completed(supabase, *, job_id: str, stage: str = "completed") -> No
         "status": "completed",
         "current_stage": stage,
         "completed_at": utc_now_iso(),
+        "claimed_by": None,
+        "claimed_at": None,
+        "lease_expires_at": None,
         "updated_at": utc_now_iso(),
     }).eq("id", job_id).execute()
 
@@ -107,6 +113,9 @@ def mark_job_failed(supabase, *, job_id: str, error: str, stage: Optional[str] =
         "retry_count": retry_count + 1,
         "last_error": error[:4000],
         "failed_at": utc_now_iso(),
+        "claimed_by": None,
+        "claimed_at": None,
+        "lease_expires_at": None,
         "updated_at": utc_now_iso(),
     }).eq("id", job_id).execute()
 

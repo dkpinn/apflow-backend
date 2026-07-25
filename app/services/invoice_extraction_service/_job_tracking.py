@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from threading import Lock
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -102,7 +101,6 @@ EXTRACT_STAGE_LABELS = {
 # Concurrency lock for the extraction worker (used by _queue.py)
 # ---------------------------------------------------------------------------
 
-EXTRACT_WORKER_LOCK = Lock()
 
 
 # ---------------------------------------------------------------------------

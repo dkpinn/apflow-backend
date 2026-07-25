@@ -15,7 +15,6 @@ Internal submodule layout:
   _queue         — queue_invoice_job + worker drain helpers
 """
 from ._job_tracking import (
-    EXTRACT_WORKER_LOCK,
     EXTRACT_STAGE_LABELS,
     EXTRACT_STAGE_PROGRESS,
     REEXTRACT_DEFAULT_DIAGNOSTIC,
@@ -47,7 +46,6 @@ from ._queue import (
 
 __all__ = [
     # Job tracking
-    "EXTRACT_WORKER_LOCK",
     "EXTRACT_STAGE_LABELS",
     "EXTRACT_STAGE_PROGRESS",
     "REEXTRACT_DEFAULT_DIAGNOSTIC",

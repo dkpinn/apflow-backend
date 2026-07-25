@@ -26,7 +26,6 @@ from app.services.invoice_extraction_service import (
     get_raw_invoice,
     process_next_queued_invoice_job,
     queue_invoice_job,
-    run_extract_worker_until_empty,
 )
 
 router = APIRouter(prefix="/api/invoices", tags=["invoices"])
@@ -115,7 +114,10 @@ def process_next_invoice_job(payload: ProcessNextJobRequest, auth: UserAuth):
     if not payload.organisation_id:
         raise HTTPException(status_code=400, detail="organisation_id is required")
     _require_org_write(auth, payload.organisation_id)
-    return process_next_queued_invoice_job(organisation_id=payload.organisation_id)
+    return process_next_queued_invoice_job(
+        worker_id="api-manual-process-next",
+        organisation_id=payload.organisation_id,
+    )
 
 
 @router.get("/raw/{invoice_raw_id}/file")
@@ -493,7 +495,6 @@ def merge_invoices(payload: MergeInvoicesPayload, background_tasks: BackgroundTa
 
     # Step 7 — queue extraction on the merged record
     queue_invoice_job(invoice_raw_id=new_raw_id, organisation_id=payload.organisation_id)
-    background_tasks.add_task(run_extract_worker_until_empty)
 
     return {"success": True, "new_invoice_raw_id": new_raw_id}
 
@@ -597,7 +598,6 @@ def split_invoice_into_pages(raw_id: str, organisation_id: str, background_tasks
     # Step 5 — queue extraction for all new records and drain the worker
     for new_id in new_raw_ids:
         queue_invoice_job(invoice_raw_id=new_id, organisation_id=organisation_id)
-    background_tasks.add_task(run_extract_worker_until_empty)
 
     return {"success": True, "page_count": page_count, "new_raw_ids": new_raw_ids}
 
@@ -725,7 +725,6 @@ def process_page_groups(payload: ProcessPageGroupsPayload, background_tasks: Bac
     # so a queue failure leaves the original intact and the user can retry)
     for new_id in new_raw_ids:
         queue_invoice_job(invoice_raw_id=new_id, organisation_id=payload.organisation_id)
-    background_tasks.add_task(run_extract_worker_until_empty)
 
     # Step 5 — delete original record now that all new records are safely queued
     extracted_rows = (

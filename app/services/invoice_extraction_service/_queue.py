@@ -6,7 +6,7 @@ Invoice job queueing and worker drain helpers.
 Group F from the original invoice_extraction_service.py:
   queue_invoice_job                 — create a document_processing_jobs row and enqueue
   process_next_queued_invoice_job   — dequeue one job and run extraction
-  run_extract_worker_until_empty    — drain all queued jobs (single-threaded)
+  run_extract_worker_until_empty    — drain queued jobs using atomic DB claims
 """
 from __future__ import annotations
 
@@ -17,16 +17,14 @@ from fastapi import HTTPException
 from app.db.supabase_client import get_supabase_client
 from app.services.audit_log import log_invoice_event
 from app.services.document_jobs import (
+    claim_next_queued_job,
     create_processing_job,
-    get_next_queued_job,
     mark_job_completed,
     mark_job_failed,
-    mark_job_processing,
     safe_update_invoice_raw_status,
 )
 from app.services.invoice_data_builders import utc_now_iso
 from ._helpers import get_raw_invoice
-from ._job_tracking import EXTRACT_WORKER_LOCK
 from ._pipeline import run_invoice_extraction
 
 try:
@@ -79,8 +77,16 @@ def queue_invoice_job(
     return job
 
 
-def process_next_queued_invoice_job(*, organisation_id: Optional[str] = None) -> dict:
-    job = get_next_queued_job(supabase, organisation_id=organisation_id)
+def process_next_queued_invoice_job(
+    *,
+    worker_id: str,
+    organisation_id: Optional[str] = None,
+) -> dict:
+    job = claim_next_queued_job(
+        supabase,
+        worker_id=worker_id,
+        organisation_id=organisation_id,
+    )
 
     if not job:
         return {
@@ -94,7 +100,6 @@ def process_next_queued_invoice_job(*, organisation_id: Optional[str] = None) ->
     organisation_id = job["organisation_id"]
 
     try:
-        mark_job_processing(supabase, job_id=job_id, stage="starting")
         safe_update_invoice_raw_status(
             supabase,
             invoice_raw_id=invoice_raw_id,
@@ -152,15 +157,15 @@ def process_next_queued_invoice_job(*, organisation_id: Optional[str] = None) ->
         }
 
 
-def run_extract_worker_until_empty(organisation_id: Optional[str] = None) -> None:
-    acquired = EXTRACT_WORKER_LOCK.acquire(blocking=False)
-    if not acquired:
-        return
-
-    try:
-        for _ in range(100):
-            result = process_next_queued_invoice_job(organisation_id=organisation_id)
-            if result.get("status") == "empty":
-                return
-    finally:
-        EXTRACT_WORKER_LOCK.release()
+def run_extract_worker_until_empty(
+    organisation_id: Optional[str] = None,
+    *,
+    worker_id: str = "legacy-manual-worker",
+) -> None:
+    for _ in range(100):
+        result = process_next_queued_invoice_job(
+            worker_id=worker_id,
+            organisation_id=organisation_id,
+        )
+        if result.get("status") == "empty":
+            return

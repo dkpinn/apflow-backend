@@ -1,7 +1,6 @@
 import importlib.util
 import pathlib
 import sys
-import threading
 import types
 import unittest
 
@@ -84,7 +83,11 @@ def create_processing_job(supabase, *, organisation_id, invoice_raw_id, batch_id
     return job
 
 
-def get_next_queued_job(supabase, *, organisation_id=None):
+claimed_by = []
+
+
+def claim_next_queued_job(supabase, *, worker_id, organisation_id=None, lease_seconds=1800):
+    claimed_by.append(worker_id)
     if created_jobs:
         return created_jobs[-1]
     return None
@@ -107,7 +110,7 @@ def safe_update_invoice_raw_status(supabase, *, invoice_raw_id, parse_status, ex
 
 
 doc_jobs_mod.create_processing_job = create_processing_job
-doc_jobs_mod.get_next_queued_job = get_next_queued_job
+doc_jobs_mod.claim_next_queued_job = claim_next_queued_job
 doc_jobs_mod.mark_job_processing = mark_job_processing
 doc_jobs_mod.mark_job_completed = mark_job_completed
 doc_jobs_mod.mark_job_failed = mark_job_failed
@@ -127,11 +130,6 @@ def get_raw_invoice(invoice_raw_id: str):
 
 helpers_mod.get_raw_invoice = get_raw_invoice
 sys.modules["app.services.invoice_extraction_service._helpers"] = helpers_mod
-
-# Stub job tracking.
-job_tracking_mod = types.ModuleType("app.services.invoice_extraction_service._job_tracking")
-job_tracking_mod.EXTRACT_WORKER_LOCK = threading.Lock()
-sys.modules["app.services.invoice_extraction_service._job_tracking"] = job_tracking_mod
 
 # Stub pipeline run.
 pipeline_mod = types.ModuleType("app.services.invoice_extraction_service._pipeline")
@@ -159,6 +157,7 @@ _restore_stubbed_modules()
 class InvoiceExtractionQueueStrategyTests(unittest.TestCase):
     def setUp(self) -> None:
         created_jobs.clear()
+        claimed_by.clear()
         record.clear()
 
     def test_queue_invoice_job_records_strategy_override(self):
@@ -177,10 +176,14 @@ class InvoiceExtractionQueueStrategyTests(unittest.TestCase):
             organisation_id="org-1",
             extraction_strategy="vlm",
         )
-        result = queue.process_next_queued_invoice_job(organisation_id="org-1")
+        result = queue.process_next_queued_invoice_job(
+            worker_id="test-worker",
+            organisation_id="org-1",
+        )
 
         self.assertTrue(result["success"])
         self.assertEqual(record["extraction_strategy"], "vlm")
+        self.assertEqual(claimed_by, ["test-worker"])
 
 
 if __name__ == "__main__":

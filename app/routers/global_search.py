@@ -18,5 +18,12 @@ def global_search(
     user_id, db = auth
     ensure_org_read(user_id, organisation_id)
     if len(q.strip()) < 2:
-        return {"results": [], "query": q}
+        return {
+            "results": [],
+            "query": q,
+            "is_partial": False,
+            "errors": [],
+            "searched_sources": [],
+            "failed_sources": [],
+        }
     return search(db, organisation_id, q, limit=limit)

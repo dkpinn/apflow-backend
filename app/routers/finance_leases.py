@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import json
 import uuid as _uuid
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 from typing import Any, Literal, Optional
+from urllib.parse import unquote
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
@@ -43,6 +44,7 @@ from app.services.finance_lease_gl import (
 router = APIRouter(prefix="/api/finance-leases", tags=["finance-leases"])
 
 PaymentFrequency = Literal["monthly", "quarterly", "semi_annual", "annual"]
+FINANCE_LEASE_DOCUMENT_BUCKET = "finance-lease-docs"
 
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
@@ -123,7 +125,7 @@ class UploadDocumentRequest(BaseModel):
     organisation_id:   str
     original_filename: str
     mime_type:         str
-    storage_bucket:    str = "finance-lease-docs"
+    storage_bucket:    str = FINANCE_LEASE_DOCUMENT_BUCKET
     storage_path:      str
     file_size_bytes:   Optional[int] = None
     extract:           bool = True
@@ -133,6 +135,36 @@ class UploadDocumentRequest(BaseModel):
 
 def _svc():
     return get_supabase_client()
+
+
+def _validated_document_storage_path(
+    *,
+    organisation_id: str,
+    storage_bucket: str,
+    storage_path: str,
+) -> str:
+    """Validate the client-uploaded object reference before service-role access."""
+    if storage_bucket != FINANCE_LEASE_DOCUMENT_BUCKET:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Finance lease documents must use the {FINANCE_LEASE_DOCUMENT_BUCKET} bucket",
+        )
+
+    path = storage_path.strip()
+    decoded_path = unquote(path)
+    parts = decoded_path.split("/")
+    if (
+        not path
+        or path.startswith("/")
+        or "\\" in decoded_path
+        or any(part in {"", ".", ".."} for part in parts)
+        or parts[0] != organisation_id
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Finance lease document path must be an organisation-owned object path",
+        )
+    return path
 
 
 def _auth(auth: UserAuth):
@@ -174,89 +206,6 @@ def _validate_accounts(db, *, organisation_id: str, account_ids: list[str]) -> N
             status_code=422,
             detail=f"GL accounts not found in this organisation: {missing}",
         )
-
-
-def _post_gl_journal(
-    db,
-    *,
-    organisation_id: str,
-    source_id: str,
-    journal_date: date,
-    description: str,
-    lines: list[dict],
-    created_by: str,
-) -> str:
-    """Insert a balanced GL journal and its lines; return the journal ID."""
-    try:
-        assert_accounting_period_unlocked(
-            db,
-            organisation_id=organisation_id,
-            transaction_date=journal_date,
-            action="Post finance lease journal",
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    assert_balanced(lines)
-    total = round(sum(float(l.get("debit_amount", 0)) for l in lines), 2)
-    journal_id = str(_uuid.uuid4())
-
-    db.table("gl_journals").insert({
-        "id":             journal_id,
-        "organisation_id": organisation_id,
-        "source_type":    "finance_lease",
-        "source_id":      source_id,
-        "journal_date":   journal_date.isoformat(),
-        "description":    description,
-        "status":         "posted",
-        "total_debit":    total,
-        "total_credit":   total,
-        "created_by":     created_by,
-        "posted_by":      created_by,
-        "posted_at":      datetime.utcnow().isoformat(),
-    }).execute()
-
-    line_rows = [
-        {
-            "organisation_id": organisation_id,
-            "gl_journal_id":   journal_id,
-            "account_id":      l["account_id"],
-            "description":     l.get("description", ""),
-            "debit_amount":    float(l.get("debit_amount", 0)),
-            "credit_amount":   float(l.get("credit_amount", 0)),
-            "tracking":        {},
-            "sort_order":      l.get("sort_order", 0),
-        }
-        for l in lines
-    ]
-    db.table("gl_journal_lines").insert(line_rows).execute()
-    return journal_id
-
-
-def _log_posting_event(
-    db,
-    *,
-    organisation_id: str,
-    lease_id: str,
-    journal_id: str,
-    event_type: str,
-    journal_date: date,
-    period_number: int | None,
-    description: str | None,
-    amount: float,
-    created_by: str,
-) -> None:
-    db.table("finance_lease_gl_postings").insert({
-        "organisation_id": organisation_id,
-        "lease_id":        lease_id,
-        "journal_id":      journal_id,
-        "event_type":      event_type,
-        "period_number":   period_number,
-        "journal_date":    journal_date.isoformat(),
-        "description":     description,
-        "amount":          amount,
-        "created_by":      created_by,
-    }).execute()
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -598,7 +547,7 @@ def post_payment_journal(
     payload: PostPaymentRequest,
     auth: UserAuth,
 ):
-    """Post the monthly payment journal (and optionally the depreciation journal)."""
+    """Atomically post a payment and its optional depreciation journal."""
     user_id, db = _auth(auth)
     ensure_org_write(user_id, payload.organisation_id)
 
@@ -630,95 +579,63 @@ def post_payment_journal(
     )
     payment_lines = build_payment_lines(lease, schedule_row, payload.bank_account_id,
                                         description=payment_desc)
-
-    payment_journal_id = _post_gl_journal(
-        db,
-        organisation_id=payload.organisation_id,
-        source_id=lease_id,
-        journal_date=payload.journal_date,
-        description=payment_desc,
-        lines=payment_lines,
-        created_by=user_id,
-    )
-
-    principal = float(schedule_row["principal_amount"])
-    interest  = float(schedule_row["interest_amount"])
-
-    _log_posting_event(db,
-        organisation_id=payload.organisation_id,
-        lease_id=lease_id,
-        journal_id=payment_journal_id,
-        event_type="payment",
-        journal_date=payload.journal_date,
-        period_number=period_number,
-        description=payment_desc,
-        amount=principal + interest,
-        created_by=user_id,
-    )
-
-    # Mark schedule row as posted
-    db.table("finance_lease_schedule").update({
-        "posted":     True,
-        "journal_id": payment_journal_id,
-        "posted_at":  datetime.utcnow().isoformat(),
-        "posted_by":  user_id,
-    }).eq("lease_id", lease_id).eq("period_number", period_number).execute()
-
-    # Update lease running balances
-    new_liability = float(lease["current_liability_balance"]) - principal
-    updates: dict[str, Any] = {
-        "current_liability_balance": round(new_liability, 2),
-        "last_posted_period":        period_number,
-        "updated_by":                user_id,
-    }
-
-    depreciation_journal_id: str | None = None
+    depreciation_lines: list[dict] = []
+    depreciation_amount = 0.0
+    depreciation_desc: str | None = None
     if payload.post_depreciation:
-        monthly_dep = compute_monthly_depreciation(lease)
-        dep_desc = f"ROU Asset Depreciation – Period {period_number} – {lease['asset_description']}"
-        dep_lines = build_depreciation_lines(lease, monthly_depreciation=monthly_dep, description=dep_desc)
+        depreciation_amount = compute_monthly_depreciation(lease)
+        depreciation_desc = (
+            f"ROU Asset Depreciation – Period {period_number} – {lease['asset_description']}"
+        )
+        depreciation_lines = build_depreciation_lines(
+            lease,
+            monthly_depreciation=depreciation_amount,
+            description=depreciation_desc,
+        )
 
-        depreciation_journal_id = _post_gl_journal(
+    try:
+        assert_balanced(payment_lines)
+        if depreciation_lines:
+            assert_balanced(depreciation_lines)
+        assert_accounting_period_unlocked(
             db,
             organisation_id=payload.organisation_id,
-            source_id=lease_id,
-            journal_date=payload.journal_date,
-            description=dep_desc,
-            lines=dep_lines,
-            created_by=user_id,
+            transaction_date=payload.journal_date,
+            action="Post finance lease payment",
         )
-        _log_posting_event(db,
-            organisation_id=payload.organisation_id,
-            lease_id=lease_id,
-            journal_id=depreciation_journal_id,
-            event_type="depreciation",
-            journal_date=payload.journal_date,
-            period_number=period_number,
-            description=dep_desc,
-            amount=monthly_dep,
-            created_by=user_id,
-        )
-        new_nbv = float(lease["current_rou_net_book_value"]) - monthly_dep
-        updates["current_rou_net_book_value"] = round(new_nbv, 2)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Check if all periods are now posted → mark lease complete
-    remaining = (
-        db.table("finance_lease_schedule")
-        .select("id", count="exact")
-        .eq("lease_id", lease_id)
-        .eq("posted", False)
-        .execute()
-    )
-    if (remaining.count or 0) == 0:
-        updates["status"] = "completed"
+    try:
+        rpc_result = db.rpc(
+            "post_lease_payment_atomic",
+            {
+                "p_org_id": payload.organisation_id,
+                "p_lease_id": lease_id,
+                "p_period_number": period_number,
+                "p_user_id": user_id,
+                "p_journal_date": payload.journal_date.isoformat(),
+                "p_payment_description": payment_desc,
+                "p_payment_lines": json.dumps(payment_lines),
+                "p_post_depreciation": payload.post_depreciation,
+                "p_depreciation_description": depreciation_desc,
+                "p_depreciation_amount": depreciation_amount,
+                "p_depreciation_lines": json.dumps(depreciation_lines),
+            },
+        ).execute()
+    except Exception as exc:
+        message = str(exc)
+        status_code = 409 if "already been posted" in message.lower() else 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
 
-    db.table("finance_leases").update(updates).eq("id", lease_id).execute()
+    result = rpc_result.data or {}
 
     return {
-        "success":                 True,
-        "payment_journal_id":      payment_journal_id,
-        "depreciation_journal_id": depreciation_journal_id,
-        "period_number":           period_number,
+        "success": True,
+        "payment_journal_id": result.get("payment_journal_id"),
+        "depreciation_journal_id": result.get("depreciation_journal_id"),
+        "period_number": result.get("period_number", period_number),
+        "lease_status": result.get("lease_status"),
     }
 
 
@@ -770,6 +687,12 @@ def upload_lease_document(
     user_id, db = _auth(auth)
     ensure_org_write(user_id, payload.organisation_id)
 
+    storage_path = _validated_document_storage_path(
+        organisation_id=payload.organisation_id,
+        storage_bucket=payload.storage_bucket,
+        storage_path=payload.storage_path,
+    )
+
     # Confirm lease exists (the lease may not yet be saved if doc uploaded first)
     if lease_id != "new":
         _get_lease(db, lease_id=lease_id, organisation_id=payload.organisation_id)
@@ -781,8 +704,8 @@ def upload_lease_document(
         "lease_id":          None if lease_id == "new" else lease_id,
         "original_filename": payload.original_filename,
         "mime_type":         payload.mime_type,
-        "storage_bucket":    payload.storage_bucket,
-        "storage_path":      payload.storage_path,
+        "storage_bucket":    FINANCE_LEASE_DOCUMENT_BUCKET,
+        "storage_path":      storage_path,
         "file_size_bytes":   payload.file_size_bytes,
         "extraction_status": "uploaded",
         "uploaded_by":       user_id,
@@ -799,7 +722,7 @@ def upload_lease_document(
             from app.services.finance_lease_extraction import extract_lease_document
 
             # Download file bytes from Supabase storage
-            file_res = db.storage.from_(payload.storage_bucket).download(payload.storage_path)
+            file_res = db.storage.from_(FINANCE_LEASE_DOCUMENT_BUCKET).download(storage_path)
             file_bytes = file_res if isinstance(file_res, bytes) else bytes(file_res)
 
             extracted_data = extract_lease_document(file_bytes, mime_type=payload.mime_type)

@@ -1,6 +1,18 @@
 from __future__ import annotations
 
 import re
+import logging
+
+
+logger = logging.getLogger(__name__)
+SEARCH_SOURCES = (
+    "suppliers",
+    "customers",
+    "supplier_invoices",
+    "sales_invoices",
+    "accounts",
+    "bank_lines",
+)
 
 
 def _safe_q(q: str) -> str:
@@ -15,30 +27,48 @@ def _rows(query) -> list[dict]:
 def search(db, organisation_id: str, query: str, limit: int = 6) -> dict:
     q = _safe_q(query)
     if len(q) < 2:
-        return {"results": [], "query": q}
+        return {
+            "results": [],
+            "query": q,
+            "is_partial": False,
+            "errors": [],
+            "searched_sources": [],
+            "failed_sources": [],
+        }
 
     pat = f"%{q}%"
     results: list[dict] = []
+    errors: list[dict[str, str]] = []
+    searched_sources: list[str] = []
+
+    def source_failed(source: str, label: str, exc: Exception) -> None:
+        logger.warning("Global search source %s failed: %s", source, exc, exc_info=True)
+        errors.append({
+            "source": source,
+            "code": "source_unavailable",
+            "message": f"{label} search is temporarily unavailable",
+        })
 
     # ── Suppliers ─────────────────────────────────────────────────────────────
     try:
         rows = _rows(
             db.table("suppliers")
-            .select("id, name, supplier_code")
+            .select("id, supplier_name, trading_name, supplier_code")
             .eq("organisation_id", organisation_id)
-            .or_(f"name.ilike.{pat},supplier_code.ilike.{pat}")
+            .or_(f"supplier_name.ilike.{pat},trading_name.ilike.{pat},supplier_code.ilike.{pat}")
             .limit(limit)
         )
         for r in rows:
             results.append({
                 "type": "supplier",
                 "id": r["id"],
-                "title": r.get("name") or "Unnamed supplier",
+                "title": r.get("supplier_name") or r.get("trading_name") or "Unnamed supplier",
                 "subtitle": r.get("supplier_code"),
                 "link": f"/suppliers/{r['id']}",
             })
-    except Exception:
-        pass
+        searched_sources.append("suppliers")
+    except Exception as exc:
+        source_failed("suppliers", "Supplier", exc)
 
     # ── Customers ─────────────────────────────────────────────────────────────
     try:
@@ -57,8 +87,9 @@ def search(db, organisation_id: str, query: str, limit: int = 6) -> dict:
                 "subtitle": r.get("customer_code"),
                 "link": f"/customers/{r['id']}",
             })
-    except Exception:
-        pass
+        searched_sources.append("customers")
+    except Exception as exc:
+        source_failed("customers", "Customer", exc)
 
     # ── Supplier invoices ─────────────────────────────────────────────────────
     try:
@@ -80,8 +111,9 @@ def search(db, organisation_id: str, query: str, limit: int = 6) -> dict:
                 "subtitle": supplier,
                 "link": f"/invoices/{r['id']}",
             })
-    except Exception:
-        pass
+        searched_sources.append("supplier_invoices")
+    except Exception as exc:
+        source_failed("supplier_invoices", "Supplier invoice", exc)
 
     # ── Sales invoices ────────────────────────────────────────────────────────
     try:
@@ -103,8 +135,9 @@ def search(db, organisation_id: str, query: str, limit: int = 6) -> dict:
                 "subtitle": customer,
                 "link": f"/sales-invoices/{r['id']}",
             })
-    except Exception:
-        pass
+        searched_sources.append("sales_invoices")
+    except Exception as exc:
+        source_failed("sales_invoices", "Sales invoice", exc)
 
     # ── Accounts (chart of accounts) ──────────────────────────────────────────
     try:
@@ -124,8 +157,9 @@ def search(db, organisation_id: str, query: str, limit: int = 6) -> dict:
                 "subtitle": r.get("code"),
                 "link": f"/reports/general-ledger?account_id={r['id']}",
             })
-    except Exception:
-        pass
+        searched_sources.append("accounts")
+    except Exception as exc:
+        source_failed("accounts", "Account", exc)
 
     # ── Bank statement lines ──────────────────────────────────────────────────
     try:
@@ -146,7 +180,15 @@ def search(db, organisation_id: str, query: str, limit: int = 6) -> dict:
                 "subtitle": r.get("line_date"),
                 "link": "/bank",
             })
-    except Exception:
-        pass
+        searched_sources.append("bank_lines")
+    except Exception as exc:
+        source_failed("bank_lines", "Bank line", exc)
 
-    return {"results": results, "query": q}
+    return {
+        "results": results,
+        "query": q,
+        "is_partial": bool(errors),
+        "errors": errors,
+        "searched_sources": searched_sources,
+        "failed_sources": [error["source"] for error in errors],
+    }

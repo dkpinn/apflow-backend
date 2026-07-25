@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import logging
 from calendar import monthrange
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -8,8 +9,17 @@ from typing import Any
 
 from dateutil.relativedelta import relativedelta
 
+from app.services.aged_payables import generate_aged_payables
+
 MONEY = Decimal("0.01")
 ZERO = Decimal("0.00")
+logger = logging.getLogger(__name__)
+
+
+class CashFlowForecastDataError(RuntimeError):
+    def __init__(self, source: str):
+        self.source = source
+        super().__init__(f"Required cash-flow forecast source is unavailable: {source}")
 
 OUTFLOW_TYPES = {
     "supplier_invoice",
@@ -93,6 +103,9 @@ def generate_cash_flow_forecast(
     end = start + timedelta(days=forecast_days)
     n_weeks = math.ceil(forecast_days / 7)
 
+    warnings: list[dict[str, str]] = []
+    is_partial = False
+
     # Build weekly buckets
     weeks: list[dict] = []
     for i in range(n_weeks):
@@ -142,35 +155,40 @@ def generate_cash_flow_forecast(
         )
         for acc in accounts:
             opening_balance += _d(acc.get("current_reconciled_balance"))
-    except Exception:
-        pass  # non-critical — leave as zero if table missing
+    except Exception as exc:
+        logger.exception("Failed to load bank balances for cash-flow forecast")
+        raise CashFlowForecastDataError("bank_balances") from exc
 
     # ── Payables due (AP invoices) ─────────────────────────────────────────
+    # Use the same as-at reconciliation logic as the Aged Payables report so
+    # partially and fully settled invoices are not forecast at their gross total.
     try:
-        payables = (
-            db.table("invoices_extracted")
-            .select("due_date, total_amount, supplier_name, invoice_number")
-            .eq("organisation_id", organisation_id)
-            .eq("posting_status", "posted")
-            .gte("due_date", start.isoformat())
-            .lte("due_date", end.isoformat())
-            .execute()
-            .data or []
+        aged_payables = generate_aged_payables(
+            db,
+            organisation_id=organisation_id,
+            as_at_date=start.isoformat(),
         )
-        for row in payables:
-            try:
-                due = date.fromisoformat(str(row["due_date"]))
-            except (ValueError, TypeError):
-                continue
-            amt = _d(row.get("total_amount"))
-            if amt <= ZERO:
-                continue
-            supplier = row.get("supplier_name") or "Supplier"
-            inv_no = row.get("invoice_number") or ""
-            desc = f"{supplier} – {inv_no}".strip(" –") if inv_no else supplier
-            _add_item(due, "out", "payable", desc, amt)
-    except Exception:
-        pass
+        warnings.extend(aged_payables.get("warnings") or [])
+        for supplier_group in aged_payables.get("suppliers", []):
+            supplier = supplier_group.get("supplier_name") or "Supplier"
+            for row in supplier_group.get("invoices", []):
+                try:
+                    due = date.fromisoformat(str(row["due_date"]))
+                except (ValueError, TypeError):
+                    continue
+                if due < start or due > end:
+                    continue
+                amt = _d(row.get("outstanding_amount"))
+                if amt <= ZERO:
+                    continue
+                inv_no = row.get("invoice_number") or ""
+                desc = f"{supplier} – {inv_no}".strip(" –") if inv_no else supplier
+                _add_item(due, "out", "payable", desc, amt)
+    except CashFlowForecastDataError:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to load supplier payables for cash-flow forecast")
+        raise CashFlowForecastDataError("supplier_payables") from exc
 
     # ── Receivables due (AR invoices) ──────────────────────────────────────
     try:
@@ -195,8 +213,9 @@ def generate_cash_flow_forecast(
             inv_no = row.get("invoice_number") or ""
             desc = f"Invoice {inv_no}".strip() if inv_no else "Sales invoice due"
             _add_item(due, "in", "receivable", desc, amt)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.exception("Failed to load customer receivables for cash-flow forecast")
+        raise CashFlowForecastDataError("customer_receivables") from exc
 
     # ── Recurring transactions ─────────────────────────────────────────────
     try:
@@ -243,7 +262,12 @@ def generate_cash_flow_forecast(
                 _add_item(candidate, direction, item_type, name, amt)
                 candidate = _advance(candidate, schedule, day)
     except Exception:
-        pass
+        logger.exception("Failed to load recurring transactions for cash-flow forecast")
+        is_partial = True
+        warnings.append({
+            "code": "recurring_transactions_unavailable",
+            "message": "Recurring transactions could not be loaded and are excluded from this forecast.",
+        })
 
     # ── Build running balance ──────────────────────────────────────────────
     running = opening_balance
@@ -279,9 +303,11 @@ def generate_cash_flow_forecast(
             "total_outflows": _f(total_outflows),
             "closing_balance": _f(running),
         },
+        "is_partial": is_partial,
+        "warnings": warnings,
         "disclaimer": (
-            "Forecast is indicative only. Payables use total invoice amount (not net of payments). "
-            "Receivables use outstanding balance. Recurring amounts are projected from templates. "
-            "Actual timing may vary."
+            "Forecast is indicative only. Payables use outstanding balances after matched payments "
+            "dated on or before the forecast start date. Receivables use outstanding balance. "
+            "Recurring amounts are projected from templates. Actual timing may vary."
         ),
     }

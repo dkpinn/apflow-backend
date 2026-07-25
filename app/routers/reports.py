@@ -9,7 +9,7 @@ from app.services.aged_payables import generate_aged_payables
 from app.services.aged_receivables import generate_aged_receivables
 from app.services.balance_sheet import generate_balance_sheet
 from app.services.cash_flow import generate_cash_flow
-from app.services.cash_flow_forecast import generate_cash_flow_forecast
+from app.services.cash_flow_forecast import CashFlowForecastDataError, generate_cash_flow_forecast
 from app.services.general_ledger import generate_general_ledger
 from app.services.income_statement import generate_income_statement
 from app.services.transaction_report import (
@@ -90,8 +90,6 @@ def transaction_report(
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
 @router.get("/transactions/export")
 def export_transaction_report(
     auth: UserAuth,
@@ -111,7 +109,6 @@ def export_transaction_report(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     filename_base = f"transactions-{date_from}-to-{date_to}"
     if export_format == "csv":
         content = transaction_report_csv(report)
@@ -299,6 +296,15 @@ def cash_flow_forecast_report(
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CashFlowForecastDataError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "cash_flow_forecast_source_unavailable",
+                "source": exc.source,
+                "message": "Cash-flow forecast data is temporarily unavailable",
+            },
+        ) from exc
 
 
 @router.get("/vat")

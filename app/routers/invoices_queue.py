@@ -27,7 +27,6 @@ from app.services.invoice_extraction_service import (
     get_reextract_job_status,
     log_reextract_failure,
     queue_invoice_job,
-    run_extract_worker_until_empty,
     run_invoice_extraction,
     run_invoice_re_extraction,
     run_reextract_job_background,
@@ -110,9 +109,8 @@ def extract_invoice(
     """
     Legacy-compatible extraction endpoint.
 
-    Default queues and starts the local single-worker processor so the browser
-    does not wait on a long OCR request. Use ?sync=true for the old blocking
-    behavior during debugging.
+    Default queues work for the dedicated invoice worker so the browser does
+    not wait on a long OCR request. Use ?sync=true for blocking diagnostics.
     """
     _raw, organisation_id = _ensure_raw_write(auth, payload.invoice_raw_id, payload.organisation_id)
     if sync:
@@ -128,7 +126,6 @@ def extract_invoice(
         batch_id=payload.batch_id,
         extraction_strategy=payload.extraction_strategy,
     )
-    background_tasks.add_task(run_extract_worker_until_empty)
     return {
         "success": True,
         "status": "queued",

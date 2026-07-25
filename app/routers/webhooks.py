@@ -41,9 +41,61 @@ from app.services.whatsapp_ingestion import (
     store_pending_selection,
     verify_meta_signature,
 )
-from app.services.invoice_extraction_service import run_extract_worker_until_empty
+from app.webhook_limits import (
+    MAILGUN_MAX_ATTACHMENT_BYTES,
+    MAILGUN_MAX_ATTACHMENT_COUNT,
+    MAILGUN_MAX_TOTAL_ATTACHMENT_BYTES,
+)
 
 router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
+
+
+def _required_webhook_secret(name: str) -> str:
+    """Return a configured webhook secret or fail closed.
+
+    Webhook endpoints are intentionally unauthenticated at the HTTP layer, so a
+    missing verification secret must never downgrade them to unsigned access.
+    """
+    value = os.environ.get(name, "").strip()
+    if not value:
+        logger.error("Webhook rejected because %s is not configured", name)
+        raise HTTPException(status_code=503, detail="Webhook verification is not configured")
+    return value
+
+
+def _mailgun_attachment_count(value: Any) -> int:
+    try:
+        count = int(value or 0)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid Mailgun attachment count") from exc
+    if count < 0:
+        raise HTTPException(status_code=400, detail="Invalid Mailgun attachment count")
+    if count > MAILGUN_MAX_ATTACHMENT_COUNT:
+        raise HTTPException(status_code=413, detail="Too many Mailgun attachments")
+    return count
+
+
+async def _read_limited_attachment(file_field: Any, *, remaining_total: int) -> bytes:
+    declared_size = getattr(file_field, "size", None)
+    if declared_size is not None:
+        if declared_size > MAILGUN_MAX_ATTACHMENT_BYTES:
+            raise HTTPException(status_code=413, detail="Mailgun attachment is too large")
+        if declared_size > remaining_total:
+            raise HTTPException(status_code=413, detail="Mailgun attachments exceed total size limit")
+
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file_field.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAILGUN_MAX_ATTACHMENT_BYTES:
+            raise HTTPException(status_code=413, detail="Mailgun attachment is too large")
+        if total > remaining_total:
+            raise HTTPException(status_code=413, detail="Mailgun attachments exceed total size limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -71,16 +123,37 @@ async def email_inbound(
     to avoid Mailgun retry storms.  Use the response body to diagnose routing
     issues during integration testing.
     """
+    signing_key = _required_webhook_secret("MAILGUN_WEBHOOK_SIGNING_KEY")
     form = await request.form()
 
     # ── Signature verification ───────────────────────────────────────────
-    signing_key = os.environ.get("MAILGUN_WEBHOOK_SIGNING_KEY", "")
-    if signing_key:
-        token = str(form.get("token", ""))
-        timestamp = str(form.get("timestamp", ""))
-        signature = str(form.get("signature", ""))
-        if not verify_mailgun_signature(signing_key, token, timestamp, signature):
-            raise HTTPException(status_code=401, detail="Invalid Mailgun webhook signature")
+    token = str(form.get("token", ""))
+    timestamp = str(form.get("timestamp", ""))
+    signature = str(form.get("signature", ""))
+    if not verify_mailgun_signature(signing_key, token, timestamp, signature):
+        raise HTTPException(status_code=401, detail="Invalid Mailgun webhook signature")
+
+    # Validate and read every attachment before creating any records. This
+    # prevents an oversized later file from leaving a partially ingested email.
+    attachment_count = _mailgun_attachment_count(form.get("attachment-count", 0))
+    attachments: list[tuple[str, str, bytes]] = []
+    skipped = 0
+    total_attachment_bytes = 0
+    for i in range(1, attachment_count + 1):
+        file_field = form.get(f"attachment-{i}")
+        if file_field is None or not hasattr(file_field, "filename"):
+            skipped += 1
+            continue
+        file_bytes = await _read_limited_attachment(
+            file_field,
+            remaining_total=MAILGUN_MAX_TOTAL_ATTACHMENT_BYTES - total_attachment_bytes,
+        )
+        total_attachment_bytes += len(file_bytes)
+        attachments.append((
+            file_field.filename or f"email-attachment-{i}",
+            file_field.content_type or "application/octet-stream",
+            file_bytes,
+        ))
 
     # ── Resolve organisation ─────────────────────────────────────────────
     recipient = str(form.get("recipient", ""))
@@ -98,20 +171,8 @@ async def email_inbound(
     uploaded_by = resolve_member_user_id(supabase, org_id, sender) if sender else None
 
     # ── Process attachments ──────────────────────────────────────────────
-    attachment_count = int(form.get("attachment-count", 0) or 0)
     processed_ids: list[str] = []
-    skipped = 0
-
-    for i in range(1, attachment_count + 1):
-        file_field = form.get(f"attachment-{i}")
-        if file_field is None or not hasattr(file_field, "filename"):
-            skipped += 1
-            continue
-
-        file_bytes: bytes = await file_field.read()
-        filename: str = file_field.filename or f"email-attachment-{i}"
-        content_type: str = file_field.content_type or "application/octet-stream"
-
+    for filename, content_type, file_bytes in attachments:
         raw_id = await ingest_email_attachment(
             supabase,
             org_id=org_id,
@@ -124,10 +185,6 @@ async def email_inbound(
             processed_ids.append(raw_id)
         else:
             skipped += 1
-
-    # ── Kick the extraction worker ───────────────────────────────────────
-    if processed_ids:
-        background_tasks.add_task(run_extract_worker_until_empty)
 
     return {
         "status": "ok",
@@ -166,9 +223,7 @@ async def mailgun_events(request: Request) -> dict[str, Any]:
         recipient = str(form.get("recipient") or "")
         details = {key: str(value) for key, value in form.items()}
 
-    signing_key = os.environ.get("MAILGUN_WEBHOOK_SIGNING_KEY")
-    if not signing_key:
-        raise HTTPException(status_code=500, detail="MAILGUN_WEBHOOK_SIGNING_KEY not configured")
+    signing_key = _required_webhook_secret("MAILGUN_WEBHOOK_SIGNING_KEY")
     if not verify_mailgun_signature(signing_key, token, timestamp, signature):
         raise HTTPException(status_code=401, detail="Invalid Mailgun webhook signature")
 
@@ -278,14 +333,13 @@ async def whatsapp_inbound(
 
     See: https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks
     """
+    app_secret = _required_webhook_secret("META_APP_SECRET")
     payload_bytes = await request.body()
 
     # ── Signature verification ───────────────────────────────────────────
-    app_secret = os.environ.get("META_APP_SECRET", "")
-    if app_secret:
-        sig_header = request.headers.get("X-Hub-Signature-256", "")
-        if not verify_meta_signature(app_secret, payload_bytes, sig_header):
-            raise HTTPException(status_code=403, detail="Invalid Meta webhook signature")
+    sig_header = request.headers.get("X-Hub-Signature-256", "")
+    if not verify_meta_signature(app_secret, payload_bytes, sig_header):
+        raise HTTPException(status_code=403, detail="Invalid Meta webhook signature")
 
     try:
         payload = json.loads(payload_bytes)
@@ -297,23 +351,17 @@ async def whatsapp_inbound(
     phone_number_id = os.environ.get("META_WHATSAPP_PHONE_NUMBER_ID", "")
     supabase = get_supabase_client()
 
-    any_ingested = False
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
             for message in value.get("messages", []):
-                ingested = await _handle_whatsapp_message(
+                await _handle_whatsapp_message(
                     supabase=supabase,
                     message=message,
                     access_token=access_token,
                     phone_number_id=phone_number_id,
                     background_tasks=background_tasks,
                 )
-                if ingested:
-                    any_ingested = True
-
-    if any_ingested:
-        background_tasks.add_task(run_extract_worker_until_empty)
 
     # Always 200 to prevent Meta retrying
     return {"status": "ok"}
@@ -330,7 +378,7 @@ async def _handle_whatsapp_message(
     """
     Process one inbound WhatsApp message.
 
-    Returns True if a document was successfully ingested (caller kicks the worker).
+    Returns True if a document was successfully ingested.
     """
     from_wa_id: str = message.get("from", "")
     msg_type: str = message.get("type", "")
