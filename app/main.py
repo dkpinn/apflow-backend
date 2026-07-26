@@ -27,6 +27,7 @@ from app.routers import bank_lines
 from app.routers import bank_attachments
 from app.routers import bank_extraction_benchmark
 from app.routers import bank_extraction_admin
+from app.routers import invoice_extraction_admin
 from app.routers import reports
 from app.routers import asset_types
 from app.routers import document_autofill
@@ -104,6 +105,7 @@ app.include_router(bank_lines.router)
 app.include_router(bank_attachments.router)
 app.include_router(bank_extraction_benchmark.router)
 app.include_router(bank_extraction_admin.router)
+app.include_router(invoice_extraction_admin.router)
 app.include_router(reports.router)
 app.include_router(asset_types.router)
 app.include_router(document_autofill.router)

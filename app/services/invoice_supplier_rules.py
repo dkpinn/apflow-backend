@@ -516,7 +516,7 @@ def _fetch_current_line_items(supabase, invoice_extracted_id: Optional[str]) -> 
             .table("invoice_line_items")
             .select("*")
             .eq("invoice_extracted_id", invoice_extracted_id)
-            .order("created_at", desc=False)
+            .order("sort_order", desc=False)
             .order("id", desc=False)
             .execute()
         )

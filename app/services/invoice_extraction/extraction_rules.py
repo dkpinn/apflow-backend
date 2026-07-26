@@ -188,6 +188,33 @@ def looks_like_location_cluster(name: str) -> bool:
     return True  # Looks like suburb/area names
 
 
+def infer_strong_document_type(text: str) -> str | None:
+    """Return a document type only when the text contains strong evidence.
+
+    This is a deterministic guard for model classification mistakes, not a
+    general classifier. In particular, statements must not enter the supplier
+    invoice workflow merely because they contain invoice rows and totals.
+    """
+    compact = re.sub(r"\s+", " ", text or "").lower()
+    statement_signals = sum(
+        signal in compact
+        for signal in (
+            "statement date",
+            "account statement",
+            "opening balance",
+            "closing balance",
+            "balance brought forward",
+            "current statement total",
+            "days past net payment terms",
+        )
+    )
+    if re.search(r"\bstatement\b", compact) and statement_signals >= 1:
+        return "statement"
+    if re.search(r"\bcredit\s+note\b", compact):
+        return "credit_note"
+    return None
+
+
 @dataclass(frozen=True)
 class VatCandidate:
     value: str

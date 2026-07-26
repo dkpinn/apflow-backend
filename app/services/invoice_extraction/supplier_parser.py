@@ -182,6 +182,8 @@ def is_valid_supplier_candidate(line: str) -> bool:
         "welcome",
         "welcame",
         "welkom",
+        "flight",
+        "status",
     ]
 
     if not clean:
@@ -194,6 +196,11 @@ def is_valid_supplier_candidate(line: str) -> bool:
         or looks_like_address_value(clean)
         or is_recipient_block_label(clean)
     ):
+        return False
+
+    if re.search(r"\bstore\s*(?:number|no\.?|#)\b", lower):
+        return False
+    if re.search(r"\b(?:gauteng|kwazulu[ -]?natal|western cape|eastern cape|limpopo|mpumalanga|free state|north west|northern cape)\b", lower) and re.search(r"\b\d{4}\b", clean):
         return False
 
     if lower in {"pty", "(pty)", "ltd", "limited", "(pty) ltd", "pty ltd"}:
@@ -219,7 +226,7 @@ def is_valid_supplier_candidate(line: str) -> bool:
     if len(words) == 1 and len(words[0]) <= 4 and not re.search(r"\b(absa|fnb)\b", lower):
         return False
 
-    if "@" in line:
+    if "@" in line or re.search(r"\b[a-z0-9.-]+\.(?:co\.za|com|net|org)\b", lower):
         return False
 
     if any(term in lower for term in ignored_terms):
@@ -546,6 +553,9 @@ def extract_supplier_from_top_header(lines: list[str]) -> Optional[str]:
 
 def extract_supplier_name(text: str, layout_type: str = "unknown") -> Optional[str]:
     lines = normalise_lines(text)
+
+    if re.search(r"\bfly\s*safair\b|\bflysafair\b", text, re.IGNORECASE):
+        return "FlySafair"
 
     # 1. Template-specific rules
     if layout_type == "evetech_image_invoice" or "evetech" in text.lower():

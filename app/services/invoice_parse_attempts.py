@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from app.services.invoice_line_items import build_line_item_diagnostics
@@ -39,30 +40,51 @@ def _has_meaningful_text(text: Optional[str]) -> bool:
     return bool((text or "").strip())
 
 
-def _attempt_score(attempt: dict) -> tuple:
+def _decimal(value) -> Optional[Decimal]:
+    try:
+        return Decimal(str(value)) if value is not None else None
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _amounts_reconcile(parsed: dict, line_items: list[dict]) -> bool:
+    subtotal = _decimal(parsed.get("subtotal"))
+    tax = _decimal(parsed.get("tax_amount"))
+    total = _decimal(parsed.get("total_amount"))
+    if subtotal is not None and tax is not None and total is not None:
+        if abs((subtotal + tax) - total) <= Decimal("0.05"):
+            return True
+    line_total = sum(
+        (_decimal(item.get("line_total")) or Decimal("0")) for item in line_items
+    )
+    return bool(line_items and subtotal is not None and abs(line_total - subtotal) <= Decimal("0.05"))
+
+
+def parse_attempt_quality_score(attempt: dict) -> float:
+    """Rank extraction evidence, not a parser's self-reported confidence."""
     parsed = attempt.get("parsed_data") or {}
     line_items = attempt.get("line_items") or []
     confidence = float(attempt.get("confidence_score") or 0)
     candidate_score = float(attempt.get("candidate_score") or 0)
-    has_total = 1 if parsed.get("total_amount") else 0
-    has_supplier = 1 if parsed.get("supplier_name_extracted") else 0
-    has_invoice_number = 1 if parsed.get("invoice_number") else 0
-    text_length = len(attempt.get("text_preview") or "")
-    return (
-        confidence,
-        candidate_score,
-        min(len(line_items), 20),
-        has_total,
-        has_supplier,
-        has_invoice_number,
-        text_length,
+    required = sum(
+        1 for field in ("invoice_number", "invoice_date", "subtotal", "tax_amount", "total_amount")
+        if parsed.get(field) not in (None, "")
     )
+    score = required * 8.0
+    score += min(len(line_items), 30) * 2.0
+    score += 24.0 if _amounts_reconcile(parsed, line_items) else 0.0
+    score += 5.0 if parsed.get("supplier_name_extracted") else 0.0
+    score += min(len(attempt.get("text_preview") or "") / 1000.0, 5.0)
+    score += confidence * 3.0 + candidate_score
+    if attempt.get("strategy") == "pdf_text":
+        score += 3.0
+    return round(score, 6)
 
 
 def select_best_parse_attempt(attempts: list[dict]) -> Optional[dict]:
     if not attempts:
         return None
-    return max(attempts, key=_attempt_score)
+    return max(attempts, key=parse_attempt_quality_score)
 
 
 def build_parse_attempt(

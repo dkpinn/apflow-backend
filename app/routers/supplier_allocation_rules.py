@@ -344,7 +344,7 @@ def create_supplier_allocation_rules_from_invoice(
         .table("invoice_line_items")
         .select("*")
         .eq("invoice_extracted_id", payload.invoice_extracted_id)
-        .order("created_at", desc=False)
+        .order("sort_order", desc=False)
         .order("id", desc=False)
     )
     if payload.line_item_ids:

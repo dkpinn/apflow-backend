@@ -14,8 +14,8 @@ from app.dependencies import (
 from app.services.sales_invoice_documents import (
     persist_sales_invoice_pdf,
     render_sales_invoice_pdf,
-    send_sales_invoice_email,
 )
+from app.services.sales_invoice_delivery import dispatch_sales_invoice
 from app.services.sales_invoices import issue_sales_invoice
 from app.routers.sales_invoices import (
     CreditNoteRequest,
@@ -207,15 +207,22 @@ def send_invoice(invoice_id: str, payload: SendRequest, auth: UserAuth):
     detail = _detail(db, payload.organisation_id, invoice_id)
     if detail.get("status") != "issued":
         raise HTTPException(status_code=409, detail="Only issued invoices can be sent")
-    recipient = payload.recipient_email or detail["customer"].get("default_email")
-    if not recipient:
-        raise HTTPException(status_code=400, detail="Customer has no invoice email address")
+    customer = detail["customer"]
+    if payload.channel == "whatsapp":
+        recipient = payload.recipient_phone or customer.get("phone")
+        if not recipient:
+            raise HTTPException(status_code=400, detail="Customer has no WhatsApp phone number")
+    else:
+        recipient = payload.recipient_email or customer.get("default_email")
+        if not recipient:
+            raise HTTPException(status_code=400, detail="Customer has no invoice email address")
     try:
-        return send_sales_invoice_email(
+        return dispatch_sales_invoice(
             db,
             invoice=detail,
-            pdf_bytes=render_sales_invoice_pdf(detail, detail["lines"]),
-            recipient_email=recipient,
+            lines=detail["lines"],
+            channel=payload.channel,
+            recipient=recipient,
             actor_user_id=str(user_id),
         )
     except Exception as exc:

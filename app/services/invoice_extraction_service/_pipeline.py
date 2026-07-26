@@ -27,8 +27,13 @@ from app.services.invoice_extraction.entity_detection import (
     classify_document_direction,
     name_matches_org,
 )
-from app.services.invoice_extraction.extraction_rules import looks_like_location_cluster
+from app.services.invoice_extraction.extraction_rules import infer_strong_document_type, looks_like_location_cluster
+from app.services.invoice_extraction.invoice_number_parser import (
+    extract_explicit_reference_number,
+    is_probable_flight_number,
+)
 from app.services.invoice_extraction.supplier_parser import is_valid_supplier_candidate
+from app.services.invoice_extraction.template_cleanups import apply_template_cleanups
 from app.services.ai_provider_fallback import extract_with_vlm_fallback
 from app.services.invoice_extraction.vlm_parser import VLM_MERGE_FIELDS
 from app.services.invoice_extraction.banking_parser import reconcile_extracted_bank_name
@@ -410,8 +415,31 @@ def run_invoice_extraction(
                 for field in VLM_MERGE_FIELDS:
                     vlm_value = vlm_data.get(field)
                     if vlm_value is not None and vlm_value != [] and vlm_value != "":
-                        if not parsed_data.get(field) or vlm_confidence > tesseract_confidence:
+                        replace_org_supplier = (
+                            field == "supplier_name_extracted"
+                            and name_matches_org(parsed_data.get(field), organisation)
+                            and is_valid_supplier_candidate(str(vlm_value))
+                            and not name_matches_org(str(vlm_value), organisation)
+                        )
+                        if not parsed_data.get(field) or vlm_confidence > tesseract_confidence or replace_org_supplier:
                             parsed_data[field] = vlm_value
+
+                parsed_data = apply_template_cleanups(
+                    f"{text}\n{vlm_data.get('supplier_name_extracted') or ''}",
+                    parsed_data,
+                )
+
+                explicit_reference = extract_explicit_reference_number(text)
+                if (
+                    explicit_reference
+                    and parsed_data.get("invoice_number")
+                    and is_probable_flight_number(str(parsed_data["invoice_number"]))
+                ):
+                    parsed_data["invoice_number"] = explicit_reference
+
+                strong_document_type = infer_strong_document_type(text)
+                if strong_document_type:
+                    parsed_data["document_type"] = strong_document_type
 
                 parsed_data["confidence_score"] = calculate_confidence(parsed_data)
 
@@ -476,6 +504,10 @@ def run_invoice_extraction(
 
         reconcile_extracted_bank_name(parsed_data, text)
 
+        strong_document_type = infer_strong_document_type(text)
+        if strong_document_type:
+            parsed_data["document_type"] = strong_document_type
+
         supplier_recovery_result = {"applied": False, "fields": []}
         if not parsed_data.get("supplier_name_extracted"):
             supplier_recovery_result = merge_supplier_recovery_fields(parsed_data, text_result)
@@ -494,7 +526,11 @@ def run_invoice_extraction(
                 )
 
         # organisation already fetched above (before VLM trigger) — reused here
-        direction_result = classify_document_direction(text, organisation)
+        direction_result = classify_document_direction(
+            text,
+            organisation,
+            issuer_hint=parsed_data.get("supplier_name_extracted"),
+        )
 
         parsed_data["issuer_name_extracted"] = direction_result.issuer_name
         parsed_data["recipient_name_extracted"] = direction_result.recipient_name
@@ -511,7 +547,7 @@ def run_invoice_extraction(
 
         original_supplier_name = parsed_data.get("supplier_name_extracted")
         supplier_correction_reason, rejected_supplier_candidate = _correct_extracted_supplier(
-            parsed_data, direction_result, text
+            parsed_data, direction_result, text, organisation
         )
 
         if direction_result.confidence_adjustment:
@@ -654,9 +690,26 @@ def run_invoice_extraction(
                     notes=quality_note,
                 )
 
+        missing_field_labels = [
+            label
+            for field, label in (
+                ("supplier_name_extracted", "supplier"),
+                ("invoice_number", "invoice/reference number"),
+                ("invoice_date", "invoice date"),
+                ("total_amount", "total amount"),
+            )
+            if parsed_data.get(field) in (None, "")
+        ]
+        if missing_field_labels:
+            parsed_data["validation_notes"] = _append_validation_note(
+                parsed_data.get("validation_notes"),
+                f"Low confidence because these required fields are missing: {', '.join(missing_field_labels)}.",
+            )
+
         extraction_needs_review = (
             parsed_data.get("confidence_score", 0) < 0.70
             or not parsed_data.get("invoice_number")
+            or not parsed_data.get("invoice_date")
             or not parsed_data.get("total_amount")
             or not parsed_data.get("supplier_name_extracted")
             or parsed_data.get("validation_status") != "passed"

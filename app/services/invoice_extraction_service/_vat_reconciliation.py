@@ -56,6 +56,24 @@ def _auto_reconcile_vat(parsed_data: dict, vat_rate: float = 0.15) -> None:
     if explicit_tax > 0 and derived_subtotal > 0:
         effective_vat_rate = explicit_tax / derived_subtotal
 
+    # Preserve explicitly printed header totals when they reconcile within
+    # ordinary cent rounding and the lines support the printed subtotal. The
+    # extraction layer must not silently rewrite a document's R88,608.57 to
+    # R88,608.56 merely to manufacture exact arithmetic.
+    try:
+        explicit_subtotal = float(parsed_data.get("subtotal"))
+    except (TypeError, ValueError):
+        explicit_subtotal = 0.0
+    if (
+        explicit_subtotal > 0
+        and explicit_tax > 0
+        and abs((explicit_subtotal + explicit_tax) - doc_total) <= 0.05
+        and abs(line_sum - explicit_subtotal) <= 0.05
+    ):
+        parsed_data["prices_include_vat_detected"] = "exclusive"
+        parsed_data["vat_reconciled"] = True
+        return
+
     # Case 2: Prices inclusive (SUM ≈ doc_total)
     diff_inclusive = abs(line_sum - doc_total) / doc_total
 

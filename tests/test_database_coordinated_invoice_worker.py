@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION = ROOT / "supabase/migrations/20260725110000_database_coordinated_invoice_worker.sql"
+MIGRATION = ROOT / "app/db/applied/20260725110000_database_coordinated_invoice_worker.sql"
 _SPEC = importlib.util.spec_from_file_location(
     "document_jobs_under_test", ROOT / "app/services/document_jobs.py"
 )

@@ -16,7 +16,8 @@ from app.services.invoice_data_builders import (
     MISSING_SUPPLIER_VALIDATION_STATUS,
     utc_now_iso,
 )
-from app.services.invoice_extraction.entity_detection import normalise_name
+from app.services.invoice_extraction.entity_detection import name_matches_org, normalise_name
+from app.services.invoice_extraction.extraction_rules import looks_like_address_value, looks_like_location_cluster
 from app.services.invoice_extraction.supplier_parser import (
     extract_supplier_name,
     is_valid_supplier_candidate,
@@ -29,6 +30,7 @@ def _correct_extracted_supplier(
     parsed_data: dict,
     direction_result,
     text: str,
+    organisation: dict | None = None,
 ) -> tuple[str | None, str | None]:
     """Correct the extracted supplier name using document direction context.
 
@@ -41,6 +43,7 @@ def _correct_extracted_supplier(
     issuer_norm = normalise_name(direction_result.issuer_name)
     recipient_norm = normalise_name(direction_result.recipient_name)
     supplier_correction_reason: str | None = None
+    rejected_supplier_candidate: str | None = None
 
     # Correct the common AP extraction error where the parser picks the
     # recipient/customer block as the supplier. In APPayPal, "supplier" means
@@ -75,21 +78,44 @@ def _correct_extracted_supplier(
         and original_supplier_norm
         and original_supplier_norm != issuer_norm
     ):
+        rejected_supplier_candidate = parsed_data.get("supplier_name_extracted")
         parsed_data["supplier_name_extracted"] = direction_result.issuer_name
         supplier_correction_reason = (
             "Supplier candidate differed from detected invoice issuer. "
             "Supplier corrected to issuer because selected organisation appears to be the recipient."
         )
 
-    rejected_supplier_candidate: str | None = None
     current_supplier_name = parsed_data.get("supplier_name_extracted")
-    if current_supplier_name and not is_valid_supplier_candidate(str(current_supplier_name)):
+    candidate_is_organisation = bool(
+        current_supplier_name and name_matches_org(str(current_supplier_name), organisation or {})
+    )
+    candidate_is_location = bool(
+        current_supplier_name
+        and (
+            looks_like_address_value(str(current_supplier_name))
+            or looks_like_location_cluster(str(current_supplier_name))
+        )
+    )
+    if current_supplier_name and (
+        candidate_is_organisation
+        or candidate_is_location
+        or not is_valid_supplier_candidate(str(current_supplier_name))
+    ):
         rejected_supplier_candidate = current_supplier_name
-        recovered_supplier_name = extract_supplier_name(text)
-        if recovered_supplier_name and is_valid_supplier_candidate(recovered_supplier_name):
+        recovered_supplier_name = direction_result.issuer_name or extract_supplier_name(text)
+        recovered_is_organisation = bool(
+            recovered_supplier_name and name_matches_org(recovered_supplier_name, organisation or {})
+        )
+        if (
+            recovered_supplier_name
+            and not recovered_is_organisation
+            and is_valid_supplier_candidate(recovered_supplier_name)
+            and not looks_like_address_value(recovered_supplier_name)
+            and not looks_like_location_cluster(recovered_supplier_name)
+        ):
             parsed_data["supplier_name_extracted"] = recovered_supplier_name
             supplier_correction_reason = (
-                "Supplier candidate looked like a date or document metadata. "
+                "Supplier candidate matched the selected organisation or looked like address/document metadata. "
                 "Supplier recovered from the document header."
             )
         else:
@@ -97,8 +123,8 @@ def _correct_extracted_supplier(
             if parsed_data.get("validation_status") != MISSING_SUPPLIER_VALIDATION_STATUS:
                 parsed_data["validation_status"] = "needs_review"
             rejection_note = (
-                f"Rejected supplier candidate '{rejected_supplier_candidate}' because it looked like "
-                "a date or document metadata. Manual supplier review is required."
+                f"Rejected supplier candidate '{rejected_supplier_candidate}' because it matched the selected "
+                "organisation or looked like an address/document metadata. Manual supplier review is required."
             )
             parsed_data["validation_notes"] = (
                 (parsed_data.get("validation_notes") + " " if parsed_data.get("validation_notes") else "")

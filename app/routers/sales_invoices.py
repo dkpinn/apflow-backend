@@ -97,7 +97,9 @@ class IssueRequest(BaseModel):
 
 class SendRequest(BaseModel):
     organisation_id: str
+    channel: Literal["email", "whatsapp"] = "email"
     recipient_email: Optional[str] = Field(default=None, max_length=320)
+    recipient_phone: Optional[str] = Field(default=None, max_length=32)
 
 
 class CreditNoteRequest(BaseModel):

@@ -55,6 +55,8 @@ _EXTRACTION_PROMPT = (
     "IMPORTANT: 'Total Items' on a receipt is the COUNT of line items purchased (e.g. 'Total Items: 1.00' means 1 item), "
     "NOT a currency amount. Never use a 'Total Items' value as tax_amount, subtotal, or any monetary field. "
     "For till slips and POS receipts, use the receipt number, sale number, or transaction number as invoice_number. "
+    "For airline invoices, use the labelled invoice/reference/booking reference as invoice_number. "
+    "Never use a flight number (for example FA201, SA 123, or BA0057) as invoice_number. "
     "If the only candidate for invoice_number is the date, time, or a timestamp, set invoice_number to null instead. "
     "Each line item should include the item description, quantity, unit price, discounted unit price/discount if printed, line total, "
     "and the item/product code or SKU if printed. "
@@ -113,7 +115,10 @@ class _VLMInvoiceSchema(BaseModel):
             "Must not be a date, VAT status, invoice label, customer name, address, or document metadata."
         ),
     )
-    invoice_number: Optional[str] = Field(None, description="Invoice or tax invoice reference number")
+    invoice_number: Optional[str] = Field(
+        None,
+        description="Labelled invoice/document/booking reference; never an airline flight number",
+    )
     invoice_date: Optional[str] = Field(None, description="Invoice date in YYYY-MM-DD format")
     due_date: Optional[str] = Field(None, description="Payment due date in YYYY-MM-DD format")
     subtotal: Optional[float] = Field(None, description="Subtotal amount before tax")

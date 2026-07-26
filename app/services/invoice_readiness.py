@@ -206,7 +206,7 @@ def _fetch_invoice_context(supabase, invoice_extracted_id: str, organisation_id:
         supabase.table("invoice_line_items")
         .select("*")
         .eq("invoice_extracted_id", invoice_extracted_id)
-        .order("created_at", desc=False)
+        .order("sort_order", desc=False)
         .order("id", desc=False)
     )
     line_ids = [row.get("id") for row in line_items if row.get("id")]

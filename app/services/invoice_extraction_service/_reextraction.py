@@ -10,6 +10,7 @@ Group H from the original invoice_extraction_service.py:
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from typing import Optional
 
 from fastapi import HTTPException
@@ -20,19 +21,29 @@ from app.db.supabase_client import get_supabase_client
 from app.services.audit_log import log_invoice_event
 from app.services.invoice_extraction.entity_detection import classify_document_direction
 from app.services.invoice_extraction.supplier_parser import (
-    extract_supplier_name,
     is_valid_supplier_candidate,
 )
 from app.services.ai_provider_fallback import extract_with_vlm_fallback
 from app.services.invoice_extraction.vlm_parser import VLM_MERGE_FIELDS
 from app.services.invoice_extraction.banking_parser import reconcile_extracted_bank_name
+from app.services.invoice_extraction.contact_parser import (
+    extract_registered_entity_addresses,
+    extract_vat_number_excluding,
+)
+from app.services.invoice_extraction.extraction_rules import infer_strong_document_type
+from app.services.invoice_extraction.template_cleanups import apply_template_cleanups
+from app.services.invoice_extraction.invoice_number_parser import (
+    extract_explicit_reference_number,
+    is_probable_flight_number,
+)
 from app.services.invoice_line_items import build_line_item_diagnostics, replace_invoice_line_items
-from app.services.invoice_ocr_pipeline import calculate_confidence
+from app.services.invoice_ocr_pipeline import calculate_confidence, parse_invoice_fields
 from app.services.invoice_parse_attempts import (
     build_deep_region_parse_attempt,
     ensure_parsed_data_attempt,
     fetch_parse_attempts,
     persist_parse_attempts,
+    select_best_parse_attempt,
 )
 from app.services.invoice_readiness import evaluate_invoice_readiness
 from app.services.invoice_supplier_rules import (
@@ -56,6 +67,7 @@ from ._helpers import (
 )
 from ._job_tracking import update_reextract_job
 from ._vat_reconciliation import _auto_reconcile_vat
+from ._supplier_matching import _correct_extracted_supplier
 
 try:
     supabase = get_supabase_client()
@@ -217,8 +229,58 @@ def run_invoice_re_extraction(
         if job_id:
             update_reextract_job(job_id, status="running", stage="parsing_invoice_fields")
 
-        parsed_data = deep_result.get("parsed_data") or {}
         deep_text = deep_result.get("text") or ""
+        existing_deep_attempt = next(
+            (
+                attempt for attempt in reversed(existing_parse_attempts)
+                if attempt.get("strategy") == "deep_region_ocr"
+                and (attempt.get("text_preview") or "").strip()
+            ),
+            None,
+        )
+        evidence_deep_attempt = deep_attempt if deep_text.strip() else existing_deep_attempt
+        evidence_deep_text = (
+            deep_text
+            if deep_text.strip()
+            else (evidence_deep_attempt or {}).get("text_preview") or ""
+        )
+        source_attempt = select_best_parse_attempt([
+            *existing_parse_attempts,
+            *([deep_attempt] if deep_attempt else []),
+        ])
+        source_is_deep = source_attempt is deep_attempt
+        parsed_data = deepcopy(
+            (source_attempt or {}).get("parsed_data")
+            or deep_result.get("parsed_data")
+            or {}
+        )
+        source_text = (
+            deep_text
+            if source_is_deep
+            else (source_attempt or {}).get("text_preview") or deep_text
+        )
+        # Native PDF text is usually best for fields/tables, while OCR can see
+        # logos and rasterised issuer blocks absent from the PDF text layer.
+        # Use both as entity evidence without letting inferior OCR replace the
+        # selected structured extraction.
+        extraction_text = source_text
+        if not source_is_deep and evidence_deep_text and evidence_deep_text.strip() != source_text.strip():
+            extraction_text = f"{source_text}\n{evidence_deep_text}"
+
+        # Re-run deterministic header parsers so parser fixes apply to an
+        # existing native-PDF attempt while retaining its richer table rows.
+        refreshed_header = parse_invoice_fields(source_text)
+        for field in (
+            "invoice_number",
+            "invoice_date",
+            "due_date",
+            "subtotal",
+            "tax_amount",
+            "total_amount",
+            "currency",
+        ):
+            if refreshed_header.get(field) not in (None, ""):
+                parsed_data[field] = refreshed_header[field]
 
         parsed_supplier_candidate = parsed_data.get("supplier_name_extracted")
         supplier_candidate_invalid = bool(
@@ -259,6 +321,18 @@ def run_invoice_re_extraction(
                     if vlm_value is not None and vlm_value != [] and vlm_value != "":
                         if not parsed_data.get(field) or vlm_confidence > tesseract_confidence:
                             parsed_data[field] = vlm_value
+
+                explicit_reference = extract_explicit_reference_number(extraction_text)
+                if (
+                    explicit_reference
+                    and parsed_data.get("invoice_number")
+                    and is_probable_flight_number(str(parsed_data["invoice_number"]))
+                ):
+                    parsed_data["invoice_number"] = explicit_reference
+
+                strong_document_type = infer_strong_document_type(extraction_text)
+                if strong_document_type:
+                    parsed_data["document_type"] = strong_document_type
 
                 logger.debug("RE-EXTRACT MERGED LINE ITEMS: %d items", len(parsed_data.get("line_items") or []))
                 parsed_data["confidence_score"] = calculate_confidence(parsed_data)
@@ -310,10 +384,13 @@ def run_invoice_re_extraction(
                     notes=f"VLM fallback was needed during re-extract but could not complete: {vlm_result.get('reason') or 'unknown_error'}.",
                 )
 
-        reconcile_extracted_bank_name(parsed_data, deep_text)
+        reconcile_extracted_bank_name(parsed_data, extraction_text)
+        strong_document_type = infer_strong_document_type(extraction_text)
+        if strong_document_type:
+            parsed_data["document_type"] = strong_document_type
 
         organisation = get_organisation(org_id)
-        direction_result = classify_document_direction(deep_text, organisation)
+        direction_result = classify_document_direction(extraction_text, organisation)
         parsed_data["issuer_name_extracted"] = direction_result.issuer_name
         parsed_data["recipient_name_extracted"] = direction_result.recipient_name
         parsed_data["document_direction"] = direction_result.document_direction
@@ -328,33 +405,47 @@ def run_invoice_re_extraction(
             else:
                 parsed_data["validation_notes"] = existing_notes or deep_ocr_dependency_issue
 
-        if (
-            direction_result.document_direction == "supplier_invoice_payable"
-            and direction_result.issuer_name
-            and not parsed_data.get("supplier_name_extracted")
-        ):
+        _, rejected_supplier_candidate = _correct_extracted_supplier(
+            parsed_data, direction_result, extraction_text, organisation
+        )
+
+        if direction_result.document_direction == "supplier_invoice_payable" and direction_result.issuer_name:
             parsed_data["supplier_name_extracted"] = direction_result.issuer_name
+            deep_parsed = (evidence_deep_attempt or {}).get("parsed_data") or {}
+            deep_direction = (
+                classify_document_direction(evidence_deep_text, organisation)
+                if evidence_deep_text else None
+            )
+            if deep_direction and deep_direction.issuer_name == direction_result.issuer_name:
+                for field in (
+                    "supplier_telephone_extracted",
+                    "supplier_fax_extracted",
+                    "supplier_email_extracted",
+                    "supplier_website_extracted",
+                    "company_registration_number_extracted",
+                ):
+                    if deep_parsed.get(field):
+                        parsed_data[field] = deep_parsed[field]
 
-        rejected_supplier_candidate = None
-        current_supplier_name = parsed_data.get("supplier_name_extracted")
-        if current_supplier_name and not is_valid_supplier_candidate(str(current_supplier_name)):
-            rejected_supplier_candidate = current_supplier_name
-            recovered_supplier_name = extract_supplier_name(deep_text)
-            if recovered_supplier_name and is_valid_supplier_candidate(recovered_supplier_name):
-                parsed_data["supplier_name_extracted"] = recovered_supplier_name
-            else:
-                parsed_data["supplier_name_extracted"] = None
-                parsed_data["validation_status"] = "needs_review"
-                rejection_note = (
-                    f"Rejected supplier candidate '{rejected_supplier_candidate}' because it looked like "
-                    "a date or document metadata. Manual supplier review is required."
-                )
-                parsed_data["validation_notes"] = (
-                    (parsed_data.get("validation_notes") + " " if parsed_data.get("validation_notes") else "")
-                    + rejection_note
-                )
-                parsed_data["supplier_candidate_rejected"] = True
+            supplier_vat = extract_vat_number_excluding(
+                extraction_text,
+                [organisation.get("vat_number"), organisation.get("tax_number")],
+            )
+            if supplier_vat:
+                parsed_data["vat_number_extracted"] = supplier_vat
 
+            issuer_addresses = extract_registered_entity_addresses(
+                evidence_deep_text or extraction_text,
+                direction_result.issuer_name,
+            )
+            if issuer_addresses.get("postal"):
+                parsed_data["supplier_pos_address_extracted"] = issuer_addresses["postal"]
+            if issuer_addresses.get("physical"):
+                parsed_data["supplier_del_address_extracted"] = issuer_addresses["physical"]
+
+            parsed_data = apply_template_cleanups(extraction_text, parsed_data)
+
+        if rejected_supplier_candidate:
             log_invoice_event(
                 supabase,
                 organisation_id=org_id,
@@ -367,7 +458,7 @@ def run_invoice_re_extraction(
                 field_name="supplier_name_extracted",
                 old_value={"supplier_name_extracted": rejected_supplier_candidate},
                 new_value={"supplier_name_extracted": parsed_data.get("supplier_name_extracted")},
-                notes="Rejected supplier candidate because it looked like a date or document metadata.",
+                notes="Rejected supplier candidate because it matched the organisation or looked like address/document metadata.",
             )
 
         vat_guard_result = clear_organisation_vat_from_supplier(parsed_data, organisation)
@@ -410,16 +501,12 @@ def run_invoice_re_extraction(
         # the raw parse attempt and invoice update are persisted.
         _auto_reconcile_vat(parsed_data, vat_rate=0.15)
 
-        if deep_attempt:
-            deep_attempt["parsed_data"] = dict(parsed_data)
-            deep_attempt["line_items"] = parsed_data.get("line_items") or []
-            deep_attempt["confidence_score"] = parsed_data.get("confidence_score")
-
+        selected_source_attempt = deepcopy(source_attempt or deep_attempt or {})
         raw_parse_attempts = ensure_parsed_data_attempt(
-            [deep_attempt] if deep_attempt else [],
+            [selected_source_attempt] if selected_source_attempt else [],
             parsed_data=parsed_data,
-            text=deep_text,
-            strategy="deep_region_ocr",
+            text=extraction_text,
+            strategy=(source_attempt or {}).get("strategy") or "deep_region_ocr",
         )
         selected_raw_parse_attempt = raw_parse_attempts[0] if raw_parse_attempts else None
         raw_line_items_found_count = len(parsed_data.get("line_items") or [])
@@ -520,8 +607,11 @@ def run_invoice_re_extraction(
             parse_attempts = [
                 attempt
                 for attempt in existing_parse_attempts
-                if attempt.get("strategy") != "deep_region_ocr"
+                if attempt.get("id") != (source_attempt or {}).get("id")
+                and (attempt.get("strategy") != "deep_region_ocr" or deep_attempt is None)
             ]
+            if deep_attempt and not source_is_deep:
+                parse_attempts.append(deep_attempt)
             parse_attempts.extend(raw_parse_attempts)
             parse_attempt_result = persist_parse_attempts(
                 supabase,

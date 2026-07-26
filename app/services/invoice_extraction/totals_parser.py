@@ -163,6 +163,19 @@ def extract_subtotal(text: str, total_amount: Optional[float], tax_amount: float
     if stacked.get("subtotal") is not None:
         return stacked["subtotal"]
 
+    # Printed South African trade invoices commonly use SUB-TOTAL. Capture
+    # the printed value before falling back to total minus tax, which can
+    # differ by a cent because of document rounding.
+    hyphenated = re.search(
+        r"\bSub\s*-\s*Total\b\s*[:#-]?\s*(?:ZAR|R)?\s*([0-9][0-9\s,]*[,.][0-9]{2})",
+        text,
+        re.IGNORECASE,
+    )
+    if hyphenated:
+        amount = clean_amount(hyphenated.group(1))
+        if amount is not None:
+            return amount
+
     patterns = [
         r"(?:Subtotal|Sub\s*Total|Amount\s*Excl|Net\s*Amount|Net\s*Total)\s*[:#\-]?\s*(?:ZAR|R|GBP|£|USD|\$|EUR|€)?\s*([0-9][0-9\s,]*[,.][0-9]{2})",
     ]

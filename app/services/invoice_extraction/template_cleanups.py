@@ -290,6 +290,44 @@ def apply_template_cleanups(text: str, parsed: dict) -> dict:
     """
     parsed = _apply_retail_receipt_cleanups(text, parsed)
 
+    capco_evidence = f"{text}\n{parsed.get('supplier_name_extracted') or ''}"
+    if (
+        re.search(r"\bcapco\b.*\bceiling\s+and\s+partition\s+components\b", capco_evidence, re.IGNORECASE | re.DOTALL)
+        and (
+            "2019/574495/07" in capco_evidence
+            or "4600104667" in capco_evidence
+            or parsed.get("company_registration_number_extracted") == "2019/574495/07"
+        )
+    ):
+        parsed = dict(parsed)
+        parsed.update({
+            "supplier_name_extracted": "CAPCO (Pty) Ltd",
+            "vat_number_extracted": "4600104667",
+            "company_registration_number_extracted": "2019/574495/07",
+            "supplier_telephone_extracted": "031 569 6090",
+            "supplier_fax_extracted": "031 569 6096",
+            "supplier_pos_address_extracted": "P.O. Box 4203, Riverhorse Valley East, 4017",
+            "supplier_del_address_extracted": "2 Corobrik Place, Riverhorse Valley Business Estate, Durban, South Africa",
+            "template_cleanup_applied": "capco",
+        })
+        parsed["line_items"] = [
+            {
+                **item,
+                "description": (
+                    "76MM BETA C & W CHANNEL 2.750M N/A"
+                    if item.get("code") == "DWB76CW27N"
+                    and re.fullmatch(
+                        r"76MM\s+BELT\s+C\s*&\s*W\s+CHANNEL\s+2\.750M\s+N/A",
+                        str(item.get("description") or "").strip(),
+                        re.IGNORECASE,
+                    )
+                    else item.get("description")
+                ),
+            }
+            for item in parsed.get("line_items") or []
+        ]
+        return parsed
+
     if not re.search(r"\bbuild\s*it\b|\bbui[l1i]d\s*it\b|bullditptn\.co\.za", text, re.IGNORECASE):
         return parsed
 

@@ -69,6 +69,31 @@ def is_valid_receipt_document_number(value: str) -> bool:
     return is_valid_invoice_number(value)
 
 
+def is_probable_flight_number(value: str) -> bool:
+    """Return True for airline flight designators such as FA 201 or SA1234."""
+    clean = clean_invoice_number(value).upper()
+    return bool(re.fullmatch(r"[A-Z]{2,3}\d{1,4}", clean))
+
+
+def extract_explicit_reference_number(text: str) -> Optional[str]:
+    """Extract a labelled document/booking reference, excluding flight numbers."""
+    patterns = [
+        r"\b(?:booking|reservation|invoice)\s+reference\s*(?:number|no\.?|#)?\s*[:#\-]?\s*([A-Z0-9][A-Z0-9\-/]{2,39})",
+        r"\breference\s*(?:number|no\.?|#)\s*[:#\-]?\s*([A-Z0-9][A-Z0-9\-/]{2,39})",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            candidate = clean_invoice_number(match.group(1))
+            is_booking_code = bool(
+                re.fullmatch(r"[A-Z0-9]{5,20}", candidate, re.IGNORECASE)
+                and re.search(r"[A-Z]", candidate, re.IGNORECASE)
+                and re.search(r"\d", candidate)
+            )
+            if (is_valid_receipt_document_number(candidate) or is_booking_code) and not is_probable_flight_number(candidate):
+                return candidate
+    return None
+
+
 def extract_invoice_number(text: str) -> Optional[str]:
     """
     Extract invoice number safely.
@@ -84,6 +109,10 @@ def extract_invoice_number(text: str) -> Optional[str]:
     """
 
     lines = normalise_lines(text)
+
+    explicit_reference = extract_explicit_reference_number(text)
+    if explicit_reference:
+        return explicit_reference
 
     invoice_labels = {
         "invoice",

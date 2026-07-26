@@ -141,7 +141,34 @@ def get_organisation(organisation_id: str) -> Optional[dict]:
         .execute()
     )
 
-    return org_res.data[0] if org_res.data else None
+    if not org_res.data:
+        return None
+
+    organisation = org_res.data[0]
+    try:
+        directors_res = (
+            supabase
+            .table("organisation_directorships")
+            .select("party:organisation_compliance_parties(first_name,surname,other_names,registered_name,trading_name)")
+            .eq("organisation_id", organisation_id)
+            .eq("status", "active")
+            .execute()
+        )
+        director_names: list[str] = []
+        for row in directors_res.data or []:
+            party = row.get("party") or {}
+            natural_name = " ".join(
+                str(party.get(field) or "").strip()
+                for field in ("first_name", "other_names", "surname")
+            ).strip()
+            for candidate in (natural_name, party.get("registered_name"), party.get("trading_name")):
+                if candidate and str(candidate).strip():
+                    director_names.append(str(candidate).strip())
+        organisation["director_names"] = director_names
+    except Exception:
+        logger.warning("Could not load organisation director aliases for %s", organisation_id, exc_info=True)
+        organisation["director_names"] = []
+    return organisation
 
 
 def get_organisation_extraction_settings(organisation_id: str) -> dict:

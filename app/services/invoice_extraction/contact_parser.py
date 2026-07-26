@@ -112,6 +112,47 @@ def extract_vat_number(text: str) -> Optional[str]:
     return best.value
 
 
+def extract_vat_number_excluding(text: str, excluded_values: list[object]) -> Optional[str]:
+    """Return the strongest VAT candidate that is not owned by the recipient."""
+    excluded = {
+        re.sub(r"\D", "", str(value or ""))
+        for value in excluded_values
+        if value
+    }
+    for candidate in extract_vat_candidates(normalise_lines(text)):
+        digits = re.sub(r"\D", "", candidate.value)
+        if candidate.score >= 0 and digits not in excluded:
+            return candidate.value
+    return None
+
+
+def extract_registered_entity_addresses(text: str, issuer_name: Optional[str]) -> dict:
+    """Extract postal/physical addresses following a registered issuer block."""
+    if not issuer_name:
+        return {"postal": None, "physical": None}
+    match = re.search(re.escape(issuer_name), text, re.IGNORECASE)
+    if not match:
+        return {"postal": None, "physical": None}
+    region = re.sub(r"\s+", " ", text[match.start():match.start() + 900]).strip()
+    postal_match = re.search(
+        r"(P\.?\s*O\.?\s*Box\s+\d+\s*,?\s*.*?\b\d{4}\b)",
+        region,
+        re.IGNORECASE,
+    )
+    postal = postal_match.group(1).strip(" ,") if postal_match else None
+    physical = None
+    if postal_match:
+        remainder = region[postal_match.end():]
+        physical_match = re.search(
+            r"(\d+[A-Za-z]?\s+.*?South\s+Africa)\b",
+            remainder,
+            re.IGNORECASE,
+        )
+        if physical_match:
+            physical = physical_match.group(1).strip(" ,")
+    return {"postal": postal, "physical": physical}
+
+
 def extract_customer_code(text: str) -> Optional[str]:
     # High-specificity labels — unambiguously a customer/account code
     high_priority = [

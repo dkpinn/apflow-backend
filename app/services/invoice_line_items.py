@@ -78,8 +78,9 @@ def build_line_item_payload(
             "expense_account": item.get("expense_account"),
             "vat_treatment": item.get("vat_treatment"),  # may be enriched later by account lookup
             "tracking": item.get("tracking"),
+            "sort_order": index,
         }
-        for item in line_items or []
+        for index, item in enumerate(line_items or [])
     ]
 
 
