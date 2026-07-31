@@ -54,6 +54,38 @@ IGNORABLE_SUPPLIER_COMPARISON_FIELDS = {
     "company_registration_number_extracted",
 }
 
+EDITABLE_INVOICE_DOCUMENT_FIELDS = {
+    "invoice_number",
+    "document_reference",
+    "supplier_name_extracted",
+    "invoice_date",
+    "due_date",
+    "subtotal",
+    "tax_amount",
+    "total_amount",
+    "currency",
+    "supplier_email_extracted",
+    "supplier_acc_email_extracted",
+    "supplier_telephone_extracted",
+    "supplier_fax_extracted",
+    "supplier_cell_extracted",
+    "supplier_website_extracted",
+    "supplier_del_address_extracted",
+    "supplier_pos_address_extracted",
+    "vat_number_extracted",
+    "cus_code_extracted",
+    "company_registration_number_extracted",
+    "bank_account_name_extracted",
+    "bank_name_extracted",
+    "bank_account_number_extracted",
+    "bank_branch_code_extracted",
+    "bank_swift_code_extracted",
+    "issuer_name_extracted",
+    "recipient_name_extracted",
+    "expense_account",
+}
+NUMERIC_INVOICE_DOCUMENT_FIELDS = {"subtotal", "tax_amount", "total_amount"}
+
 
 class AgentSuggestionActionRequest(BaseModel):
     note: Optional[str] = None
@@ -64,6 +96,12 @@ class SupplierComparisonIgnoreRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class InvoiceDocumentFieldsUpdateRequest(BaseModel):
+    organisation_id: str
+    fields: dict[str, object]
+    correction_type: str = "manual"
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @router.get("/{invoice_id}/review-data")
@@ -72,6 +110,121 @@ def get_invoice_review_data(invoice_id: str, auth: UserAuth):
     user_id, _db = auth
     ensure_org_read(user_id, review_data.get("organisation_id"))
     return review_data
+
+
+@router.patch("/{invoice_id}/document-fields")
+def update_invoice_document_fields(
+    invoice_id: str,
+    payload: InvoiceDocumentFieldsUpdateRequest,
+    auth: UserAuth,
+):
+    """Persist reviewer corrections through the authorised service-role client."""
+    user_id, _db = auth
+    review_data = _build_invoice_review_data(invoice_id)
+    organisation_id = str(review_data.get("organisation_id") or "")
+    invoice_extracted_id = str(review_data.get("invoice_extracted_id") or "")
+    invoice_raw_id = review_data.get("invoice_raw_id")
+    before = dict(review_data.get("invoice") or {})
+
+    if not organisation_id or not invoice_extracted_id:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if str(payload.organisation_id) != organisation_id:
+        raise HTTPException(status_code=400, detail="Invoice does not belong to organisation_id")
+    _ensure_agent_write_access(user_id, organisation_id)
+
+    unsupported = sorted(set(payload.fields) - EDITABLE_INVOICE_DOCUMENT_FIELDS)
+    if unsupported:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported invoice document fields: {', '.join(unsupported)}",
+        )
+    if not payload.fields:
+        raise HTTPException(status_code=422, detail="At least one invoice document field is required")
+    if payload.correction_type not in {"manual", "supplier_master"}:
+        raise HTTPException(status_code=422, detail="Unsupported correction_type")
+
+    fields: dict[str, object] = {}
+    for field_name, raw_value in payload.fields.items():
+        if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+            fields[field_name] = None
+        elif field_name in NUMERIC_INVOICE_DOCUMENT_FIELDS:
+            try:
+                fields[field_name] = float(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{field_name} must be a number",
+                ) from exc
+        elif isinstance(raw_value, (str, int, float)):
+            fields[field_name] = str(raw_value).strip()
+        else:
+            raise HTTPException(status_code=422, detail=f"{field_name} must be a scalar value")
+
+    supabase.table("invoices_extracted").update(fields).eq(
+        "id", invoice_extracted_id
+    ).eq("organisation_id", organisation_id).execute()
+
+    saved_res = (
+        supabase.table("invoices_extracted")
+        .select("*")
+        .eq("id", invoice_extracted_id)
+        .eq("organisation_id", organisation_id)
+        .limit(1)
+        .execute()
+    )
+    saved = saved_res.data[0] if saved_res.data else None
+    if not saved or any(saved.get(key) != value for key, value in fields.items()):
+        raise HTTPException(status_code=500, detail="Invoice field update was not persisted")
+
+    feedback_rows = []
+    for field_name, corrected_value in fields.items():
+        extracted_value = before.get(field_name)
+        if extracted_value == corrected_value:
+            continue
+        feedback_rows.append({
+            "organisation_id": organisation_id,
+            "invoice_raw_id": invoice_raw_id,
+            "invoice_extracted_id": invoice_extracted_id,
+            "supplier_id": before.get("supplier_id"),
+            "field_name": field_name,
+            "extracted_value": None if extracted_value is None else str(extracted_value),
+            "corrected_value": None if corrected_value is None else str(corrected_value),
+            "source_text": None,
+            "layout_type": before.get("layout_type"),
+            "correction_type": payload.correction_type,
+            "created_by": user_id,
+        })
+    feedback_recorded = True
+    if feedback_rows:
+        try:
+            supabase.table("invoice_extraction_feedback").insert(feedback_rows).execute()
+        except Exception:
+            feedback_recorded = False
+            logger.exception("Invoice fields saved but correction feedback insert failed")
+
+    log_invoice_event(
+        supabase,
+        organisation_id=organisation_id,
+        invoice_raw_id=invoice_raw_id,
+        invoice_extracted_id=invoice_extracted_id,
+        event_type="invoice_document_fields_updated",
+        stage="review",
+        actor_type="user",
+        actor_user_id=user_id,
+        old_value={key: before.get(key) for key in fields},
+        new_value=fields,
+        notes=(
+            "Invoice document field updated from supplier master."
+            if payload.correction_type == "supplier_master"
+            else "Invoice document fields updated by reviewer."
+        ),
+    )
+    return {
+        "success": True,
+        "invoice": saved,
+        "updated_fields": fields,
+        "feedback_recorded": feedback_recorded,
+    }
 
 
 def _build_invoice_review_data(invoice_id: str):

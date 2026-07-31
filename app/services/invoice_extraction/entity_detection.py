@@ -171,6 +171,10 @@ def is_probable_entity(line: str) -> bool:
         return False
     if lower in BAD_ENTITY_TERMS:
         return False
+    if re.search(r"\b(?:company\s+)?reg(?:istration)?\s*(?:number|no\.?|#)\b", lower):
+        return False
+    if re.match(r"^(?:vat|tax|company\s+registration)\s*(?:number|no\.?|#)?\s*[:\-]", lower):
+        return False
     if is_survey_noise_line(clean):
         return False
     if any(term in lower for term in ["www.", "@", "tel", "phone", "fax", "branch", "account number"]):
@@ -195,6 +199,24 @@ def best_legal_entity(lines: list[str]) -> Optional[str]:
         if is_probable_entity(line):
             return line.strip()
     return None
+
+
+def legal_entity_candidates(lines: list[str]) -> list[str]:
+    candidates: list[str] = []
+    for index, line in enumerate(lines):
+        joined = line
+        if index + 1 < len(lines) and re.match(
+            r"^\s*\(?\s*(?:pty|ltd|limited|cc)\b|^\s*\(?\s*pty\s*\)?\s*ltd\b",
+            lines[index + 1],
+            re.IGNORECASE,
+        ):
+            joined = f"{line} {lines[index + 1]}"
+        if re.match(r"^\s*\(?\s*(?:pty|ltd|limited|cc)\b", line, re.IGNORECASE) and index > 0:
+            joined = f"{lines[index - 1]} {line}"
+        joined = re.sub(r"\s+", " ", joined).strip()
+        if is_probable_entity(joined) and LEGAL_ENTITY_RE.search(joined):
+            candidates.append(joined)
+    return candidates
 
 
 def extract_issuer_name(text: str) -> Optional[str]:
@@ -330,6 +352,18 @@ def classify_document_direction(
         issuer = known_receipt_issuer
         if not receipt_has_named_customer(text):
             recipient = "Cash/Card"
+
+    # Many supplier invoices print the customer prominently in the header and
+    # the issuer's registered name lower down beside banking/payment details.
+    # If the initial header candidate is our own organisation, preserve it as
+    # recipient and select the first other legal entity as the issuer.
+    if organisation and issuer and name_matches_org(issuer, organisation):
+        for candidate in legal_entity_candidates(normalise_lines(text)[:160]):
+            if name_matches_org(candidate, organisation):
+                continue
+            recipient = recipient or issuer
+            issuer = candidate
+            break
 
     if (
         issuer_hint

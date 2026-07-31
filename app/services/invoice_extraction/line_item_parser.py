@@ -580,8 +580,60 @@ def extract_code_qty_total_rows(text: str) -> list[dict]:
     return items
 
 
+def extract_description_column_blocks(lines: list[str]) -> list[dict]:
+    """Parse native PDF tables serialized as description then separate value lines."""
+    start = next((i + 1 for i, line in enumerate(lines) if line.lower() == "amount zar"), None)
+    if start is None:
+        return []
+    end = next((i for i in range(start, len(lines)) if lines[i].lower().startswith("subtotal")), len(lines))
+    items: list[dict] = []
+    index = start
+    while index < end:
+        if is_amount(lines[index]) or re.fullmatch(r"\d+(?:\.\d+)?%", lines[index]):
+            index += 1
+            continue
+        description_parts = [lines[index]]
+        index += 1
+        while index < end and not is_amount(lines[index]) and not re.fullmatch(r"\d+(?:\.\d+)?%", lines[index]):
+            description_parts.append(lines[index])
+            index += 1
+        values: list[float] = []
+        vat_rate: Optional[float] = None
+        raw_values: list[str] = []
+        while index < end and (is_amount(lines[index]) or re.fullmatch(r"\d+(?:\.\d+)?%", lines[index])):
+            raw = lines[index]
+            raw_values.append(raw)
+            if raw.endswith("%"):
+                vat_rate = clean_amount(raw[:-1])
+            else:
+                amount = clean_amount(raw)
+                if amount is not None:
+                    values.append(amount)
+            index += 1
+        if len(values) < 3:
+            continue
+        quantity, unit_price, line_total = values[0], values[1], values[-1]
+        item = {
+            "code": None,
+            "description": " ".join(description_parts),
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "line_total": line_total,
+            "raw_line": " | ".join(description_parts + raw_values),
+        }
+        if vat_rate is not None:
+            item["tax_amount"] = _round_money(line_total * vat_rate / 100)
+            item["pricing_notes"] = {"vat_rate": vat_rate}
+        items.append(item)
+    return items
+
+
 def extract_line_items(text: str, layout_type: str = "unknown") -> list[dict]:
     lines = normalise_lines(text)
+
+    description_blocks = extract_description_column_blocks(lines)
+    if description_blocks:
+        return description_blocks
 
     if layout_type == "row_table":
         row_items = extract_line_items_from_single_rows(lines)

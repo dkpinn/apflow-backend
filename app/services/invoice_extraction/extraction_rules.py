@@ -32,7 +32,7 @@ SUPPLIER_EVIDENCE_RE = re.compile(
 
 DOCUMENT_METADATA_RE = re.compile(
     r"\b("
-    r"tax\s+invoice|invoice\s+(?:number|no|date)|document\s+no|date|page|"
+    r"tax\s+invoice|invoice(?:\s+(?:number|no|date))?|document\s+no|date|page|"
     r"customer\s+(?:no|number|code)|sales\s*person|sales\s*rep|terms|"
     r"po\s+number|reference|qty|quantity|item\s+number|description|"
     r"unit\s+price|disc\s+price|discount|extended\s+price|subtotal|total"
@@ -206,9 +206,18 @@ def infer_strong_document_type(text: str) -> str | None:
             "balance brought forward",
             "current statement total",
             "days past net payment terms",
+            "days late",
+            "balance due current",
+            "inv. date due on",
+            "payment terms: all orders",
         )
     )
-    if re.search(r"\bstatement\b", compact) and statement_signals >= 1:
+    statement_label = bool(re.search(r"\bstatem(?:ent|erit|e?t)\b", compact))
+    statement_table = bool(
+        re.search(r"\binv\.?\s*#?\s+inv\.?\s*date\s+due\s+on\b", compact)
+        and re.search(r"\b(?:days\s+late|balance)\b", compact)
+    )
+    if (statement_label and statement_signals >= 1) or statement_table or statement_signals >= 3:
         return "statement"
     if re.search(r"\bcredit\s+note\b", compact):
         return "credit_note"

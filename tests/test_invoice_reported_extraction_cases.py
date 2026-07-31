@@ -12,6 +12,7 @@ from app.services.invoice_extraction.totals_parser import extract_subtotal
 from app.services.invoice_extraction.template_cleanups import apply_template_cleanups
 from app.services.invoice_extraction_service._supplier_matching import _correct_extracted_supplier
 from app.services.invoice_parse_attempts import select_best_parse_attempt
+from app.services.supplier_statement_parser import normalise_supplier_statement
 
 
 def _direction(*, issuer=None, recipient=None, direction="unknown"):
@@ -73,6 +74,54 @@ def test_address_returned_by_vlm_is_replaced_with_header_issuer():
 def test_contact_or_status_text_cannot_be_a_supplier():
     assert not is_valid_supplier_candidate("steffen signfacets.co.za / renato signfacets.co.za")
     assert not is_valid_supplier_candidate("Status")
+    assert not is_valid_supplier_candidate("Company Registration No: 2014/248504/07")
+
+
+def test_customer_in_header_and_supplier_near_banking_details_are_role_resolved():
+    text = """
+    TAX INVOICE
+    Misty Sea Trading 305 (Pty) Ltd
+    VAT Number: 4170249066
+    Invoice Date 8 May 2026
+    Invoice Number INV-0847
+    Description Quantity Unit Price VAT Amount ZAR
+    Subtotal 1,520.00
+    TOTAL VAT 228.00
+    TOTAL ZAR 1,748.00
+    Banking Details:
+    Lukky Vonadik Design (Pty) Ltd t/a Toosh Seating
+    Bank: First National Bank
+    """
+    organisation = {
+        "name": "Misty Sea Trading 305 (Pty) Ltd",
+        "legal_name": "Misty Sea Trading 305 (Pty) Ltd",
+    }
+
+    result = classify_document_direction(text, organisation)
+
+    assert result.issuer_name == "Lukky Vonadik Design (Pty) Ltd t/a Toosh Seating"
+    assert result.recipient_name == "Misty Sea Trading 305 (Pty) Ltd"
+    assert result.document_direction == "supplier_invoice_payable"
+
+
+def test_parse_attempt_penalises_registration_label_as_supplier():
+    common = {
+        "strategy": "pdf_text",
+        "confidence_score": 0.8,
+        "parsed_data": {
+            "invoice_number": "INV-0847",
+            "invoice_date": "2026-05-08",
+            "subtotal": 1520,
+            "tax_amount": 228,
+            "total_amount": 1748,
+        },
+        "line_items": [{"line_total": 1520}],
+        "text_preview": "invoice evidence",
+    }
+    bad = {**common, "parsed_data": {**common["parsed_data"], "supplier_name_extracted": "Company Registration No: 2014/248504/07"}}
+    good = {**common, "parsed_data": {**common["parsed_data"], "supplier_name_extracted": "Lukky Vonadik Design (Pty) Ltd"}}
+
+    assert select_best_parse_attempt([bad, good]) is good
 
 
 def test_flysafair_reference_wins_over_flight_number():
@@ -99,6 +148,55 @@ def test_sign_facets_document_is_deterministically_a_statement():
     """
 
     assert infer_strong_document_type(text) == "statement"
+
+
+def test_sign_facets_statement_is_routed_and_uses_statement_fields_only():
+    text = """
+    Sign Facets Cape Town (Pty) Ltd
+    PO Box 3462
+    Glenvista, Gauteng, 2058
+    ph. 011-900 4064
+    fax. 011-900 1800
+    email: steffen@signfacets.co.za / renato@signfacets.co.za
+    Statement Date: 2026/06/19
+    Store No. 1
+    ATTN: Daniel Kerr
+    Misty Sea Trading 305 (Pty) Ltd
+    email: daniel@switchd-on.co.za
+    Inv. # Inv. Date Due On Days Late P.O. # Orderer Total Balance
+    SF8494 2026/06/19 2026/06/19 0 Daniel Kerr R3 698.81 R3 698.81
+    Payment Terms: All Orders Days Past Net Payment Terms
+    Balance Due Current 1 - 30 Days 31 - 60 Days 61 - 90 Days Over 90 Days
+    R12 158.06 R0.00 R12 158.06 R0.00 R0.00 R0.00
+    Current Statement Total Here.
+    """
+    organisation = {
+        "name": "Misty Sea Trading 305 (Pty) Ltd",
+        "legal_name": "Misty Sea Trading 305 (Pty) Ltd",
+    }
+
+    assert infer_strong_document_type(text) == "statement"
+    result = normalise_supplier_statement(
+        {
+            "supplier_name_extracted": "Glenvista, Gauteng 2058 Store No",
+            "invoice_number": "202606190000",
+            "line_items": [{"description": "wrong invoice row"}],
+        },
+        text,
+        organisation,
+    )
+
+    assert result["document_type"] == "statement"
+    assert result["supplier_name_extracted"] == "Sign Facets Cape Town (Pty) Ltd"
+    assert result["invoice_number"] == "STATEMENT-2026-06-19"
+    assert result["invoice_date"] == "2026-06-19"
+    assert result["total_amount"] == 12158.06
+    assert result["supplier_telephone_extracted"] == "011-900 4064"
+    assert result["supplier_fax_extracted"] == "011-900 1800"
+    assert result["supplier_email_extracted"] == "steffen@signfacets.co.za"
+    assert result["supplier_pos_address_extracted"] == "PO Box 3462\nGlenvista, Gauteng, 2058"
+    assert result["supplier_del_address_extracted"] is None
+    assert result["line_items"] == []
 
 
 def test_capco_registered_trading_name_is_issuer_and_selected_org_is_recipient():

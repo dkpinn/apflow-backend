@@ -37,6 +37,7 @@ from app.services.invoice_extraction.template_cleanups import apply_template_cle
 from app.services.ai_provider_fallback import extract_with_vlm_fallback
 from app.services.invoice_extraction.vlm_parser import VLM_MERGE_FIELDS
 from app.services.invoice_extraction.banking_parser import reconcile_extracted_bank_name
+from app.services.invoice_extraction.contact_parser import extract_vat_number_excluding, reconcile_supplier_addresses
 from ._vat_reconciliation import _auto_reconcile_vat
 from ._supplier_matching import _attempt_supplier_auto_link, _correct_extracted_supplier
 
@@ -94,6 +95,7 @@ from app.services.invoice_data_builders import (
     utc_now_iso,
 )
 from app.services.organisation_extraction_settings import get_organisation_extraction_settings
+from app.services.supplier_statement_parser import normalise_supplier_statement
 from ._helpers import (
     get_raw_invoice,
     get_organisation,
@@ -314,6 +316,9 @@ def run_invoice_extraction(
         vlm_enabled = organisation_settings.get("vlm_enabled", False)
 
         parsed_data = parse_invoice_fields(text)
+        initial_document_type = infer_strong_document_type(text)
+        if initial_document_type:
+            parsed_data["document_type"] = initial_document_type
         if ocr_dependency_issue:
             parsed_data["validation_status"] = "needs_review"
             parsed_data["validation_notes"] = _append_validation_note(
@@ -370,7 +375,7 @@ def run_invoice_extraction(
             parsed_supplier_candidate
             and not is_valid_supplier_candidate(str(parsed_supplier_candidate))
         )
-        vlm_should_try = (
+        vlm_should_try = parsed_data.get("document_type") != "statement" and (
             force_vlm
             or parsed_data.get("confidence_score", 0) < 0.70
             or not parsed_data.get("invoice_number")
@@ -549,6 +554,14 @@ def run_invoice_extraction(
         supplier_correction_reason, rejected_supplier_candidate = _correct_extracted_supplier(
             parsed_data, direction_result, text, organisation
         )
+        if direction_result.document_direction == "supplier_invoice_payable":
+            parsed_data = reconcile_supplier_addresses(
+                parsed_data,
+                text,
+                direction_result.issuer_name,
+            )
+        if parsed_data.get("document_type") == "statement":
+            parsed_data = normalise_supplier_statement(parsed_data, text, organisation)
 
         if direction_result.confidence_adjustment:
             parsed_data["confidence_score"] = round(
@@ -571,6 +584,13 @@ def run_invoice_extraction(
                 new_value=None,
                 notes=vat_guard_result.get("note"),
             )
+        if parsed_data.get("document_type") != "statement":
+            supplier_vat = extract_vat_number_excluding(
+                text,
+                [(organisation or {}).get("vat_number"), (organisation or {}).get("tax_number")],
+            )
+            if supplier_vat:
+                parsed_data["vat_number_extracted"] = supplier_vat
 
         missing_supplier_failure = (
             False
@@ -739,7 +759,8 @@ def run_invoice_extraction(
     # Compare SUM(line_totals) against document total to determine whether
     # prices are VAT-inclusive or exclusive, then correct accordingly.
     # This prevents the "Solve" prompt for systematic VAT differences.
-    _auto_reconcile_vat(parsed_data, vat_rate=0.15)
+    if parsed_data.get("document_type") != "statement":
+        _auto_reconcile_vat(parsed_data, vat_rate=0.15)
 
     extracted_payload = {
         "organisation_id": org_id,
@@ -794,17 +815,23 @@ def run_invoice_extraction(
         "prices_include_vat_detected": parsed_data.get("prices_include_vat_detected"),
     }
 
-    auto_linked_supplier_id, auto_link_match_result = _attempt_supplier_auto_link(
-        supabase, org_id, invoice_raw_id, parsed_data, extracted_payload
-    )
-
-    supplier_settings = fetch_supplier_processing_settings(
-        supabase,
-        extracted_payload.get("supplier_id"),
-    )
-    supplier_rule_result = apply_supplier_processing_rules(parsed_data, supplier_settings)
-    extracted_payload.update(supplier_rule_result["invoice_patch"])
-    line_items = supplier_rule_result["line_items"]
+    auto_linked_supplier_id = None
+    auto_link_match_result = None
+    if parsed_data.get("document_type") == "statement":
+        extracted_payload["supplier_id"] = None
+        supplier_rule_result = {"invoice_patch": {}, "line_items": []}
+        line_items = []
+    else:
+        auto_linked_supplier_id, auto_link_match_result = _attempt_supplier_auto_link(
+            supabase, org_id, invoice_raw_id, parsed_data, extracted_payload
+        )
+        supplier_settings = fetch_supplier_processing_settings(
+            supabase,
+            extracted_payload.get("supplier_id"),
+        )
+        supplier_rule_result = apply_supplier_processing_rules(parsed_data, supplier_settings)
+        extracted_payload.update(supplier_rule_result["invoice_patch"])
+        line_items = supplier_rule_result["line_items"]
 
     logger.debug("EXTRACTED PAYLOAD TO SAVE: %s", extracted_payload)
 

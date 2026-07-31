@@ -78,7 +78,7 @@ def extract_supplier_website(text: str) -> Optional[str]:
 
 def extract_supplier_telephone(text: str) -> Optional[str]:
     patterns = [
-        r"(?:Tel|Telephone|Phone)\s*[:#\-]?\s*([+0-9 ()\-]{7,25})",
+        r"(?:Tel|Telephone|Phone|Ph\.?)\s*[:#\-]?\s*([+0-9 ()\-]{7,25})",
         r"\b(0\d{2}\s*\d{3}\s*\d{4})\b",
     ]
 
@@ -87,7 +87,7 @@ def extract_supplier_telephone(text: str) -> Optional[str]:
 
 def extract_supplier_fax(text: str) -> Optional[str]:
     patterns = [
-        r"(?:Fax)\s*[:#\-]?\s*([+0-9 ()\-]{7,25})",
+        r"(?:Fax\.?)\s*[:#\-]?\s*([+0-9 ()\-]{7,25})",
     ]
 
     return extract_first_match(text, patterns)
@@ -273,9 +273,18 @@ def extract_supplier_postal_address(text: str) -> Optional[str]:
     if start_index is None:
         return None
 
+    if start_index > 0 and re.match(
+        r"^(?:suite|unit|box|mailbox)\s+[A-Z0-9\-/]+\b",
+        lines[start_index - 1],
+        re.IGNORECASE,
+    ):
+        start_index -= 1
+
     stop_terms = [
         "tel:",
         "telephone:",
+        "ph:",
+        "ph.",
         "fax:",
         "e-mail:",
         "email:",
@@ -285,12 +294,23 @@ def extract_supplier_postal_address(text: str) -> Optional[str]:
         "tax invoice",
         "vat:",
         "computer generated",
+        "description",
+        "quantity",
+        "unit price",
+        "amount zar",
+        "line total",
+        "subtotal",
+        "total vat",
     ]
 
     postal_lines: list[str] = []
 
     for line in lines[start_index:start_index + 8]:
         lower = line.lower()
+        is_mailbox_line = bool(re.search(
+            r"\bp\s*\.?\s*o\s*\.?\s*box\b|\bpo\s+box\b|\bprivate\s+bag\b|\bpostnet\s+(?:suite|box|mailbox)\b",
+            lower,
+        ))
 
         if any(term in lower for term in stop_terms):
             break
@@ -298,10 +318,38 @@ def extract_supplier_postal_address(text: str) -> Optional[str]:
         if "@" in line or "www." in lower:
             break
 
+        if (is_address_stop_line(line) and not is_mailbox_line) or is_recipient_block_label(line):
+            break
+
         if len(line) <= 90:
             postal_lines.append(line)
 
     return "\n".join(postal_lines).strip() if postal_lines else None
+
+
+def reconcile_supplier_addresses(
+    parsed: dict,
+    text: str,
+    issuer_name: Optional[str],
+) -> dict:
+    """Replace contaminated OCR/VLM addresses with strict issuer/mailbox evidence."""
+    registered = extract_registered_entity_addresses(text, issuer_name)
+    strict_postal = registered.get("postal") or extract_supplier_postal_address(text)
+    strict_physical = registered.get("physical")
+
+    current_postal = parsed.get("supplier_pos_address_extracted")
+    if strict_postal:
+        parsed["supplier_pos_address_extracted"] = strict_postal
+    elif current_postal and address_contains_metadata(str(current_postal)):
+        parsed["supplier_pos_address_extracted"] = None
+
+    current_physical = parsed.get("supplier_del_address_extracted")
+    if strict_physical:
+        parsed["supplier_del_address_extracted"] = strict_physical
+    elif current_physical and address_contains_metadata(str(current_physical)):
+        parsed["supplier_del_address_extracted"] = None
+
+    return parsed
 
 
 # Backwards-compatible names, if old code still imports these.

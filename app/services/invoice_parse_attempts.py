@@ -11,6 +11,7 @@ from app.services.invoice_ocr_pipeline import (
     deep_extract_text_with_regions,
     parse_invoice_fields,
 )
+from app.services.invoice_extraction.supplier_parser import is_valid_supplier_candidate
 
 
 PARSE_ATTEMPT_SELECT = (
@@ -73,7 +74,11 @@ def parse_attempt_quality_score(attempt: dict) -> float:
     score = required * 8.0
     score += min(len(line_items), 30) * 2.0
     score += 24.0 if _amounts_reconcile(parsed, line_items) else 0.0
-    score += 5.0 if parsed.get("supplier_name_extracted") else 0.0
+    supplier = parsed.get("supplier_name_extracted")
+    if supplier and is_valid_supplier_candidate(str(supplier)):
+        score += 5.0
+    elif supplier:
+        score -= 12.0
     score += min(len(attempt.get("text_preview") or "") / 1000.0, 5.0)
     score += confidence * 3.0 + candidate_score
     if attempt.get("strategy") == "pdf_text":

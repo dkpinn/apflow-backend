@@ -109,6 +109,138 @@ class GeneratePreviewRequest(BaseModel):
     organisation_id: str
 
 
+class ResetInvoiceRequest(BaseModel):
+    organisation_id: Optional[str] = None
+
+
+def _extracted_rows_for_raw(invoice_raw_id: str) -> list[dict]:
+    return (
+        supabase.table("invoices_extracted")
+        .select("id, posting_status")
+        .eq("invoice_raw_id", invoice_raw_id)
+        .execute()
+    ).data or []
+
+
+def _ensure_invoice_can_be_removed(extracted_rows: list[dict]) -> None:
+    """Protect posted invoices and invoices already included in payment runs."""
+    extracted_ids = [str(row["id"]) for row in extracted_rows if row.get("id")]
+    if not extracted_ids:
+        return
+
+    posted = [
+        str(row["id"])
+        for row in extracted_rows
+        if row.get("id") and str(row.get("posting_status") or "").lower() == "posted"
+    ]
+    if posted:
+        raise HTTPException(
+            status_code=409,
+            detail="Posted invoices cannot be reset or deleted. Reverse the GL posting first.",
+        )
+
+    payment_run_items = (
+        supabase.table("supplier_payment_run_items")
+        .select("id")
+        .in_("invoice_extracted_id", extracted_ids)
+        .limit(1)
+        .execute()
+    ).data or []
+    if payment_run_items:
+        raise HTTPException(
+            status_code=409,
+            detail="This invoice is included in a supplier payment run. Remove it from the payment run first.",
+        )
+
+
+def _remove_invoice_extraction_data(invoice_raw_id: str, extracted_rows: list[dict]) -> None:
+    """Remove derived extraction rows while preserving the original upload."""
+    extracted_ids = [str(row["id"]) for row in extracted_rows if row.get("id")]
+
+    # These legacy tables do not consistently have cascading foreign keys in
+    # every deployed database, so remove their rows explicitly first.
+    supabase.table("invoice_parse_attempts").delete().eq("invoice_raw_id", invoice_raw_id).execute()
+    supabase.table("invoice_agent_suggestions").delete().eq("invoice_raw_id", invoice_raw_id).execute()
+    supabase.table("invoice_extraction_feedback").delete().eq("invoice_raw_id", invoice_raw_id).execute()
+    if extracted_ids:
+        supabase.table("invoice_audit_log").delete().in_("invoice_id", extracted_ids).execute()
+        supabase.table("invoice_line_items").delete().in_("invoice_extracted_id", extracted_ids).execute()
+        supabase.table("invoices_extracted").delete().in_("id", extracted_ids).execute()
+
+    supabase.table("document_pages").delete().eq("invoice_raw_id", invoice_raw_id).execute()
+    supabase.table("invoice_page_groups").delete().eq("invoice_raw_id", invoice_raw_id).execute()
+
+
+@router.post("/raw/{invoice_raw_id}/reset")
+def reset_invoice_for_reparse(invoice_raw_id: str, payload: ResetInvoiceRequest, auth: UserAuth):
+    """Delete derived data and queue the retained upload for a clean extraction."""
+    _raw, organisation_id = _load_raw_invoice_for_auth(
+        invoice_raw_id,
+        auth,
+        requested_org_id=payload.organisation_id,
+        write=True,
+    )
+    extracted_rows = _extracted_rows_for_raw(invoice_raw_id)
+    _ensure_invoice_can_be_removed(extracted_rows)
+    _remove_invoice_extraction_data(invoice_raw_id, extracted_rows)
+
+    supabase.table("invoices_raw").update({
+        "parse_status": "pending",
+        "upload_status": "uploaded",
+    }).eq("id", invoice_raw_id).eq("organisation_id", organisation_id).execute()
+    job = queue_invoice_job(
+        invoice_raw_id=invoice_raw_id,
+        organisation_id=organisation_id,
+    )
+    return {
+        "success": True,
+        "status": "queued",
+        "invoice_raw_id": invoice_raw_id,
+        "organisation_id": organisation_id,
+        "job_id": job["id"],
+    }
+
+
+@router.delete("/raw/{invoice_raw_id}")
+def delete_invoice_upload(
+    invoice_raw_id: str,
+    auth: UserAuth,
+    organisation_id: Optional[str] = Query(default=None),
+):
+    """Permanently delete an invoice upload through an authorised service-role cascade."""
+    raw, resolved_org_id = _load_raw_invoice_for_auth(
+        invoice_raw_id,
+        auth,
+        requested_org_id=organisation_id,
+        write=True,
+    )
+    extracted_rows = _extracted_rows_for_raw(invoice_raw_id)
+    _ensure_invoice_can_be_removed(extracted_rows)
+    _remove_invoice_extraction_data(invoice_raw_id, extracted_rows)
+
+    # Audit events are tied to the raw upload logically but older deployments
+    # do not have a foreign key that cascades them.
+    supabase.table("invoice_audit_events").delete().eq("invoice_raw_id", invoice_raw_id).execute()
+    supabase.table("invoices_raw").delete().eq("id", invoice_raw_id).eq(
+        "organisation_id", resolved_org_id
+    ).execute()
+
+    storage_deleted = True
+    file_path = raw.get("file_path")
+    if file_path:
+        try:
+            supabase.storage.from_("invoices").remove([file_path])
+        except Exception:
+            storage_deleted = False
+            logger.exception("Invoice row deleted but storage cleanup failed for %s", invoice_raw_id)
+
+    return {
+        "success": True,
+        "invoice_raw_id": invoice_raw_id,
+        "storage_deleted": storage_deleted,
+    }
+
+
 @router.post("/jobs/process-next")
 def process_next_invoice_job(payload: ProcessNextJobRequest, auth: UserAuth):
     if not payload.organisation_id:

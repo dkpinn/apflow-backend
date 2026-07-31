@@ -165,8 +165,24 @@ def get_organisation(organisation_id: str) -> Optional[dict]:
                 if candidate and str(candidate).strip():
                     director_names.append(str(candidate).strip())
         organisation["director_names"] = director_names
-    except Exception:
-        logger.warning("Could not load organisation director aliases for %s", organisation_id, exc_info=True)
+    except Exception as exc:
+        message = str(exc)
+        missing_optional_table = (
+            "PGRST205" in message
+            and "organisation_directorships" in message
+        )
+        if missing_optional_table:
+            logger.info(
+                "Organisation director aliases unavailable for %s; optional compliance table is not installed.",
+                organisation_id,
+            )
+        else:
+            logger.warning(
+                "Could not load organisation director aliases for %s: %s",
+                organisation_id,
+                exc,
+                exc_info=True,
+            )
         organisation["director_names"] = []
     return organisation
 

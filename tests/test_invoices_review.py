@@ -124,6 +124,95 @@ def test_get_invoice_review_data_404_when_not_found(monkeypatch):
     assert exc_info.value.status_code == 404
 
 
+def test_update_invoice_document_field_from_supplier_master_persists(monkeypatch):
+    invoice = {
+        **_invoice_row(),
+        "supplier_pos_address_extracted": "Incorrect scanned address",
+        "layout_type": "native_pdf",
+    }
+    db = MemoryDB({
+        "invoices_extracted": [invoice],
+        "invoice_extraction_feedback": [],
+        "invoice_audit_events": [],
+    })
+    monkeypatch.setattr(rv, "supabase", db)
+    monkeypatch.setattr(
+        rv,
+        "_build_invoice_review_data",
+        lambda _invoice_id: _fake_context(invoice=invoice),
+    )
+    monkeypatch.setattr(rv, "_ensure_agent_write_access", lambda *_args: None)
+
+    result = rv.update_invoice_document_fields(
+        "inv-1",
+        rv.InvoiceDocumentFieldsUpdateRequest(
+            organisation_id="org-1",
+            fields={"supplier_pos_address_extracted": "PO Box 25589, Gateway, Kwa-Zulu Natal, 4321"},
+            correction_type="supplier_master",
+        ),
+        AUTH,
+    )
+
+    assert result["success"] is True
+    assert result["invoice"]["supplier_pos_address_extracted"] == "PO Box 25589, Gateway, Kwa-Zulu Natal, 4321"
+    assert db.tables["invoices_extracted"][0]["supplier_pos_address_extracted"] == "PO Box 25589, Gateway, Kwa-Zulu Natal, 4321"
+    assert db.tables["invoice_extraction_feedback"][0]["correction_type"] == "supplier_master"
+
+
+def test_update_invoice_document_field_rejects_unsafe_field(monkeypatch):
+    invoice = _invoice_row()
+    db = MemoryDB({"invoices_extracted": [invoice]})
+    monkeypatch.setattr(rv, "supabase", db)
+    monkeypatch.setattr(
+        rv,
+        "_build_invoice_review_data",
+        lambda _invoice_id: _fake_context(invoice=invoice),
+    )
+    monkeypatch.setattr(rv, "_ensure_agent_write_access", lambda *_args: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        rv.update_invoice_document_fields(
+            "inv-1",
+            rv.InvoiceDocumentFieldsUpdateRequest(
+                organisation_id="org-1",
+                fields={"posting_status": "unposted"},
+            ),
+            AUTH,
+        )
+
+    assert exc_info.value.status_code == 422
+    assert "posting_status" not in db.tables["invoices_extracted"][0]
+
+
+def test_update_invoice_document_field_authorizes_before_update(monkeypatch):
+    invoice = _invoice_row()
+    db = MemoryDB({"invoices_extracted": [invoice]})
+    monkeypatch.setattr(rv, "supabase", db)
+    monkeypatch.setattr(
+        rv,
+        "_build_invoice_review_data",
+        lambda _invoice_id: _fake_context(invoice=invoice),
+    )
+    monkeypatch.setattr(
+        rv,
+        "_ensure_agent_write_access",
+        lambda *_args: (_ for _ in ()).throw(HTTPException(status_code=403, detail="denied")),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        rv.update_invoice_document_fields(
+            "inv-1",
+            rv.InvoiceDocumentFieldsUpdateRequest(
+                organisation_id="org-1",
+                fields={"supplier_pos_address_extracted": "new"},
+            ),
+            AUTH,
+        )
+
+    assert exc_info.value.status_code == 403
+    assert "supplier_pos_address_extracted" not in db.tables["invoices_extracted"][0]
+
+
 def test_get_invoice_review_data_requires_org_read(monkeypatch):
     db = StubDB({
         "invoices_extracted": [_invoice_row()],

@@ -135,6 +135,7 @@ def is_metadata_supplier_candidate(line: str) -> bool:
         r"\binvoice\s+(date|number|no)\b",
         r"\bvat\s*(number|no|registration)?\b",
         r"\b(qty|quantity|description|unit\s+price|subtotal|total)\b",
+        r"\b(?:company\s+)?reg(?:istration)?\s*(?:number|no\.?|#)\b",
     ]
     return any(re.search(pattern, lower) for pattern in metadata_patterns)
 

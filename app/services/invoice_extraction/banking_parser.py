@@ -280,7 +280,7 @@ def extract_bank_account_number(text: str) -> Optional[str]:
     lines = normalise_lines(search_text)
 
     same_line_patterns = [
-        r"^(?:Account\s*(?:No\.?|Number)?|Acc\s*No\.?|Bank\s*Account)\s*[:#\-]?\s*([0-9\- ]{6,25})$",
+        r"^(?:Account\s*(?:No\.?|Number)?|Acc(?:\s*No\.?)?|Bank\s*Account)\s*[:#\-]?\s*([0-9\- ]{6,25})$",
     ]
 
     candidate = extract_same_line_value(search_text, same_line_patterns)

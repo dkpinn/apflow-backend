@@ -29,6 +29,7 @@ from app.services.invoice_extraction.banking_parser import reconcile_extracted_b
 from app.services.invoice_extraction.contact_parser import (
     extract_registered_entity_addresses,
     extract_vat_number_excluding,
+    reconcile_supplier_addresses,
 )
 from app.services.invoice_extraction.extraction_rules import infer_strong_document_type
 from app.services.invoice_extraction.template_cleanups import apply_template_cleanups
@@ -59,6 +60,7 @@ from app.services.invoice_data_builders import (
     build_reextract_update,
     clear_organisation_vat_from_supplier,
 )
+from app.services.supplier_statement_parser import normalise_supplier_statement
 from ._helpers import (
     get_raw_invoice,
     get_organisation,
@@ -267,6 +269,10 @@ def run_invoice_re_extraction(
         if not source_is_deep and evidence_deep_text and evidence_deep_text.strip() != source_text.strip():
             extraction_text = f"{source_text}\n{evidence_deep_text}"
 
+        detected_document_type = infer_strong_document_type(extraction_text)
+        if detected_document_type:
+            parsed_data["document_type"] = detected_document_type
+
         # Re-run deterministic header parsers so parser fixes apply to an
         # existing native-PDF attempt while retaining its richer table rows.
         refreshed_header = parse_invoice_fields(source_text)
@@ -287,7 +293,7 @@ def run_invoice_re_extraction(
             parsed_supplier_candidate
             and not is_valid_supplier_candidate(str(parsed_supplier_candidate))
         )
-        vlm_should_try = (
+        vlm_should_try = parsed_data.get("document_type") != "statement" and (
             parsed_data.get("confidence_score", 0) < 0.70
             or not parsed_data.get("invoice_number")
             or not parsed_data.get("total_amount")
@@ -409,6 +415,9 @@ def run_invoice_re_extraction(
             parsed_data, direction_result, extraction_text, organisation
         )
 
+        if parsed_data.get("document_type") == "statement":
+            parsed_data = normalise_supplier_statement(parsed_data, extraction_text, organisation)
+
         if direction_result.document_direction == "supplier_invoice_payable" and direction_result.issuer_name:
             parsed_data["supplier_name_extracted"] = direction_result.issuer_name
             deep_parsed = (evidence_deep_attempt or {}).get("parsed_data") or {}
@@ -444,6 +453,11 @@ def run_invoice_re_extraction(
                 parsed_data["supplier_del_address_extracted"] = issuer_addresses["physical"]
 
             parsed_data = apply_template_cleanups(extraction_text, parsed_data)
+            parsed_data = reconcile_supplier_addresses(
+                parsed_data,
+                evidence_deep_text or extraction_text,
+                direction_result.issuer_name,
+            )
 
         if rejected_supplier_candidate:
             log_invoice_event(
@@ -499,7 +513,8 @@ def run_invoice_re_extraction(
         # Keep re-extraction arithmetic identical to the primary extraction path.
         # This must run after VLM/OCR merging and VAT identity guards, but before
         # the raw parse attempt and invoice update are persisted.
-        _auto_reconcile_vat(parsed_data, vat_rate=0.15)
+        if parsed_data.get("document_type") != "statement":
+            _auto_reconcile_vat(parsed_data, vat_rate=0.15)
 
         selected_source_attempt = deepcopy(source_attempt or deep_attempt or {})
         raw_parse_attempts = ensure_parsed_data_attempt(
@@ -516,6 +531,26 @@ def run_invoice_re_extraction(
             parsed=parsed_data,
             force_update=force_update,
         )
+        if parsed_data.get("document_type") == "statement":
+            statement_fields = {
+                "document_type": "statement",
+                "supplier_name_extracted": parsed_data.get("supplier_name_extracted"),
+                "invoice_number": parsed_data.get("invoice_number"),
+                "invoice_date": parsed_data.get("invoice_date"),
+                "due_date": None,
+                "subtotal": None,
+                "tax_amount": None,
+                "total_amount": parsed_data.get("total_amount"),
+                "supplier_del_address_extracted": None,
+                "supplier_pos_address_extracted": parsed_data.get("supplier_pos_address_extracted"),
+                "supplier_email_extracted": parsed_data.get("supplier_email_extracted"),
+                "supplier_acc_email_extracted": parsed_data.get("supplier_acc_email_extracted"),
+                "supplier_telephone_extracted": parsed_data.get("supplier_telephone_extracted"),
+                "supplier_fax_extracted": parsed_data.get("supplier_fax_extracted"),
+                "cus_code_extracted": None,
+                "supplier_id": None,
+            }
+            update_payload.update(statement_fields)
 
         log_invoice_event(
             supabase,
@@ -539,16 +574,32 @@ def run_invoice_re_extraction(
         if job_id:
             update_reextract_job(job_id, status="running", stage="extracting_line_items")
 
-        supplier_settings = fetch_supplier_processing_settings(
-            supabase,
-            existing.get("supplier_id") or raw.get("supplier_id"),
-        )
-        supplier_rule_result = apply_supplier_processing_rules(parsed_data, supplier_settings)
-        line_items = supplier_rule_result["line_items"]
-        update_payload.update(supplier_rule_result["invoice_patch"])
+        if parsed_data.get("document_type") == "statement":
+            supplier_settings = {}
+            supplier_rule_result = {"invoice_patch": {}, "line_items": []}
+            line_items = []
+        else:
+            supplier_settings = fetch_supplier_processing_settings(
+                supabase,
+                existing.get("supplier_id") or raw.get("supplier_id"),
+            )
+            supplier_rule_result = apply_supplier_processing_rules(parsed_data, supplier_settings)
+            line_items = supplier_rule_result["line_items"]
+            update_payload.update(supplier_rule_result["invoice_patch"])
 
         line_items_replaced = False
-        if line_items:
+        if parsed_data.get("document_type") == "statement":
+            line_item_diagnostics = replace_invoice_line_items(
+                supabase,
+                invoice_extracted_id=extracted_invoice_id,
+                organisation_id=org_id,
+                line_items=[],
+                invoice_total=None,
+                delete_when_empty=True,
+                raise_on_error=False,
+            )
+            line_items_replaced = not bool(line_item_diagnostics.get("line_items_insert_error"))
+        elif line_items:
             line_item_diagnostics = replace_invoice_line_items(
                 supabase,
                 invoice_extracted_id=extracted_invoice_id,
