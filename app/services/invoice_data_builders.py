@@ -71,6 +71,7 @@ def build_extracted_supplier_profile(parsed_data: dict) -> dict:
 def build_extracted_document_profile(parsed_data: dict) -> dict:
     return {
         "invoice_number": parsed_data.get("invoice_number"),
+        "document_reference": parsed_data.get("document_reference"),
         "invoice_date": parsed_data.get("invoice_date"),
         "due_date": parsed_data.get("due_date"),
         "subtotal": parsed_data.get("subtotal"),
@@ -164,8 +165,11 @@ def build_supplier_create_payload(
 # ---------------------------------------------------------------------------
 
 REEXTRACT_FIELD_MAP = {
+    "document_type": "document_type",
+    "document_count": "document_count",
     "supplier_name_extracted": "supplier_name_extracted",
     "invoice_number": "invoice_number",
+    "document_reference": "document_reference",
     "invoice_date": "invoice_date",
     "due_date": "due_date",
     "subtotal": "subtotal",
@@ -194,6 +198,7 @@ REEXTRACT_FIELD_MAP = {
     "organisation_match_status": "organisation_match_status",
     "validation_status": "validation_status",
     "validation_notes": "validation_notes",
+    "prices_include_vat_detected": "prices_include_vat_detected",
 }
 
 SUPPLIER_RECOVERY_FIELDS = [
@@ -232,7 +237,14 @@ MISSING_SUPPLIER_NOTE = (
 
 # Status/classification fields whose latest extraction value should always win.
 # The "has old value" guard does not apply to these.
-_ALWAYS_UPDATE_FIELDS = {"validation_status", "document_direction", "organisation_match_status"}
+_ALWAYS_UPDATE_FIELDS = {
+    "document_type",
+    "document_count",
+    "validation_status",
+    "document_direction",
+    "organisation_match_status",
+    "prices_include_vat_detected",
+}
 
 # A user-triggered re-scan must be allowed to refresh valid banking evidence even
 # when unrelated OCR fields keep the overall confidence score flat. Global
@@ -283,6 +295,11 @@ def _looks_suspicious_value(field_name: str, value) -> bool:
 
 
 def _valid_reextract_value(field_name: str, value) -> bool:
+    if field_name == "tax_amount":
+        try:
+            return value not in (None, "") and float(value) >= 0
+        except Exception:
+            return False
     if not _has_value(value):
         return False
 
@@ -291,11 +308,26 @@ def _valid_reextract_value(field_name: str, value) -> bool:
             return float(value) > 0
         except Exception:
             return False
-    if field_name == "tax_amount":
+    if field_name == "document_count":
         try:
-            return float(value) >= 0
+            return int(value) >= 1
         except Exception:
             return False
+    if field_name == "document_type":
+        return str(value) in {
+            "tax_invoice",
+            "invoice",
+            "credit_note",
+            "card_receipt",
+            "receipt",
+            "till_slip",
+            "statement",
+            "quotation",
+            "delivery_note",
+            "other",
+        }
+    if field_name == "prices_include_vat_detected":
+        return value in {"inclusive", "exclusive"}
     if field_name in {"vat_number_extracted", "bank_account_number_extracted"}:
         return len("".join(char for char in str(value) if char.isdigit())) >= 7
     if field_name == "bank_name_extracted":
@@ -453,6 +485,17 @@ def build_reextract_update(
         old_value = existing.get(target_field)
 
         if not _valid_reextract_value(target_field, new_value):
+            # A forced rerun must represent the fresh extractor output, not
+            # retain manually corrected or stale values that the new run did
+            # not find. This is essential for trustworthy benchmark scoring.
+            if force_update and parsed_key in parsed and new_value in (None, "") and old_value is not None:
+                update_payload[target_field] = None
+                improved_fields.append({
+                    "field": target_field,
+                    "old_value": old_value,
+                    "new_value": None,
+                })
+                continue
             if target_field == "supplier_name_extracted" and _looks_suspicious_value(target_field, old_value):
                 update_payload[target_field] = None
                 improved_fields.append({

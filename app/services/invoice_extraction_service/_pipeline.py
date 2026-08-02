@@ -40,6 +40,12 @@ from app.services.invoice_extraction.banking_parser import reconcile_extracted_b
 from app.services.invoice_extraction.contact_parser import extract_vat_number_excluding, reconcile_supplier_addresses
 from ._vat_reconciliation import _auto_reconcile_vat
 from ._supplier_matching import _attempt_supplier_auto_link, _correct_extracted_supplier
+from ._vlm_routing import (
+    is_image_document,
+    should_replace_with_vlm,
+    should_try_vlm,
+    vlm_routing_reasons,
+)
 
 # Published rates (USD per million tokens) — update when providers change pricing.
 _COST_PER_MILLION: dict[str, dict[str, float]] = {
@@ -360,10 +366,7 @@ def run_invoice_extraction(
         #     the `vlm_enabled` gate previously blocked this — removed as OCR adds cost with no benefit).
         #   Images (JPEG/PNG/WEBP/HEIC) → VLM always, regardless of vlm_enabled.
         #     If no API key is configured, extract_with_vlm_fallback returns None gracefully.
-        is_image_file = (
-            (raw.get("file_type") or "").startswith("image/")
-            or _is_image_bytes(file_bytes)
-        )
+        is_image_file = is_image_document(file_bytes, raw.get("file_type"))
         is_scanned_pdf = text_result.get("ocr_used", False) and not is_image_file
         force_vlm = (
             (strategy == "vlm" and vlm_enabled)
@@ -396,6 +399,16 @@ def run_invoice_extraction(
                 and parsed_data.get("total_amount")
             )
         )
+        routing_reasons = vlm_routing_reasons(
+            parsed_data,
+            force_vlm=force_vlm,
+            organisation=organisation,
+        )
+        vlm_should_try = should_try_vlm(
+            parsed_data,
+            force_vlm=force_vlm,
+            organisation=organisation,
+        )
 
         _extraction_input_tokens: int | None = None
         _extraction_output_tokens: int | None = None
@@ -426,7 +439,15 @@ def run_invoice_extraction(
                             and is_valid_supplier_candidate(str(vlm_value))
                             and not name_matches_org(str(vlm_value), organisation)
                         )
-                        if not parsed_data.get(field) or vlm_confidence > tesseract_confidence or replace_org_supplier:
+                        if should_replace_with_vlm(
+                            field,
+                            current_value=parsed_data.get(field),
+                            vlm_value=vlm_value,
+                            force_vlm=force_vlm,
+                            routing_reasons=routing_reasons,
+                            vlm_confidence=float(vlm_confidence or 0),
+                            text_confidence=float(tesseract_confidence or 0),
+                        ) or replace_org_supplier:
                             parsed_data[field] = vlm_value
 
                 parsed_data = apply_template_cleanups(
@@ -467,6 +488,7 @@ def run_invoice_extraction(
                         "vlm_provider": vlm_result.get("provider"),
                         "vlm_model": vlm_result.get("model"),
                         "vlm_attempts": vlm_result.get("attempts") or [],
+                        "vlm_routing_reasons": routing_reasons,
                     },
                     notes=f"VLM fallback merged via {vlm_result.get('provider') or 'unknown provider'}. VLM confidence={vlm_confidence:.2f}, Tesseract confidence={tesseract_confidence:.2f}.",
                 )
@@ -494,6 +516,7 @@ def run_invoice_extraction(
                         "vlm_provider": vlm_result.get("provider"),
                         "vlm_model": vlm_result.get("model"),
                         "vlm_attempts": vlm_result.get("attempts") or [],
+                        "vlm_routing_reasons": routing_reasons,
                     },
                     notes=f"VLM fallback was needed but could not complete: {vlm_result.get('reason') or 'unknown_error'}.",
                 )
@@ -768,6 +791,7 @@ def run_invoice_extraction(
         "supplier_id": raw.get("supplier_id"),
         "supplier_name_extracted": parsed_data.get("supplier_name_extracted"),
         "invoice_number": parsed_data.get("invoice_number"),
+        "document_reference": parsed_data.get("document_reference"),
         "invoice_date": parsed_data.get("invoice_date"),
         "due_date": parsed_data.get("due_date"),
         "subtotal": parsed_data.get("subtotal"),
@@ -1122,6 +1146,7 @@ def run_invoice_extraction(
             ),
         },
         "invoice_number": parsed_data.get("invoice_number"),
+        "document_reference": parsed_data.get("document_reference"),
         "invoice_date": parsed_data.get("invoice_date"),
         "due_date": parsed_data.get("due_date"),
         "subtotal": parsed_data.get("subtotal"),

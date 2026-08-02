@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
@@ -12,10 +11,9 @@ from app.dependencies import UserAuth, ensure_platform_owner
 from app.services.invoice_extraction_benchmark import (
     build_invoice_benchmark_snapshot,
     build_pilot_accuracy_summary,
-    evaluate_invoice_against_gold,
     validate_gold_snapshot,
 )
-from app.services.invoice_extraction_service import run_invoice_re_extraction
+from app.services.invoice_extraction_benchmark_suite import extractor_version, run_benchmark_case
 
 
 router = APIRouter(
@@ -75,6 +73,47 @@ class GoldDocumentUpdate(BaseModel):
     dataset_split: Optional[Literal["development", "validation", "locked"]] = None
     gold_json: Optional[dict[str, Any]] = None
     notes: Optional[str] = None
+
+
+class BenchmarkSuiteCreate(BaseModel):
+    dataset_split: Literal["development", "validation", "locked"] = "locked"
+    document_kind: Optional[Literal["invoice", "credit_note", "receipt"]] = None
+    source_format: Optional[Literal["pdf", "image"]] = None
+
+
+def _suite_payload(db, suite: dict[str, Any]) -> dict[str, Any]:
+    items = (
+        db.table("invoice_extraction_benchmark_suite_items")
+        .select("*")
+        .eq("suite_id", suite["id"])
+        .order("created_at", desc=False)
+        .execute()
+        .data
+        or []
+    )
+    gold_ids = [item.get("gold_document_id") for item in items if item.get("gold_document_id")]
+    cases = (
+        db.table("invoice_extraction_gold_documents")
+        .select("id, source_file_name, document_kind, source_format, gold_json")
+        .in_("id", gold_ids)
+        .execute()
+        .data
+        or []
+        if gold_ids else []
+    )
+    case_by_id = {str(case.get("id")): case for case in cases}
+    for item in items:
+        case = case_by_id.get(str(item.get("gold_document_id"))) or {}
+        document = case.get("gold_json") if isinstance(case.get("gold_json"), dict) else {}
+        document = document.get("document") if isinstance(document.get("document"), dict) else {}
+        item["document_label"] = (
+            document.get("supplier_name_extracted")
+            or case.get("source_file_name")
+            or "Benchmark document"
+        )
+        item["document_kind"] = case.get("document_kind")
+        item["source_format"] = case.get("source_format")
+    return {**suite, "items": items}
 
 
 @router.post("/gold-documents")
@@ -184,12 +223,30 @@ def update_gold_document(gold_document_id: str, payload: GoldDocumentUpdate, aut
         "Gold document not found",
     )
     updates = payload.model_dump(exclude_unset=True)
+    if existing.get("dataset_split") == "locked" and any(
+        field in updates for field in ("gold_json", "document_kind")
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Locked gold truth is frozen. Move the document out of the locked split before changing it.",
+        )
     if "gold_json" in updates:
         blockers = validate_gold_snapshot(updates["gold_json"])
         if blockers:
             raise HTTPException(status_code=400, detail={"message": "Gold document is incomplete", "blockers": blockers})
         updates["verified_by"] = user_id
         updates["verified_at"] = _now_iso()
+    if updates.get("dataset_split") == "locked":
+        prospective_gold = updates.get("gold_json", existing.get("gold_json") or {})
+        blockers = validate_gold_snapshot(prospective_gold)
+        if blockers:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Gold document cannot be locked until its truth is current and complete",
+                    "blockers": blockers,
+                },
+            )
     if updates:
         updates["updated_at"] = _now_iso()
     result = db.table("invoice_extraction_gold_documents").update(updates).eq("id", existing["id"]).execute()
@@ -203,6 +260,11 @@ def capture_current_as_gold(gold_document_id: str, auth: UserAuth):
         db.table("invoice_extraction_gold_documents").select("*").eq("id", gold_document_id).limit(1).execute().data or [],
         "Gold document not found",
     )
+    if case.get("dataset_split") == "locked":
+        raise HTTPException(
+            status_code=409,
+            detail="Locked gold truth is frozen. Move the document out of the locked split before recapturing it.",
+        )
     _invoice, _raw, snapshot = _invoice_snapshot(db, case["invoice_extracted_id"])
     blockers = validate_gold_snapshot(snapshot)
     if blockers:
@@ -227,32 +289,174 @@ def run_gold_document(
         db.table("invoice_extraction_gold_documents").select("*").eq("id", gold_document_id).limit(1).execute().data or [],
         "Gold document not found",
     )
-    if reextract:
-        run_invoice_re_extraction(
-            invoice_raw_id=case["invoice_raw_id"],
-            organisation_id=case["organisation_id"],
-            force_update=True,
+    benchmark = run_benchmark_case(db, case=case, run_by=user_id, reextract=reextract)
+    return {"success": True, "result": benchmark["result"], "run": benchmark["run"]}
+
+
+@router.post("/suites")
+def create_benchmark_suite(payload: BenchmarkSuiteCreate, auth: UserAuth):
+    user_id, db = _platform_db(auth)
+    active = (
+        db.table("invoice_extraction_benchmark_suites")
+        .select("id, status")
+        .in_("status", ["queued", "running"])
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if active:
+        raise HTTPException(status_code=409, detail="A benchmark suite is already queued or running")
+
+    query = (
+        db.table("invoice_extraction_gold_documents")
+        .select("*")
+        .eq("dataset_split", payload.dataset_split)
+        .order("created_at", desc=False)
+    )
+    if payload.document_kind:
+        query = query.eq("document_kind", payload.document_kind)
+    if payload.source_format:
+        query = query.eq("source_format", payload.source_format)
+    cases = query.execute().data or []
+    if not cases:
+        raise HTTPException(status_code=400, detail="No gold documents match this benchmark suite")
+    ineligible = [case for case in cases if validate_gold_snapshot(case.get("gold_json") or {})]
+    if ineligible:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(ineligible)} gold document(s) use incomplete or outdated truth. "
+                "Unlock and recapture them before running the suite."
+            ),
         )
-    invoice, _raw, actual = _invoice_snapshot(db, case["invoice_extracted_id"])
-    result = evaluate_invoice_against_gold(actual, case["gold_json"])
-    row = {
-        "gold_document_id": case["id"],
-        "invoice_extracted_id": invoice["id"],
-        "extractor_version": os.getenv("APP_VERSION") or os.getenv("GIT_COMMIT_SHA") or "development",
-        "extracted_json": actual,
-        "correct_values": result["correct_values"],
-        "total_values": result["total_values"],
-        "accuracy": result["accuracy"],
-        "correction_count": result["correction_count"],
-        "within_two_corrections": result["within_two_corrections"],
-        "exact_document": result["exact_document"],
-        "critical_error_count": result["critical_error_count"],
-        "discrepancies": result["discrepancies"],
-        "extraction_rerun": reextract,
-        "run_by": user_id,
+
+    suite_row = {
+        "dataset_split": payload.dataset_split,
+        "document_kind": payload.document_kind,
+        "source_format": payload.source_format,
+        "status": "queued",
+        "extractor_version": extractor_version(),
+        "total_documents": len(cases),
+        "requested_by": user_id,
     }
-    saved = db.table("invoice_extraction_benchmark_runs").insert(row).execute()
-    return {"success": True, "result": result, "run": saved.data[0] if saved.data else None}
+    created = db.table("invoice_extraction_benchmark_suites").insert(suite_row).execute().data or []
+    suite = _one(created, "Unable to create benchmark suite")
+    try:
+        db.table("invoice_extraction_benchmark_suite_items").insert([
+            {"suite_id": suite["id"], "gold_document_id": case["id"], "status": "queued"}
+            for case in cases
+        ]).execute()
+    except Exception:
+        db.table("invoice_extraction_benchmark_suites").delete().eq("id", suite["id"]).execute()
+        raise
+    refreshed = _one(
+        db.table("invoice_extraction_benchmark_suites").select("*").eq("id", suite["id"]).limit(1).execute().data or [],
+        "Benchmark suite was not found after creation",
+    )
+    return {"success": True, "suite": _suite_payload(db, refreshed)}
+
+
+@router.get("/suites/latest")
+def latest_benchmark_suite(auth: UserAuth):
+    _user_id, db = _platform_db(auth)
+    rows = (
+        db.table("invoice_extraction_benchmark_suites")
+        .select("*")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return {"success": True, "suite": _suite_payload(db, rows[0]) if rows else None}
+
+
+@router.get("/suites/{suite_id}")
+def get_benchmark_suite(suite_id: str, auth: UserAuth):
+    _user_id, db = _platform_db(auth)
+    suite = _one(
+        db.table("invoice_extraction_benchmark_suites").select("*").eq("id", suite_id).limit(1).execute().data or [],
+        "Benchmark suite not found",
+    )
+    return {"success": True, "suite": _suite_payload(db, suite)}
+
+
+@router.post("/suites/{suite_id}/cancel")
+def cancel_benchmark_suite(suite_id: str, auth: UserAuth):
+    _user_id, db = _platform_db(auth)
+    suite = _one(
+        db.table("invoice_extraction_benchmark_suites").select("*").eq("id", suite_id).limit(1).execute().data or [],
+        "Benchmark suite not found",
+    )
+    if suite.get("status") not in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail="Only a queued or running benchmark suite can be cancelled")
+    db.table("invoice_extraction_benchmark_suites").update({
+        "status": "cancelled",
+        "completed_at": _now_iso(),
+        "current_gold_document_id": None,
+        "updated_at": _now_iso(),
+    }).eq("id", suite_id).execute()
+    db.table("invoice_extraction_benchmark_suite_items").update({
+        "status": "skipped",
+        "completed_at": _now_iso(),
+        "claimed_by": None,
+        "claimed_at": None,
+        "lease_expires_at": None,
+        "updated_at": _now_iso(),
+    }).eq("suite_id", suite_id).in_("status", ["queued", "running"]).execute()
+    refreshed = _one(
+        db.table("invoice_extraction_benchmark_suites").select("*").eq("id", suite_id).limit(1).execute().data or [],
+        "Benchmark suite not found",
+    )
+    return {"success": True, "suite": _suite_payload(db, refreshed)}
+
+
+@router.post("/suites/{suite_id}/retry-failed")
+def retry_failed_benchmark_suite_items(suite_id: str, auth: UserAuth):
+    _user_id, db = _platform_db(auth)
+    suite = _one(
+        db.table("invoice_extraction_benchmark_suites").select("*").eq("id", suite_id).limit(1).execute().data or [],
+        "Benchmark suite not found",
+    )
+    failed = (
+        db.table("invoice_extraction_benchmark_suite_items")
+        .select("id")
+        .eq("suite_id", suite_id)
+        .eq("status", "failed")
+        .execute()
+        .data
+        or []
+    )
+    if not failed:
+        raise HTTPException(status_code=409, detail="This benchmark suite has no failed items to retry")
+    db.table("invoice_extraction_benchmark_suites").update({
+        "status": "running",
+        "completed_at": None,
+        "updated_at": _now_iso(),
+    }).eq("id", suite["id"]).execute()
+    db.table("invoice_extraction_benchmark_suite_items").update({
+        "status": "queued",
+        "attempt_count": 0,
+        "run_id": None,
+        "accuracy": None,
+        "correction_count": None,
+        "critical_error_count": None,
+        "within_two_corrections": None,
+        "quality_passed": None,
+        "error": None,
+        "claimed_by": None,
+        "claimed_at": None,
+        "lease_expires_at": None,
+        "started_at": None,
+        "completed_at": None,
+        "updated_at": _now_iso(),
+    }).eq("suite_id", suite_id).eq("status", "failed").execute()
+    refreshed = _one(
+        db.table("invoice_extraction_benchmark_suites").select("*").eq("id", suite_id).limit(1).execute().data or [],
+        "Benchmark suite not found",
+    )
+    return {"success": True, "suite": _suite_payload(db, refreshed)}
 
 
 @router.get("/summary")
@@ -267,11 +471,4 @@ def get_accuracy_summary(auth: UserAuth):
         .data
         or []
     )
-    latest: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for run in all_runs:
-        key = str(run.get("gold_document_id"))
-        if key not in seen:
-            seen.add(key)
-            latest.append(run)
-    return {"success": True, "summary": build_pilot_accuracy_summary(cases, latest)}
+    return {"success": True, "summary": build_pilot_accuracy_summary(cases, all_runs)}

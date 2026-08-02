@@ -13,7 +13,7 @@ class _Storage:
         return _StorageBucket()
 
 
-def test_re_extract_uses_vlm_when_deep_ocr_has_no_line_items(memory_db, monkeypatch):
+def test_re_extract_uses_vlm_for_deep_ocr_even_when_parse_looks_complete(memory_db, monkeypatch):
     db = memory_db({
         "invoices_extracted": [{
             "id": "invoice-1",
@@ -78,7 +78,12 @@ def test_re_extract_uses_vlm_when_deep_ocr_has_no_line_items(memory_db, monkeypa
         "total_amount": 300.0,
         "currency": "ZAR",
         "confidence_score": 0.95,
-        "line_items": [],
+        "line_items": [{
+            "description": "Confident but incorrect OCR row",
+            "quantity": 1,
+            "unit_price": 300.0,
+            "line_total": 300.0,
+        }],
     }
     monkeypatch.setattr(
         rx,

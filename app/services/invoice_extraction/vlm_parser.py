@@ -52,12 +52,20 @@ _EXTRACTION_PROMPT = (
     "'Exclusive Total' or 'Ex VAT' summary row below the item table, use the value from the line item's own Total column "
     "as line_total — do NOT use the summary subtotal row. "
     "Extract the VAT amount from the 'Vat Total', 'Tax Total', or 'VAT' summary row and place it in tax_amount. "
+    "For every line item, extract its printed VAT/tax amount into that line's tax_amount when shown. "
+    "Set each line's vat_treatment from document evidence: 'full' for a positive standard VAT rate, 'zero_rated' "
+    "for an explicitly printed 0% or zero-rated line, and 'exempt' only when explicitly marked exempt or outside VAT. "
+    "If the line's VAT treatment is not shown or cannot be derived reliably, set vat_treatment to null. "
+    "Never set 'blocked' from the document because blocked input tax is an accounting decision made later. "
     "IMPORTANT: 'Total Items' on a receipt is the COUNT of line items purchased (e.g. 'Total Items: 1.00' means 1 item), "
     "NOT a currency amount. Never use a 'Total Items' value as tax_amount, subtotal, or any monetary field. "
     "For till slips and POS receipts, use the receipt number, sale number, or transaction number as invoice_number. "
     "For airline invoices, use the labelled invoice/reference/booking reference as invoice_number. "
     "Never use a flight number (for example FA201, SA 123, or BA0057) as invoice_number. "
     "If the only candidate for invoice_number is the date, time, or a timestamp, set invoice_number to null instead. "
+    "document_reference is a separate purchase order, customer reference, booking reference, account reference, "
+    "or explicitly labelled 'Reference' value. Do not copy invoice_number into document_reference unless the document "
+    "explicitly prints the same value for both labels. "
     "Each line item should include the item description, quantity, unit price, discounted unit price/discount if printed, line total, "
     "and the item/product code or SKU if printed. "
     "Even if the image is dark, low contrast, or taken at an angle, do your best to read every field accurately. "
@@ -85,7 +93,8 @@ _EXTRACTION_PROMPT = (
     "(e.g. a page with 3 stapled till slips has document_count = 3; a single invoice has document_count = 1). "
     "For each line_item, set source_bbox to [x1_pct, y1_pct, x2_pct, y2_pct] where each value is the "
     "percentage (0–100) of the page image width/height. Locate the bounding box of that actual line row "
-    "as it appears in the document image. This enables the document viewer to highlight the correct region."
+    "as it appears in the document image, and set source_page to its one-based PDF page number. "
+    "This enables the document viewer to highlight the correct region."
 )
 DEFAULT_EXTRACTION_PROMPT = _EXTRACTION_PROMPT
 
@@ -100,7 +109,18 @@ class _VLMLineItem(BaseModel):
     pricing_basis: Optional[str] = Field(None, description="How the line total was derived: unit_price, discount_amount, discount_percent, discounted_unit_price, or extended_price")
     pricing_notes: Optional[str] = Field(None, description="Small pricing evidence notes")
     line_total: Optional[float] = Field(None, description="Printed net/extended line total after discount, excluding tax when labelled ex-VAT")
+    tax_amount: Optional[float] = Field(None, description="Printed or clearly attributable VAT/tax amount for this line")
+    vat_treatment: Optional[str] = Field(
+        None,
+        description="Document-evidenced line VAT treatment: full, zero_rated, or exempt; null when unclear",
+        pattern="^(full|zero_rated|exempt)$",
+    )
     code: Optional[str] = Field(None, description="Product code, SKU, or barcode printed on the line")
+    source_page: Optional[int] = Field(
+        None,
+        description="One-based page number containing this line item",
+        ge=1,
+    )
     source_bbox: Optional[list[float]] = Field(
         None,
         description="Bounding box [x1_pct, y1_pct, x2_pct, y2_pct] where each value is 0–100 percent of page width/height. Locate the actual row/line as it appears in the document image.",
@@ -118,6 +138,10 @@ class _VLMInvoiceSchema(BaseModel):
     invoice_number: Optional[str] = Field(
         None,
         description="Labelled invoice/document/booking reference; never an airline flight number",
+    )
+    document_reference: Optional[str] = Field(
+        None,
+        description="Separate purchase order, customer, booking, account, or explicitly labelled reference",
     )
     invoice_date: Optional[str] = Field(None, description="Invoice date in YYYY-MM-DD format")
     due_date: Optional[str] = Field(None, description="Payment due date in YYYY-MM-DD format")
@@ -165,6 +189,7 @@ class _VLMInvoiceSchema(BaseModel):
 VLM_MERGE_FIELDS: list[str] = [
     "supplier_name_extracted",
     "invoice_number",
+    "document_reference",
     "invoice_date",
     "due_date",
     "subtotal",

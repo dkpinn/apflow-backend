@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 from app.db.supabase_client import get_supabase_client
 from app.services.audit_log import log_invoice_event
-from app.services.invoice_extraction.entity_detection import classify_document_direction
+from app.services.invoice_extraction.entity_detection import classify_document_direction, name_matches_org
 from app.services.invoice_extraction.supplier_parser import (
     is_valid_supplier_candidate,
 )
@@ -70,6 +70,12 @@ from ._helpers import (
 from ._job_tracking import update_reextract_job
 from ._vat_reconciliation import _auto_reconcile_vat
 from ._supplier_matching import _correct_extracted_supplier
+from ._vlm_routing import (
+    is_image_document,
+    should_replace_with_vlm,
+    should_try_vlm,
+    vlm_routing_reasons,
+)
 
 try:
     supabase = get_supabase_client()
@@ -288,6 +294,9 @@ def run_invoice_re_extraction(
             if refreshed_header.get(field) not in (None, ""):
                 parsed_data[field] = refreshed_header[field]
 
+        organisation = get_organisation(org_id)
+        is_image_file = is_image_document(file_bytes, raw.get("file_type"))
+        force_vlm = is_image_file or source_is_deep
         parsed_supplier_candidate = parsed_data.get("supplier_name_extracted")
         supplier_candidate_invalid = bool(
             parsed_supplier_candidate
@@ -303,6 +312,16 @@ def run_invoice_re_extraction(
                 not parsed_data.get("line_items")
                 and parsed_data.get("total_amount")
             )
+        )
+        routing_reasons = vlm_routing_reasons(
+            parsed_data,
+            force_vlm=force_vlm,
+            organisation=organisation,
+        )
+        vlm_should_try = should_try_vlm(
+            parsed_data,
+            force_vlm=force_vlm,
+            organisation=organisation,
         )
 
         if vlm_should_try:
@@ -325,7 +344,21 @@ def run_invoice_re_extraction(
                 for field in VLM_MERGE_FIELDS:
                     vlm_value = vlm_data.get(field)
                     if vlm_value is not None and vlm_value != [] and vlm_value != "":
-                        if not parsed_data.get(field) or vlm_confidence > tesseract_confidence:
+                        replace_org_supplier = (
+                            field == "supplier_name_extracted"
+                            and name_matches_org(parsed_data.get(field), organisation or {})
+                            and is_valid_supplier_candidate(str(vlm_value))
+                            and not name_matches_org(str(vlm_value), organisation or {})
+                        )
+                        if should_replace_with_vlm(
+                            field,
+                            current_value=parsed_data.get(field),
+                            vlm_value=vlm_value,
+                            force_vlm=force_vlm,
+                            routing_reasons=routing_reasons,
+                            vlm_confidence=float(vlm_confidence or 0),
+                            text_confidence=float(tesseract_confidence or 0),
+                        ) or replace_org_supplier:
                             parsed_data[field] = vlm_value
 
                 explicit_reference = extract_explicit_reference_number(extraction_text)
@@ -362,6 +395,7 @@ def run_invoice_re_extraction(
                         "vlm_provider": vlm_result.get("provider"),
                         "vlm_model": vlm_result.get("model"),
                         "vlm_attempts": vlm_result.get("attempts") or [],
+                        "vlm_routing_reasons": routing_reasons,
                     },
                     notes=f"VLM fallback merged during re-extract via {vlm_result.get('provider') or 'unknown provider'}. VLM confidence={vlm_confidence:.2f}, deep OCR confidence={tesseract_confidence:.2f}.",
                 )
@@ -386,16 +420,21 @@ def run_invoice_re_extraction(
                         "vlm_provider": vlm_result.get("provider"),
                         "vlm_model": vlm_result.get("model"),
                         "vlm_attempts": vlm_result.get("attempts") or [],
+                        "vlm_routing_reasons": routing_reasons,
                     },
                     notes=f"VLM fallback was needed during re-extract but could not complete: {vlm_result.get('reason') or 'unknown_error'}.",
                 )
+                if is_image_file:
+                    reason = vlm_result.get("reason") or "unknown_error"
+                    raise ValueError(
+                        f"Image files require VLM extraction, but VLM could not complete ({reason})."
+                    )
 
         reconcile_extracted_bank_name(parsed_data, extraction_text)
         strong_document_type = infer_strong_document_type(extraction_text)
         if strong_document_type:
             parsed_data["document_type"] = strong_document_type
 
-        organisation = get_organisation(org_id)
         direction_result = classify_document_direction(extraction_text, organisation)
         parsed_data["issuer_name_extracted"] = direction_result.issuer_name
         parsed_data["recipient_name_extracted"] = direction_result.recipient_name

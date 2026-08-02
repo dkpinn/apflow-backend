@@ -111,6 +111,7 @@ def test_line_item_payload_normalizes_vlm_string_pricing_notes():
                 "line_total": 100.0,
                 "pricing_notes": "VLM pricing evidence",
                 "source_bbox": [10, 20, 80, 30],
+                "source_page": 2,
             },
         ],
     )
@@ -118,6 +119,7 @@ def test_line_item_payload_normalizes_vlm_string_pricing_notes():
     assert payload[0]["pricing_notes"] == {
         "note": "VLM pricing evidence",
         "source_bbox": [10, 20, 80, 30],
+        "source_page": 2,
     }
 
 

@@ -121,3 +121,34 @@ def test_reextract_persists_vat_reconciled_totals_without_global_confidence_incr
     )
 
     assert update["subtotal"] == 19130.43
+
+
+def test_forced_reextract_clears_stale_corrections_and_accepts_zero_vat() -> None:
+    update, improved, _unchanged = build_reextract_update(
+        existing={
+            "supplier_name_extracted": "Manually Corrected Supplier",
+            "document_reference": "PO-OLD",
+            "tax_amount": 15.0,
+            "prices_include_vat_detected": "inclusive",
+            "confidence_score": 0.9,
+        },
+        parsed={
+            "supplier_name_extracted": None,
+            "document_reference": None,
+            "tax_amount": 0.0,
+            "prices_include_vat_detected": None,
+            "confidence_score": 0.4,
+        },
+        force_update=True,
+    )
+
+    assert update["supplier_name_extracted"] is None
+    assert update["document_reference"] is None
+    assert update["tax_amount"] == 0.0
+    assert update["prices_include_vat_detected"] is None
+    assert {row["field"] for row in improved} >= {
+        "supplier_name_extracted",
+        "document_reference",
+        "tax_amount",
+        "prices_include_vat_detected",
+    }

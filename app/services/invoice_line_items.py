@@ -70,6 +70,7 @@ def build_line_item_payload(
                 **normalize_pricing_notes(item.get("pricing_notes")),
                 # Store VLM-returned bounding box for document highlighting
                 **({ "source_bbox": item["source_bbox"] } if item.get("source_bbox") else {}),
+                **({ "source_page": item["source_page"] } if item.get("source_page") else {}),
             },
             "tax_amount": item.get("tax_amount"),
             "line_total": item.get("line_total"),

@@ -14,6 +14,7 @@ import uuid
 from threading import Event
 
 from app.db.supabase_client import get_supabase_client
+from app.services.invoice_extraction_benchmark_suite import process_next_benchmark_item
 from app.services.invoice_extraction_service import process_next_queued_invoice_job
 from app.services.recurring_transactions import generate_due_drafts
 
@@ -36,12 +37,19 @@ def maintain_queue(db) -> None:
         logger.exception("Recurring draft generation failed")
 
 
+def should_poll_benchmark(*, normal_status: str, normal_jobs_since_benchmark: int, interval_jobs: int) -> bool:
+    """Guarantee benchmark progress without taking priority from every live invoice."""
+    return normal_status == "empty" or normal_jobs_since_benchmark >= interval_jobs
+
+
 def run(*, stop_event: Event | None = None) -> None:
     stop = stop_event or Event()
     worker_id = build_worker_id()
     poll_seconds = max(0.1, float(os.getenv("INVOICE_WORKER_POLL_SECONDS", "2")))
     maintenance_seconds = max(10.0, float(os.getenv("INVOICE_WORKER_MAINTENANCE_SECONDS", "60")))
+    benchmark_interval_jobs = max(1, int(os.getenv("INVOICE_WORKER_BENCHMARK_INTERVAL_JOBS", "5")))
     next_maintenance = 0.0
+    normal_jobs_since_benchmark = 0
     db = get_supabase_client()
 
     logger.info("Invoice worker %s started", worker_id)
@@ -61,10 +69,35 @@ def run(*, stop_event: Event | None = None) -> None:
             stop.wait(poll_seconds)
             continue
 
-        if result.get("status") == "empty":
-            stop.wait(poll_seconds)
-        elif result.get("status") == "failed":
+        normal_status = str(result.get("status") or "unknown")
+        normal_job_processed = normal_status != "empty"
+        if normal_job_processed:
+            normal_jobs_since_benchmark += 1
+        if normal_status == "failed":
             logger.error("Invoice job failed: %s", result)
+        if not should_poll_benchmark(
+            normal_status=normal_status,
+            normal_jobs_since_benchmark=normal_jobs_since_benchmark,
+            interval_jobs=benchmark_interval_jobs,
+        ):
+            continue
+
+        try:
+            benchmark_result = process_next_benchmark_item(worker_id=worker_id, db=db)
+        except Exception:
+            logger.exception("Invoice benchmark worker polling failed")
+            stop.wait(poll_seconds)
+            continue
+
+        benchmark_status = benchmark_result.get("status")
+        if benchmark_status != "empty":
+            normal_jobs_since_benchmark = 0
+        if benchmark_status in {"failed", "retrying", "stale_claim"}:
+            logger.error("Invoice benchmark item failed: %s", benchmark_result)
+        if normal_job_processed:
+            continue
+        if benchmark_status == "empty":
+            stop.wait(poll_seconds)
 
     logger.info("Invoice worker %s stopped", worker_id)
 
