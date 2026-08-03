@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from app.services.accounting_locks import assert_accounting_period_unlocked
@@ -83,7 +84,20 @@ def build_invoice_debit_lines(
 
     journal_lines: list[dict[str, Any]] = []
     missing_accounts: list[str] = []
+    vat_by_tracking: dict[str, dict[str, Any]] = {}
     sort_order = 0
+
+    def add_claimable_vat(amount: Any, tracking: Any) -> None:
+        value = round(float(amount or 0), 2)
+        if value <= 0:
+            return
+        normalised_tracking = tracking if isinstance(tracking, dict) else {}
+        key = json.dumps(normalised_tracking, sort_keys=True, separators=(",", ":"), default=str)
+        bucket = vat_by_tracking.setdefault(key, {
+            "tracking": normalised_tracking,
+            "amount": 0.0,
+        })
+        bucket["amount"] = round(float(bucket["amount"]) + value, 2)
 
     for line_item in line_items:
         line_desc = line_item.get("description") or "Invoice line"
@@ -103,6 +117,7 @@ def build_invoice_debit_lines(
                     {},
                 )
                 blocked_share = allocation_vat.get("blocked_tax") or 0
+                allocation_tracking = allocation.get("tracking") or tracking
                 amount = round(
                     float(allocation.get("amount") or 0) + float(blocked_share),
                     2,
@@ -115,9 +130,10 @@ def build_invoice_debit_lines(
                     "description": f"{description_base} / {line_desc}",
                     "debit_amount": amount,
                     "credit_amount": 0.0,
-                    "tracking": allocation.get("tracking") or tracking,
+                    "tracking": allocation_tracking,
                     "sort_order": sort_order,
                 })
+                add_claimable_vat(allocation_vat.get("claimable_tax"), allocation_tracking)
                 sort_order += 1
             continue
 
@@ -140,19 +156,32 @@ def build_invoice_debit_lines(
             "tracking": tracking,
             "sort_order": sort_order,
         })
+        add_claimable_vat(line_vat.get("claimable_tax"), tracking)
         sort_order += 1
 
     claimable_tax = round(float(vat_allocation["claimable_tax"]), 2)
-    if vat_control_account_id and claimable_tax > 0:
-        journal_lines.append({
-            "organisation_id": organisation_id,
-            "account_id": vat_control_account_id,
-            "description": f"{description_base} - VAT",
-            "debit_amount": claimable_tax,
-            "credit_amount": 0.0,
-            "tracking": {},
-            "sort_order": sort_order,
-        })
+    if vat_control_account_id:
+        for bucket in vat_by_tracking.values():
+            journal_lines.append({
+                "organisation_id": organisation_id,
+                "account_id": vat_control_account_id,
+                "description": f"{description_base} - VAT",
+                "debit_amount": bucket["amount"],
+                "credit_amount": 0.0,
+                "tracking": bucket["tracking"],
+                "sort_order": sort_order,
+            })
+            sort_order += 1
+
+    payable_by_tracking: dict[str, dict[str, Any]] = {}
+    for journal_line in journal_lines:
+        tracking = journal_line.get("tracking") if isinstance(journal_line.get("tracking"), dict) else {}
+        key = json.dumps(tracking, sort_keys=True, separators=(",", ":"), default=str)
+        bucket = payable_by_tracking.setdefault(key, {"tracking": tracking, "amount": 0.0})
+        bucket["amount"] = round(
+            float(bucket["amount"]) + float(journal_line.get("debit_amount") or 0),
+            2,
+        )
 
     return {
         "description_base": description_base,
@@ -160,6 +189,7 @@ def build_invoice_debit_lines(
         "missing_accounts": missing_accounts,
         "claimable_tax": claimable_tax,
         "blocked_tax": round(float(vat_allocation["blocked_tax"]), 2),
+        "payable_splits": list(payable_by_tracking.values()),
     }
 
 
@@ -373,15 +403,23 @@ def prepare_invoice_gl_posting(
             f"({total_debit:.2f} posted vs {gross_total:.2f} invoice)."
         )
 
-    journal_lines.append({
-        "organisation_id": org_id,
-        "account_id": trade_payables["id"],
-        "description": description_base,
-        "debit_amount": 0.0,
-        "credit_amount": total_debit,
-        "tracking": {},
-        "sort_order": len(journal_lines),
-    })
+    for payable_split in posting["payable_splits"]:
+        journal_lines.append({
+            "organisation_id": org_id,
+            "account_id": trade_payables["id"],
+            "description": description_base,
+            "debit_amount": 0.0,
+            "credit_amount": payable_split["amount"],
+            "tracking": payable_split["tracking"],
+            "sort_order": len(journal_lines),
+        })
+
+    total_credit = round(sum(float(line["credit_amount"]) for line in journal_lines), 2)
+    if total_credit != total_debit:
+        raise ValueError(
+            f"Dimension allocation did not produce a balanced creditor liability "
+            f"({total_debit:.2f} debit vs {total_credit:.2f} credit)."
+        )
 
     return {
         "invoice": invoice,
@@ -393,7 +431,7 @@ def prepare_invoice_gl_posting(
         "gross_total": gross_total,
         "vat_rounding_adjustment": rounding_adjustment,
         "total_debit": total_debit,
-        "total_credit": total_debit,
+        "total_credit": total_credit,
         "trade_payables_account": trade_payables.get("code"),
         "vat_control_account": vat_control.get("code") if vat_status.applicable and vat_control else None,
     }

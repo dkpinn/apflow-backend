@@ -116,6 +116,54 @@ def test_blocked_vat_follows_invoice_allocation_split():
     assert sum(row["debit_amount"] for row in result["journal_lines"]) == 115.0
 
 
+def test_split_allocations_carry_vat_and_creditors_to_each_dimension():
+    result = build_invoice_debit_lines(
+        organisation_id="org-1",
+        invoice=_invoice(),
+        line_items=[
+            {
+                "id": "split-line",
+                "description": "Shared expense",
+                "line_total": 100,
+                "tax_amount": None,
+                "vat_treatment": "full",
+                "expense_account": None,
+                "tracking": {},
+            }
+        ],
+        allocations_by_line={
+            "split-line": [
+                {
+                    "expense_account": "expense-a",
+                    "amount": 60,
+                    "vat_treatment": "full",
+                    "tracking": {"department": "a"},
+                },
+                {
+                    "expense_account": "expense-b",
+                    "amount": 40,
+                    "vat_treatment": "full",
+                    "tracking": {"department": "b"},
+                },
+            ]
+        },
+        supplier_has_vat_number=True,
+        vat_control_account_id="vat-control",
+    )
+
+    vat_lines = [
+        row for row in result["journal_lines"] if row["account_id"] == "vat-control"
+    ]
+    assert [(row["tracking"], row["debit_amount"]) for row in vat_lines] == [
+        ({"department": "a"}, 9.0),
+        ({"department": "b"}, 6.0),
+    ]
+    assert result["payable_splits"] == [
+        {"tracking": {"department": "a"}, "amount": 69.0},
+        {"tracking": {"department": "b"}, "amount": 46.0},
+    ]
+
+
 def test_exempt_and_zero_rated_lines_do_not_claim_vat():
     result = build_invoice_debit_lines(
         organisation_id="org-1",

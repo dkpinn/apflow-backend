@@ -167,6 +167,50 @@ def test_prepared_journal_is_the_complete_vat_aware_posting_preview():
     ]
 
 
+def test_vat_and_creditors_are_split_by_tracking_dimension():
+    tables = _tables()
+    tables["invoices_extracted"][0].update({
+        "subtotal": 300,
+        "tax_amount": 45,
+        "total_amount": 345,
+    })
+    tables["invoice_line_items"] = [
+        {
+            **tables["invoice_line_items"][0],
+            "id": "line-1",
+            "line_total": 100,
+            "tracking": {"department": "north"},
+        },
+        {
+            **tables["invoice_line_items"][0],
+            "id": "line-2",
+            "description": "Second expense",
+            "line_total": 200,
+            "tracking": {"department": "south"},
+        },
+    ]
+
+    prepared = prepare_invoice_gl_posting(
+        _DB(tables), invoice_id="invoice-1", org_id="org-1"
+    )
+
+    vat_lines = [
+        row for row in prepared["journal_lines"] if row["account_id"] == "vat-id"
+    ]
+    creditor_lines = [
+        row for row in prepared["journal_lines"] if row["account_id"] == "payable-id"
+    ]
+    assert [(row["tracking"], row["debit_amount"]) for row in vat_lines] == [
+        ({"department": "north"}, 15.0),
+        ({"department": "south"}, 30.0),
+    ]
+    assert [(row["tracking"], row["credit_amount"]) for row in creditor_lines] == [
+        ({"department": "north"}, 115.0),
+        ({"department": "south"}, 230.0),
+    ]
+    assert prepared["total_debit"] == prepared["total_credit"] == 345
+
+
 def test_preparation_rejects_subtotal_plus_vat_that_differs_from_document_total():
     tables = _tables()
     tables["invoices_extracted"][0].update({

@@ -24,14 +24,52 @@ def _ready_for_posting(monkeypatch):
 
 def _prepared(gross_total=500.0):
     return {
+        "journal_date": "2026-06-01",
+        "description": "Supplier - INV-1",
         "gross_total": gross_total,
-        "journal_lines": [{"account_id": "acc-1", "debit_amount": gross_total, "credit_amount": 0}],
+        "total_debit": gross_total,
+        "total_credit": gross_total,
+        "journal_lines": [
+            {"account_id": "expense-1", "debit_amount": gross_total, "credit_amount": 0},
+            {"account_id": "payable-1", "debit_amount": 0, "credit_amount": gross_total},
+        ],
     }
 
 
 def _payload():
     from app.routers.invoices_gl import PostInvoiceToGLRequest
     return PostInvoiceToGLRequest(organisation_id="org-1")
+
+
+def test_gl_preview_returns_the_same_balanced_journal_used_for_posting(monkeypatch):
+    monkeypatch.setattr(gl, "supabase", StubDB({}))
+    monkeypatch.setattr(gl, "_fetch_org_role", lambda *_args: "admin")
+    monkeypatch.setattr(gl_svc, "prepare_invoice_gl_posting", lambda db, **_kw: _prepared(1839.64))
+
+    result = gl.preview_invoice_gl("inv-1", _payload(), auth=AUTH)
+
+    assert result["gross_total"] == 1839.64
+    assert result["total_debit"] == result["total_credit"] == 1839.64
+    assert result["journal_lines"][-1] == {
+        "account_id": "payable-1",
+        "debit_amount": 0,
+        "credit_amount": 1839.64,
+    }
+
+
+def test_gl_preview_reports_reconciliation_errors_instead_of_showing_an_imbalance(monkeypatch):
+    def _fail_prepare(db, **_kw):
+        raise ValueError("VAT allocation did not reconcile to the invoice total")
+
+    monkeypatch.setattr(gl, "supabase", StubDB({}))
+    monkeypatch.setattr(gl, "_fetch_org_role", lambda *_args: "admin")
+    monkeypatch.setattr(gl_svc, "prepare_invoice_gl_posting", _fail_prepare)
+
+    with pytest.raises(HTTPException) as exc_info:
+        gl.preview_invoice_gl("inv-1", _payload(), auth=AUTH)
+
+    assert exc_info.value.status_code == 400
+    assert "did not reconcile" in exc_info.value.detail
 
 
 def test_confirmed_approval_resolves_extraction_direction_before_readiness(monkeypatch):

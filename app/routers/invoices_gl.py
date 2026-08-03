@@ -410,6 +410,39 @@ def _handle_invoice_approval_workflow(
 
 # ── Route ─────────────────────────────────────────────────────────────────────
 
+@router.post("/{invoice_id}/gl-preview")
+def preview_invoice_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: UserAuth):
+    """Return the canonical balanced journal without creating or posting it."""
+    from app.services.invoice_gl_posting import prepare_invoice_gl_posting
+
+    user_id, _db = auth
+    org_id = payload.organisation_id
+
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    if not _fetch_org_role(user_id, org_id):
+        raise HTTPException(status_code=403, detail="You do not have access to this organisation")
+
+    try:
+        prepared = prepare_invoice_gl_posting(
+            supabase,
+            invoice_id=invoice_id,
+            org_id=org_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "success": True,
+        "journal_date": prepared.get("journal_date"),
+        "description": prepared.get("description"),
+        "gross_total": prepared["gross_total"],
+        "total_debit": prepared["total_debit"],
+        "total_credit": prepared["total_credit"],
+        "journal_lines": prepared["journal_lines"],
+    }
+
+
 @router.post("/{invoice_id}/post-to-gl")
 def post_invoice_to_gl(invoice_id: str, payload: PostInvoiceToGLRequest, auth: UserAuth):
     """
