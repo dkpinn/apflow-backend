@@ -326,6 +326,10 @@ When a period is locked or closed, APPayPal may block posting, reversing, issuin
 
 Organisation integrations connect APPayPal to external services. Platform-level integrations may be managed from Admin screens by platform owners.
 
+### Invoice Extraction Lab
+
+Platform owners use the Invoice Extraction Lab to build verified benchmark datasets, run fresh extraction tests, and decide whether invoice extraction meets the 95% pilot gate. See the [Invoice Extraction Lab User Manual](extraction-lab-user-manual.md) for the objective, dataset rules, operating process, acceptance criteria, and failure-improvement loop.
+
 ### Chart of accounts
 
 The chart of accounts controls where transactions appear in reports. Admin users may be able to maintain the standard chart or import account templates. Use care when changing account codes or names because reporting depends on them.
